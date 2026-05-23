@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Premier Bank — Hero Options</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="premier.css" />
+<style>
+  body { background: #f0eee8; }
+  .hero-frame { background: var(--pb-bg-body); width: 1280px; }
+  .hero-frame .pb-hero { padding: 60px 0 80px; }
+  .hero-frame .pb-hero-fullbleed { padding: 0; min-height: 640px; }
+  .hero-frame .pb-hero-split-grid { min-height: 640px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script src="image-slot.js"></script>
+<script src="premier-data.jsx"></script>
+<script type="text/babel" src="premier-chrome.jsx"></script>
+<script type="text/babel" src="premier-sections.jsx"></script>
+<script type="text/babel" src="design-canvas.jsx"></script>
+
+<script type="text/babel">
+const { useState } = React;
+
+function HeroFrame({ variant }) {
+  return (
+    <div className="hero-frame">
+      <Hero lang="en" variant={variant} />
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <DesignCanvas
+      title="Premier Bank — Hero options"
+      subtitle="Three directions for the homepage hero. Drag to compare; click any to focus."
+    >
+      <DCSection id="heroes" title="Hero variations">
+        <DCArtboard id="warm" label="01 · Warm — split with photo + floating UI" width={1280} height={760}>
+          <HeroFrame variant="warm" />
+        </DCArtboard>
+        <DCArtboard id="split" label="02 · Editorial split — quote-led" width={1280} height={760}>
+          <HeroFrame variant="split" />
+        </DCArtboard>
+        <DCArtboard id="full" label="03 · Full-bleed photo — bold &amp; cinematic" width={1280} height={760}>
+          <HeroFrame variant="fullbleed" />
+        </DCArtboard>
+      </DCSection>
+    </DesignCanvas>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
