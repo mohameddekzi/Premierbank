@@ -707,6 +707,18 @@ img { max-width: 100%; display: block; }
 .pb-detail-feat h3 { font-family: 'Lexend', sans-serif; font-size: 18px; font-weight: 600; color: var(--pb-ink); margin: 16px 0 8px; letter-spacing: -.2px; }
 .pb-detail-feat p { font-size: 14px; line-height: 1.55; color: var(--pb-muted); margin: 0; }
 
+.pb-member-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
+.pb-member { display: grid; grid-template-columns: 84px 1fr; gap: 20px; background: var(--pb-paper); border: 1px solid var(--pb-line); border-radius: 18px; padding: 24px; transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease; }
+.pb-member:hover { transform: translateY(-2px); box-shadow: 0 12px 32px rgba(11, 47, 79, .08); border-color: rgba(11, 47, 79, .15); }
+.pb-member-ph { border-style: dashed; opacity: .9; }
+.pb-member-photo { width: 84px; height: 84px; border-radius: 16px; overflow: hidden; background: linear-gradient(135deg, var(--pb-primary), var(--pb-primary-300)); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.pb-member-photo img { width: 100%; height: 100%; object-fit: cover; }
+.pb-member-initials { font-family: 'Lexend', sans-serif; font-weight: 700; font-size: 28px; color: #fff; letter-spacing: .5px; }
+.pb-member-body h3 { font-family: 'Lexend', sans-serif; font-size: 18px; font-weight: 600; color: var(--pb-ink); margin: 0 0 4px; letter-spacing: -.2px; }
+.pb-member-role { font-size: 13px; font-weight: 600; color: var(--pb-secondary-700); margin: 0 0 10px; text-transform: uppercase; letter-spacing: .04em; }
+.pb-member-bio { font-size: 13.5px; line-height: 1.55; color: var(--pb-muted); margin: 0; }
+@media (max-width: 720px) { .pb-member-grid { grid-template-columns: 1fr; } .pb-member { grid-template-columns: 64px 1fr; gap: 16px; padding: 18px; } .pb-member-photo { width: 64px; height: 64px; } }
+
 .pb-detail-steps { display: grid; gap: 0; }
 .pb-detail-step { display: grid; grid-template-columns: 80px 1fr; gap: 24px; padding: 24px 0; border-top: 1px solid var(--pb-line); align-items: start; }
 .pb-detail-step:first-child { border-top: 0; padding-top: 0; }
@@ -4280,6 +4292,22 @@ const D = window.PB_DETAILS = {
       step("Independent directors",   "Lead Audit, Risk and Shari'ah committees. Three-year terms, max two consecutive."),
       step("Executive director (CEO)","Bridge between management and governance — the only executive on the board."),
     ],
+    members: [
+      { name: "Jibril Hassan Mohamed", title: en_so("Chairman", "Gudoomiye"),
+        bio: "An astute businessman who has been in business since 2002. As Chair, he guides the Board in overseeing strategy, policy, investor relations and key partnerships within the Bank. He holds an MBA majoring in Finance, a Bachelor of Mathematics degree, and a Postgraduate Diploma in Information Technology." },
+      { name: "Mohamed Djirde Hussein", title: en_so("Director", "Agaasime"),
+        bio: "Holds a BS in Economics and Business Administration from the USA and has been in business since 1972, bringing decades of commercial leadership and enterprise experience to the Board." },
+      { name: "Ahmed Abdirahman Sheikh", title: en_so("Non-Executive Director", "Agaasime aan fulineed"),
+        bio: "A businessman with vast experience in the financial industry who has served as a Director of Premier Bank since 2014, contributing deep knowledge of Somali markets and regional finance." },
+      { name: "Khadar Mohamoud Jama", title: en_so("Director", "Agaasime"),
+        bio: "Owner and Managing Director of AMS Logistics Co., operating across Somalia, the UAE, Djibouti and Ethiopia since 1998. He holds three Diplomas in Accounting & Business Management." },
+      { name: "Abdelaziz Ali Eid", title: en_so("Director", "Agaasime"),
+        bio: "In the financial-services business for over 16 years; a Director and Shareholder of International Commercial Bank (ICB) Juba, South Sudan. He holds a Bachelor's degree in History and a Master's degree in African History." },
+      { name: "Tengeri Nyaramba Osoro", title: en_so("Director", "Agaasime"),
+        bio: "A Chartered Financial Analyst (CFA) with over 10 years' experience in finance and banking in Kenya and the wider East African region." },
+      { name: "Abdullahi Shidane", title: en_so("Director", "Agaasime"),
+        bio: "A long-serving Director of Premier Bank, contributing extensive commercial and entrepreneurial experience to the Board's governance and strategic oversight." },
+    ],
     faqs: [],
     cta1: en_so("Investor relations", "Maalgashada"),
     cta2: en_so("Download 2024 report", "Soo dejiso warbixin"),
@@ -4310,6 +4338,10 @@ const D = window.PB_DETAILS = {
       step("SSB deliberation",     "Scholars meet and either issue a fatwa, request changes, or reject."),
       step("Annual audit",         "Once live, contracts are sampled annually for ongoing compliance."),
     ],
+    members: [
+      { name: en_so("Add a Shari'ah scholar", "Ku dar culimo Shareeco"), title: en_so("Shari'ah Supervisory Board", "Guddiga Shareecada"),
+        bio: "Premier Bank's Shari'ah Supervisory Board is an independent panel of internationally-recognised scholars in Islamic jurisprudence and finance, following AAOIFI standards. Add each scholar's name, photo and biography from the admin panel.", placeholder: true },
+    ],
     faqs: [
       { q: "Can the SSB block a product?",      a: "Yes. SSB approval is mandatory; no financial product launches without a written fatwa." },
       { q: "Are the scholars paid by Premier?", a: "They receive a fixed retainer disclosed in the annual report. Independence is contractual and enforced." },
@@ -4336,6 +4368,12 @@ const D = window.PB_DETAILS = {
       { icon: "invest",title: "CFO & COO",            body: "Run finance, treasury, balance sheet, and operations + branch network respectively." },
       { icon: "internet",title: "CTO & CDO",          body: "Own core banking, the Wallet app, and data + analytics." },
       { icon: "shield",title: "CRO, CCO, General Counsel", body: "Risk, compliance, AML and legal — direct reporting to the Audit Committee for independence." },
+    ],
+    members: [
+      { name: "Dr. Mohamed Ghedi Jumale", title: en_so("Managing Director & CEO", "Agaasimaha Guud & CEO"),
+        bio: "Elected Managing Director of Premier Bank in March 2024. A management practitioner with over 20 years' experience, Dr. Ghedi sets group strategy, chairs the executive committee, and leads the bank's day-to-day operations and regional growth agenda." },
+      { name: "Osman Dualle Ahmed", title: en_so("Executive Director", "Agaasime Fulineed"),
+        bio: "Joined Premier Bank as Deputy Managing Director in 2018 and went on to serve as Managing Director & CEO, steering the bank through a period of rapid expansion across Somalia and the region." },
     ],
     steps: [],
     faqs: [],
@@ -5271,6 +5309,11 @@ function DetailPanel({ itemKey, lang, onClose, onJump, onOpenAccount }) {
   const d = D[itemKey];
   if (!d) return null;
   const tt = (o) => (lang === "en" ? o.en : o.so) || o.en;
+  const txt = (v) => (v && typeof v === "object" ? tt(v) : v);
+
+  // Live team members from Supabase (if configured) override the seeded list.
+  const liveMembers = (window.PB_LIVE_TEAM && window.PB_LIVE_TEAM[itemKey]) || null;
+  const members = (liveMembers && liveMembers.length ? liveMembers : d.members) || [];
 
   const related = Object.entries(D)
     .filter(([k, v]) => v.cat === d.cat && k !== itemKey)
@@ -5341,11 +5384,43 @@ function DetailPanel({ itemKey, lang, onClose, onJump, onOpenAccount }) {
             </div>
           )}
 
+          {/* TEAM MEMBERS */}
+          {members && members.length > 0 && (
+            <div className="pb-detail-section">
+              <div className="pb-detail-section-head">
+                <span className="pb-detail-sec-num">{(d.features && d.features.length) ? "02" : "01"}</span>
+                <h2>{lang === "en" ? "The team" : "Kooxda"}</h2>
+              </div>
+              <div className="pb-member-grid">
+                {members.map((m, i) => {
+                  const name = txt(m.name);
+                  const role = txt(m.title);
+                  const bio = txt(m.bio);
+                  const initials = (name || "?").split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join("").toUpperCase();
+                  return (
+                    <div key={m.id || i} className={`pb-member${m.placeholder ? " pb-member-ph" : ""}`}>
+                      <div className="pb-member-photo">
+                        {m.photo
+                          ? <img src={m.photo} alt={name} />
+                          : <span className="pb-member-initials">{initials}</span>}
+                      </div>
+                      <div className="pb-member-body">
+                        <h3>{name}</h3>
+                        <p className="pb-member-role">{role}</p>
+                        {bio && <p className="pb-member-bio">{bio}</p>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {/* STEPS */}
           {d.steps && d.steps.length > 0 && (
             <div className="pb-detail-section pb-detail-section-alt">
               <div className="pb-detail-section-head">
-                <span className="pb-detail-sec-num">02</span>
+                <span className="pb-detail-sec-num">{members && members.length ? "03" : "02"}</span>
                 <h2>{lang === "en" ? "How it works" : "Sida ay u shaqayso"}</h2>
               </div>
               <div className="pb-detail-steps">
