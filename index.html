@@ -3133,7 +3133,7 @@ function UtilityBar({ lang, setLang }) {
 /* -------------------------------------------------------------------------- */
 /*  Sticky nav                                                                */
 /* -------------------------------------------------------------------------- */
-function Nav({ lang, setLang, onLogin, onOpenAccount, onOpenDetail }) {
+function Nav({ lang, setLang, onLogin, onOpenAccount, onOpenDetail, onLogo }) {
   const [scrolled, setScrolled] = useState(false);
   const [open, setOpen] = useState(null);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -3150,7 +3150,7 @@ function Nav({ lang, setLang, onLogin, onOpenAccount, onOpenDetail }) {
       <UtilityBar lang={lang} setLang={setLang} />
       <div className="pb-nav-main">
         <div className="pb-container pb-nav-inner">
-          <a href="#" className="pb-nav-logo" onClick={(e) => { e.preventDefault(); window.scrollTo({ top: 0, behavior: "smooth" }); }}>
+          <a href="#" className="pb-nav-logo" onClick={(e) => { e.preventDefault(); if (onLogo) { onLogo(); } else { window.scrollTo({ top: 0, behavior: "smooth" }); } }}>
             <PBLogo variant="color" size={36} />
           </a>
 
@@ -5538,7 +5538,7 @@ const D = window.PB_DETAILS = {
 /* -------------------------------------------------------------------------- */
 /*  Detail Panel component                                                    */
 /* -------------------------------------------------------------------------- */
-function DetailPanel({ itemKey, lang, onClose, onJump, onOpenAccount }) {
+function DetailPanel({ itemKey, lang, setLang, onClose, onJump, onOpenAccount, onLogin }) {
   useEffectD(() => {
     if (!itemKey) return;
     document.body.style.overflow = "hidden";
@@ -5584,6 +5584,15 @@ function DetailPanel({ itemKey, lang, onClose, onJump, onOpenAccount }) {
       >
         <button className="pb-detail-close" onClick={onClose} aria-label="Close"><Icon name="close" size={16} /></button>
         <div className="pb-detail-scroll">
+          {/* SAME HEADER AS HOME */}
+          <Nav
+            lang={lang}
+            setLang={setLang}
+            onLogin={onLogin}
+            onOpenAccount={() => onJump("personal")}
+            onOpenDetail={onJump}
+            onLogo={onClose}
+          />
           {/* HERO */}
           <div className="pb-detail-hero">
             <div className="pb-detail-crumb">
@@ -5855,9 +5864,11 @@ function App() {
       <DetailPanel
         itemKey={detailKey}
         lang={lang}
+        setLang={setLangBoth}
         onClose={() => setDetailKey(null)}
         onJump={(k) => setDetailKey(k)}
         onOpenAccount={() => setLoginOpen(true)}
+        onLogin={() => setLoginOpen(true)}
       />
 
       <TweaksPanel title="Tweaks" defaultPosition={{ right: 24, bottom: 24 }} width={300}>
