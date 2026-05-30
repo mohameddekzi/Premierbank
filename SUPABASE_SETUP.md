@@ -52,10 +52,26 @@ create table if not exists public.site_content (
   updated_at timestamptz default now()
 );
 
+-- ATM locations
+create table if not exists public.atms (
+  id         uuid primary key default gen_random_uuid(),
+  location   text not null,
+  number     text,
+  region     text,
+  lat        text,
+  lng        text,
+  image      text,
+  created_at timestamptz default now()
+);
+
 -- ============ ROW-LEVEL SECURITY ============
 alter table public.team_members enable row level security;
 alter table public.posts        enable row level security;
 alter table public.site_content enable row level security;
+alter table public.atms         enable row level security;
+
+create policy "atms read"  on public.atms for select using (true);
+create policy "atms write" on public.atms for all to authenticated using (true) with check (true);
 
 -- Site content: anyone may read; only signed-in admins may write.
 create policy "content read"  on public.site_content for select using (true);
