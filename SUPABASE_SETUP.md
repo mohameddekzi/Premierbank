@@ -45,9 +45,22 @@ create table if not exists public.posts (
   created_at timestamptz default now()
 );
 
+-- Key/value store powering the full dashboard (branding, hero, page text…)
+create table if not exists public.site_content (
+  key        text primary key,
+  value      jsonb,
+  updated_at timestamptz default now()
+);
+
 -- ============ ROW-LEVEL SECURITY ============
 alter table public.team_members enable row level security;
 alter table public.posts        enable row level security;
+alter table public.site_content enable row level security;
+
+-- Site content: anyone may read; only signed-in admins may write.
+create policy "content read"  on public.site_content for select using (true);
+create policy "content write" on public.site_content for all
+  to authenticated using (true) with check (true);
 
 -- Team: anyone may read; only signed-in admins may write.
 create policy "team read"  on public.team_members for select using (true);
@@ -102,6 +115,28 @@ create policy "media delete" on storage.objects for delete to authenticated usin
 - **Posts & Press tab:** create a news item or press release — drag & drop a
   cover image, write the title/summary/body, tick **Published**. It appears on
   the public **Newsroom** / **Press Releases** pages.
+
+### The full dashboard
+
+The admin is a complete control centre with a sidebar:
+
+| Section | What you control |
+|---|---|
+| **Dashboard** | Overview & quick links |
+| **Branding** | Primary & accent colours — applied site-wide instantly |
+| **Hero slides** | Add / edit / reorder the homepage hero slides (EN + SO) |
+| **Page content** | Edit the title, eyebrow, tagline & feature cards of *any* About / Accounts / Cards / Services / News page (EN + SO) |
+| **Team** | Board, Senior Management & Shari'ah members with photos |
+| **News & Press** | Posts and press releases |
+| **Settings** | Supabase connection & your password |
+
+Everything is bilingual (English / Somali) and goes live the moment you save —
+no code, no redeploy.
+
+> **Already ran the SQL before this update?** Just run the new `site_content`
+> table + its two policies (they're included in the block above) once more — the
+> `create table if not exists` / `create policy` statements are safe to re-run;
+> if a policy already exists, ignore the "already exists" notice.
 
 ---
 
