@@ -719,6 +719,60 @@ img { max-width: 100%; display: block; }
 .pb-member-bio { font-size: 13.5px; line-height: 1.55; color: var(--pb-muted); margin: 0; }
 @media (max-width: 720px) { .pb-member-grid { grid-template-columns: 1fr; } .pb-member { grid-template-columns: 64px 1fr; gap: 16px; padding: 18px; } .pb-member-photo { width: 64px; height: 64px; } }
 
+.pb-post-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 22px; }
+.pb-post { background: var(--pb-paper); border: 1px solid var(--pb-line); border-radius: 18px; overflow: hidden; transition: transform .18s ease, box-shadow .18s ease; display: flex; flex-direction: column; }
+.pb-post:hover { transform: translateY(-2px); box-shadow: 0 12px 32px rgba(11, 47, 79, .08); }
+.pb-post-cover { aspect-ratio: 16/9; overflow: hidden; background: var(--pb-secondary-100); }
+.pb-post-cover img { width: 100%; height: 100%; object-fit: cover; }
+.pb-post-body { padding: 22px; }
+.pb-post-meta { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; font-size: 12px; color: var(--pb-muted); }
+.pb-post-tag { background: var(--pb-secondary-100); color: var(--pb-secondary-700); font-weight: 600; padding: 2px 8px; border-radius: 6px; text-transform: uppercase; letter-spacing: .04em; }
+.pb-post-body h3 { font-family: 'Lexend', sans-serif; font-size: 19px; font-weight: 600; color: var(--pb-ink); margin: 0 0 8px; letter-spacing: -.2px; }
+.pb-post-summary { font-size: 14px; line-height: 1.55; color: var(--pb-muted); margin: 0 0 12px; }
+.pb-post-more summary { font-size: 13px; font-weight: 600; color: var(--pb-secondary-700); cursor: pointer; }
+.pb-post-content { margin-top: 12px; }
+.pb-post-content p { font-size: 14px; line-height: 1.6; color: var(--pb-ink); margin: 0 0 10px; }
+@media (max-width: 720px) { .pb-post-grid { grid-template-columns: 1fr; } }
+
+/* ---- Admin panel ---- */
+.adm-overlay { position: fixed; inset: 0; z-index: 9999; background: rgba(8, 24, 40, .55); backdrop-filter: blur(4px); display: flex; align-items: flex-start; justify-content: center; padding: 32px 16px; overflow-y: auto; }
+.adm-shell { width: 100%; max-width: 760px; background: #fff; border-radius: 20px; box-shadow: 0 30px 80px rgba(8, 24, 40, .35); overflow: hidden; font-family: 'Lexend', sans-serif; }
+.adm-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 22px; background: var(--pb-primary); color: #fff; }
+.adm-brand { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+.adm-tabs { display: flex; gap: 4px; padding: 10px 18px 0; border-bottom: 1px solid var(--pb-line); }
+.adm-tabs button { border: 0; background: none; padding: 12px 16px; font-family: 'Lexend', sans-serif; font-size: 14px; font-weight: 600; color: var(--pb-muted); cursor: pointer; border-bottom: 2px solid transparent; }
+.adm-tabs button.is-active { color: var(--pb-primary); border-bottom-color: var(--pb-secondary); }
+.adm-body { padding: 22px; max-height: 70vh; overflow-y: auto; }
+.adm-toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.adm-toolbar h3, .adm-editor h3, .adm-login h3 { font-size: 18px; font-weight: 600; color: var(--pb-ink); margin: 0; }
+.adm-group { margin-bottom: 22px; }
+.adm-group h4 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--pb-secondary-700); margin: 0 0 10px; }
+.adm-item { display: flex; align-items: center; gap: 14px; padding: 12px; border: 1px solid var(--pb-line); border-radius: 12px; margin-bottom: 10px; }
+.adm-item-av { width: 44px; height: 44px; border-radius: 10px; overflow: hidden; background: var(--pb-primary); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; flex-shrink: 0; }
+.adm-item-av-wide { width: 64px; }
+.adm-item-av img { width: 100%; height: 100%; object-fit: cover; }
+.adm-item-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.adm-item-main strong { font-size: 14px; color: var(--pb-ink); }
+.adm-item-main span { font-size: 12.5px; color: var(--pb-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.adm-row { display: flex; gap: 8px; align-items: center; }
+.adm-btn { border: 1px solid var(--pb-line); background: #fff; color: var(--pb-ink); font-family: 'Lexend', sans-serif; font-size: 14px; font-weight: 600; padding: 9px 16px; border-radius: 10px; cursor: pointer; transition: background .15s ease; }
+.adm-btn:hover { background: #f4f6f8; }
+.adm-btn-primary { background: var(--pb-secondary); border-color: var(--pb-secondary); color: #06340a; }
+.adm-btn-primary:hover { background: var(--pb-secondary-700); color: #fff; }
+.adm-sm { padding: 6px 12px; font-size: 13px; }
+.adm-danger { color: #c0392b; }
+.adm-muted { color: var(--pb-muted); font-size: 13.5px; }
+.adm-editor, .adm-login { display: flex; flex-direction: column; gap: 14px; max-width: 520px; }
+.adm-field { display: flex; flex-direction: column; gap: 6px; }
+.adm-field > span { font-size: 12.5px; font-weight: 600; color: var(--pb-ink); }
+.adm-field input, .adm-field select, .adm-field textarea { font-family: 'Lexend', sans-serif; font-size: 14px; padding: 10px 12px; border: 1px solid var(--pb-line); border-radius: 10px; color: var(--pb-ink); background: #fff; width: 100%; box-sizing: border-box; }
+.adm-field textarea { resize: vertical; }
+.adm-check { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--pb-ink); }
+.adm-drop { border: 2px dashed var(--pb-line); border-radius: 12px; padding: 18px; text-align: center; cursor: pointer; position: relative; transition: border-color .15s ease, background .15s ease; }
+.adm-drop.is-over { border-color: var(--pb-secondary); background: var(--pb-secondary-100); }
+.adm-drop-img { max-height: 140px; max-width: 100%; border-radius: 8px; margin-bottom: 10px; display: block; margin-left: auto; margin-right: auto; }
+.adm-drop-hint { font-size: 13px; color: var(--pb-muted); }
+
 .pb-detail-steps { display: grid; gap: 0; }
 .pb-detail-step { display: grid; grid-template-columns: 80px 1fr; gap: 24px; padding: 24px 0; border-top: 1px solid var(--pb-line); align-items: start; }
 .pb-detail-step:first-child { border-top: 0; padding-top: 0; }
@@ -763,6 +817,7 @@ img { max-width: 100%; display: block; }
 </head>
 <body>
   <div id="root"></div>
+  <div id="admin-root"></div>
 
   <script>
 /**
@@ -1746,6 +1801,94 @@ window.PB_CONTENT = {
   <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
   <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
   <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <!-- Supabase backend client (secure login + database + storage) -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+  <script>
+/* ==========================================================================
+   Premier Bank — Supabase data layer (PBData)
+   --------------------------------------------------------------------------
+   1. Create a free project at https://supabase.com
+   2. Paste your Project URL + anon (public) key below, OR configure them
+      live from the admin panel (#admin → Settings) — stored in localStorage.
+   3. Run the SQL in SUPABASE_SETUP.md to create tables, policies & storage.
+   The anon key is safe to expose publicly; security is enforced by the
+   database's Row-Level Security policies (public read, authenticated write).
+   ========================================================================== */
+window.PB_SUPABASE = {
+  url:     "https://YOUR-PROJECT.supabase.co",
+  anonKey: "YOUR-ANON-PUBLIC-KEY",
+};
+
+(function () {
+  const cfg = {
+    url:     localStorage.getItem("pb_sb_url") || window.PB_SUPABASE.url,
+    anonKey: localStorage.getItem("pb_sb_key") || window.PB_SUPABASE.anonKey,
+  };
+  const ready = cfg.url && cfg.anonKey && !cfg.url.includes("YOUR-PROJECT") && !cfg.anonKey.includes("YOUR-ANON");
+  let client = null;
+  if (ready && window.supabase) {
+    try { client = window.supabase.createClient(cfg.url, cfg.anonKey); }
+    catch (e) { console.warn("Supabase init failed:", e.message); }
+  }
+  const emit = () => window.dispatchEvent(new CustomEvent("pb:data"));
+
+  window.PBData = {
+    cfg,
+    isConfigured() { return !!client; },
+    get client() { return client; },
+
+    async loadTeam() {
+      if (!client) return;
+      const { data, error } = await client.from("team_members").select("*").order("sort", { ascending: true });
+      if (error) { console.warn("team load:", error.message); return; }
+      const groups = {};
+      (data || []).forEach(m => {
+        (groups[m.category] = groups[m.category] || []).push({
+          id: m.id, name: m.name, title: m.title, bio: m.bio, photo: m.photo_url, sort: m.sort,
+        });
+      });
+      window.PB_LIVE_TEAM = groups;
+      emit();
+    },
+    async loadPosts() {
+      if (!client) return;
+      const { data, error } = await client.from("posts").select("*").eq("published", true).order("created_at", { ascending: false });
+      if (error) { console.warn("posts load:", error.message); return; }
+      window.PB_LIVE_POSTS = data || [];
+      emit();
+    },
+
+    /* auth */
+    async signIn(email, password) { return client.auth.signInWithPassword({ email, password }); },
+    async signOut() { return client.auth.signOut(); },
+    async getSession() { const { data } = await client.auth.getSession(); return data.session; },
+    onAuth(cb) { return client.auth.onAuthStateChange((_e, s) => cb(s)); },
+    async changePassword(newPassword) { return client.auth.updateUser({ password: newPassword }); },
+
+    /* team CRUD */
+    async listMembers() { return client.from("team_members").select("*").order("category", { ascending: true }).order("sort", { ascending: true }); },
+    async saveMember(m) { return client.from("team_members").upsert(m).select(); },
+    async deleteMember(id) { return client.from("team_members").delete().eq("id", id); },
+
+    /* posts CRUD */
+    async listPosts() { return client.from("posts").select("*").order("created_at", { ascending: false }); },
+    async savePost(p) { return client.from("posts").upsert(p).select(); },
+    async deletePost(id) { return client.from("posts").delete().eq("id", id); },
+
+    /* storage (drag & drop images) */
+    async uploadImage(file, folder) {
+      const ext = (file.name.split(".").pop() || "png").toLowerCase();
+      const path = (folder || "misc") + "/" + Date.now() + "-" + Math.random().toString(36).slice(2, 8) + "." + ext;
+      const { error } = await client.storage.from("media").upload(path, file, { upsert: true, contentType: file.type });
+      if (error) throw error;
+      return client.storage.from("media").getPublicUrl(path).data.publicUrl;
+    },
+  };
+
+  if (client) { window.PBData.loadTeam(); window.PBData.loadPosts(); }
+})();
+  </script>
 
   <script type="text/babel">
 // Premier Bank — Logo + Icon vector system
@@ -5315,6 +5458,13 @@ function DetailPanel({ itemKey, lang, onClose, onJump, onOpenAccount }) {
   const liveMembers = (window.PB_LIVE_TEAM && window.PB_LIVE_TEAM[itemKey]) || null;
   const members = (liveMembers && liveMembers.length ? liveMembers : d.members) || [];
 
+  // Live posts / press releases from Supabase.
+  const allPosts = window.PB_LIVE_POSTS || [];
+  const livePosts = (itemKey === "news" || itemKey === "press")
+    ? (itemKey === "press" ? allPosts.filter(p => p.category === "press") : allPosts)
+    : [];
+  const fmtDate = (s) => { try { return new Date(s).toLocaleDateString(lang === "so" ? "so" : "en-GB", { year: "numeric", month: "short", day: "numeric" }); } catch (e) { return ""; } };
+
   const related = Object.entries(D)
     .filter(([k, v]) => v.cat === d.cat && k !== itemKey)
     .slice(0, 4);
@@ -5379,6 +5529,37 @@ function DetailPanel({ itemKey, lang, onClose, onJump, onOpenAccount }) {
                     <h3>{f.title}</h3>
                     <p>{f.body}</p>
                   </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* LIVE POSTS / PRESS RELEASES */}
+          {livePosts.length > 0 && (
+            <div className="pb-detail-section">
+              <div className="pb-detail-section-head">
+                <span className="pb-detail-sec-num">01</span>
+                <h2>{lang === "en" ? "Latest" : "Kuwa cusub"}</h2>
+              </div>
+              <div className="pb-post-grid">
+                {livePosts.map((p) => (
+                  <article key={p.id} className="pb-post">
+                    {p.cover_url && <div className="pb-post-cover"><img src={p.cover_url} alt={p.title} /></div>}
+                    <div className="pb-post-body">
+                      <div className="pb-post-meta">
+                        {p.category === "press" && <span className="pb-post-tag">{lang === "en" ? "Press" : "Saxaafad"}</span>}
+                        {p.created_at && <time>{fmtDate(p.created_at)}</time>}
+                      </div>
+                      <h3>{p.title}</h3>
+                      {p.summary && <p className="pb-post-summary">{p.summary}</p>}
+                      {p.body && (
+                        <details className="pb-post-more">
+                          <summary>{lang === "en" ? "Read more" : "Akhri wax dheeraad ah"}</summary>
+                          <div className="pb-post-content">{p.body.split("\n").filter(Boolean).map((para, i) => <p key={i}>{para}</p>)}</div>
+                        </details>
+                      )}
+                    </div>
+                  </article>
                 ))}
               </div>
             </div>
@@ -5512,6 +5693,14 @@ function App() {
   const [lang, setLang] = useStateA(t.language || "en");
   const [loginOpen, setLoginOpen] = useStateA(false);
   const [detailKey, setDetailKey] = useStateA(null);
+  const [, setDataTick] = useStateA(0);
+
+  // Re-render when live Supabase data (team / posts) arrives or changes.
+  useEffectA(() => {
+    const onData = () => setDataTick((n) => n + 1);
+    window.addEventListener("pb:data", onData);
+    return () => window.removeEventListener("pb:data", onData);
+  }, []);
 
   useEffectA(() => { setLang(t.language); }, [t.language]);
 
@@ -5596,6 +5785,346 @@ function tint(hex, amt) { return shade(hex, amt); }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
+  </script>
+
+  <!-- ====================================================================== -->
+  <!--  ADMIN — secure content management (Supabase Auth + DB + Storage)       -->
+  <!--  Open by adding #admin to the URL, e.g. .../index.html#admin            -->
+  <!-- ====================================================================== -->
+  <script type="text/babel">
+(function () {
+  const { useState: uS, useEffect: uE, useRef: uR } = React;
+
+  /* ---- drag & drop image uploader ---- */
+  function AdmDrop({ value, onUpload, folder, label }) {
+    const [busy, setBusy] = uS(false);
+    const [over, setOver] = uS(false);
+    const inputRef = uR(null);
+    const handle = async (file) => {
+      if (!file) return;
+      if (!window.PBData.isConfigured()) { alert("Connect Supabase first (Settings tab)."); return; }
+      setBusy(true);
+      try { const url = await window.PBData.uploadImage(file, folder); onUpload(url); }
+      catch (e) { alert("Upload failed: " + e.message); }
+      setBusy(false);
+    };
+    return (
+      <div className={"adm-drop" + (over ? " is-over" : "")}
+        onDragOver={(e) => { e.preventDefault(); setOver(true); }}
+        onDragLeave={() => setOver(false)}
+        onDrop={(e) => { e.preventDefault(); setOver(false); handle(e.dataTransfer.files[0]); }}
+        onClick={() => inputRef.current && inputRef.current.click()}>
+        {value ? <img src={value} alt="" className="adm-drop-img" /> : null}
+        <div className="adm-drop-hint">{busy ? "Uploading…" : (value ? "Drop / click to replace" : (label || "Drag an image here, or click to browse"))}</div>
+        <input ref={inputRef} type="file" accept="image/*" hidden onChange={(e) => handle(e.target.files[0])} />
+      </div>
+    );
+  }
+
+  function AdmField({ label, children }) {
+    return <label className="adm-field"><span>{label}</span>{children}</label>;
+  }
+
+  const ADM_CATS = [
+    { value: "board",      label: "Board of Directors" },
+    { value: "leadership", label: "Senior Management" },
+    { value: "shariah",    label: "Shari'ah Board" },
+  ];
+  const catLabel = (v) => (ADM_CATS.find((c) => c.value === v) || {}).label || v;
+
+  /* ---- team members ---- */
+  function AdmTeam() {
+    const [items, setItems] = uS([]);
+    const [editing, setEditing] = uS(null);
+    const [loading, setLoading] = uS(true);
+    const load = async () => {
+      setLoading(true);
+      const { data, error } = await window.PBData.listMembers();
+      if (error) alert("Load failed: " + error.message); else setItems(data || []);
+      setLoading(false);
+    };
+    uE(() => { load(); }, []);
+    const newMember = () => setEditing({ category: "board", name: "", title: "", bio: "", photo_url: "", sort: items.length });
+    const save = async () => {
+      const m = { ...editing };
+      if (m.id == null) delete m.id;
+      if (!m.name) { alert("Name is required."); return; }
+      const { error } = await window.PBData.saveMember(m);
+      if (error) { alert("Save failed: " + error.message); return; }
+      setEditing(null); await load(); window.PBData.loadTeam();
+    };
+    const del = async (id) => {
+      if (!confirm("Delete this member?")) return;
+      const { error } = await window.PBData.deleteMember(id);
+      if (error) { alert("Delete failed: " + error.message); return; }
+      await load(); window.PBData.loadTeam();
+    };
+
+    if (editing) {
+      return (
+        <div className="adm-editor">
+          <h3>{editing.id ? "Edit member" : "New member"}</h3>
+          <AdmField label="Section">
+            <select value={editing.category} onChange={(e) => setEditing({ ...editing, category: e.target.value })}>
+              {ADM_CATS.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
+            </select>
+          </AdmField>
+          <AdmField label="Photo">
+            <AdmDrop value={editing.photo_url} folder="team" onUpload={(url) => setEditing({ ...editing, photo_url: url })} />
+          </AdmField>
+          <AdmField label="Full name">
+            <input value={editing.name} onChange={(e) => setEditing({ ...editing, name: e.target.value })} placeholder="e.g. Jibril Hassan Mohamed" />
+          </AdmField>
+          <AdmField label="Title / role">
+            <input value={editing.title || ""} onChange={(e) => setEditing({ ...editing, title: e.target.value })} placeholder="e.g. Chairman" />
+          </AdmField>
+          <AdmField label="Bio / description">
+            <textarea rows={5} value={editing.bio || ""} onChange={(e) => setEditing({ ...editing, bio: e.target.value })} placeholder="Short biography…" />
+          </AdmField>
+          <AdmField label="Sort order">
+            <input type="number" value={editing.sort ?? 0} onChange={(e) => setEditing({ ...editing, sort: parseInt(e.target.value || "0", 10) })} />
+          </AdmField>
+          <div className="adm-row">
+            <button className="adm-btn adm-btn-primary" onClick={save}>Save</button>
+            <button className="adm-btn" onClick={() => setEditing(null)}>Cancel</button>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div>
+        <div className="adm-toolbar">
+          <h3>Team members</h3>
+          <button className="adm-btn adm-btn-primary" onClick={newMember}>+ Add member</button>
+        </div>
+        {loading ? <p className="adm-muted">Loading…</p> : (
+          items.length === 0 ? <p className="adm-muted">No members yet. Click “Add member”.</p> :
+          ADM_CATS.map((c) => {
+            const group = items.filter((m) => m.category === c.value);
+            if (!group.length) return null;
+            return (
+              <div key={c.value} className="adm-group">
+                <h4>{c.label}</h4>
+                {group.map((m) => (
+                  <div key={m.id} className="adm-item">
+                    <div className="adm-item-av">{m.photo_url ? <img src={m.photo_url} alt="" /> : <span>{(m.name || "?").slice(0, 1)}</span>}</div>
+                    <div className="adm-item-main"><strong>{m.name}</strong><span>{m.title}</span></div>
+                    <div className="adm-row">
+                      <button className="adm-btn adm-sm" onClick={() => setEditing(m)}>Edit</button>
+                      <button className="adm-btn adm-sm adm-danger" onClick={() => del(m.id)}>Delete</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+          })
+        )}
+      </div>
+    );
+  }
+
+  /* ---- posts / press releases ---- */
+  function AdmPosts() {
+    const [items, setItems] = uS([]);
+    const [editing, setEditing] = uS(null);
+    const [loading, setLoading] = uS(true);
+    const load = async () => {
+      setLoading(true);
+      const { data, error } = await window.PBData.listPosts();
+      if (error) alert("Load failed: " + error.message); else setItems(data || []);
+      setLoading(false);
+    };
+    uE(() => { load(); }, []);
+    const newPost = () => setEditing({ category: "news", title: "", summary: "", body: "", cover_url: "", published: true });
+    const save = async () => {
+      const p = { ...editing };
+      if (p.id == null) delete p.id;
+      if (!p.title) { alert("Title is required."); return; }
+      const { error } = await window.PBData.savePost(p);
+      if (error) { alert("Save failed: " + error.message); return; }
+      setEditing(null); await load(); window.PBData.loadPosts();
+    };
+    const del = async (id) => {
+      if (!confirm("Delete this post?")) return;
+      const { error } = await window.PBData.deletePost(id);
+      if (error) { alert("Delete failed: " + error.message); return; }
+      await load(); window.PBData.loadPosts();
+    };
+
+    if (editing) {
+      return (
+        <div className="adm-editor">
+          <h3>{editing.id ? "Edit post" : "New post / press release"}</h3>
+          <AdmField label="Type">
+            <select value={editing.category} onChange={(e) => setEditing({ ...editing, category: e.target.value })}>
+              <option value="news">News</option>
+              <option value="press">Press Release</option>
+            </select>
+          </AdmField>
+          <AdmField label="Cover image">
+            <AdmDrop value={editing.cover_url} folder="posts" onUpload={(url) => setEditing({ ...editing, cover_url: url })} />
+          </AdmField>
+          <AdmField label="Title">
+            <input value={editing.title} onChange={(e) => setEditing({ ...editing, title: e.target.value })} placeholder="Headline…" />
+          </AdmField>
+          <AdmField label="Summary">
+            <textarea rows={2} value={editing.summary || ""} onChange={(e) => setEditing({ ...editing, summary: e.target.value })} placeholder="One or two sentence teaser…" />
+          </AdmField>
+          <AdmField label="Body">
+            <textarea rows={8} value={editing.body || ""} onChange={(e) => setEditing({ ...editing, body: e.target.value })} placeholder="Full text. Separate paragraphs with a blank line." />
+          </AdmField>
+          <label className="adm-check"><input type="checkbox" checked={!!editing.published} onChange={(e) => setEditing({ ...editing, published: e.target.checked })} /> Published (visible on the site)</label>
+          <div className="adm-row">
+            <button className="adm-btn adm-btn-primary" onClick={save}>Save</button>
+            <button className="adm-btn" onClick={() => setEditing(null)}>Cancel</button>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div>
+        <div className="adm-toolbar">
+          <h3>Posts & press releases</h3>
+          <button className="adm-btn adm-btn-primary" onClick={newPost}>+ New post</button>
+        </div>
+        {loading ? <p className="adm-muted">Loading…</p> : (
+          items.length === 0 ? <p className="adm-muted">No posts yet. Click “New post”.</p> :
+          items.map((p) => (
+            <div key={p.id} className="adm-item">
+              <div className="adm-item-av adm-item-av-wide">{p.cover_url ? <img src={p.cover_url} alt="" /> : <span>{p.category === "press" ? "PR" : "N"}</span>}</div>
+              <div className="adm-item-main">
+                <strong>{p.title} {p.published ? "" : <em className="adm-muted">(draft)</em>}</strong>
+                <span>{catLabel(p.category) === p.category ? p.category : (p.category === "press" ? "Press Release" : "News")} · {p.summary || ""}</span>
+              </div>
+              <div className="adm-row">
+                <button className="adm-btn adm-sm" onClick={() => setEditing(p)}>Edit</button>
+                <button className="adm-btn adm-sm adm-danger" onClick={() => del(p.id)}>Delete</button>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    );
+  }
+
+  /* ---- settings: connect Supabase + change password ---- */
+  function AdmSettings({ session }) {
+    const [url, setUrl] = uS(localStorage.getItem("pb_sb_url") || "");
+    const [key, setKey] = uS(localStorage.getItem("pb_sb_key") || "");
+    const [pw, setPw] = uS("");
+    const saveConn = () => {
+      localStorage.setItem("pb_sb_url", url.trim());
+      localStorage.setItem("pb_sb_key", key.trim());
+      alert("Saved. The page will reload to connect.");
+      location.reload();
+    };
+    const clearConn = () => { localStorage.removeItem("pb_sb_url"); localStorage.removeItem("pb_sb_key"); location.reload(); };
+    const changePw = async () => {
+      if (pw.length < 6) { alert("Password must be at least 6 characters."); return; }
+      const { error } = await window.PBData.changePassword(pw);
+      alert(error ? ("Failed: " + error.message) : "Password updated.");
+      setPw("");
+    };
+    return (
+      <div className="adm-editor">
+        <h3>Connect Supabase</h3>
+        <p className="adm-muted">Paste your project URL and anon (public) key. Stored locally in this browser and used to connect the admin to your backend.</p>
+        <AdmField label="Project URL"><input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://xxxx.supabase.co" /></AdmField>
+        <AdmField label="Anon public key"><input value={key} onChange={(e) => setKey(e.target.value)} placeholder="eyJhbGci…" /></AdmField>
+        <div className="adm-row">
+          <button className="adm-btn adm-btn-primary" onClick={saveConn}>Save & reload</button>
+          <button className="adm-btn" onClick={clearConn}>Clear</button>
+        </div>
+        {session && (
+          <>
+            <h3 style={{ marginTop: 28 }}>Change password</h3>
+            <AdmField label="New password"><input type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="At least 6 characters" /></AdmField>
+            <div className="adm-row"><button className="adm-btn adm-btn-primary" onClick={changePw}>Update password</button></div>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  /* ---- login ---- */
+  function AdmLogin() {
+    const [email, setEmail] = uS("");
+    const [pw, setPw] = uS("");
+    const [busy, setBusy] = uS(false);
+    const submit = async (e) => {
+      e.preventDefault(); setBusy(true);
+      const { error } = await window.PBData.signIn(email, pw);
+      setBusy(false);
+      if (error) alert("Login failed: " + error.message);
+    };
+    return (
+      <form className="adm-login" onSubmit={submit}>
+        <h3>Admin sign in</h3>
+        <AdmField label="Email"><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoFocus /></AdmField>
+        <AdmField label="Password"><input type="password" value={pw} onChange={(e) => setPw(e.target.value)} /></AdmField>
+        <button className="adm-btn adm-btn-primary" disabled={busy}>{busy ? "Signing in…" : "Sign in"}</button>
+      </form>
+    );
+  }
+
+  function AdminApp() {
+    const [show, setShow] = uS(location.hash === "#admin");
+    const [session, setSession] = uS(null);
+    const [tab, setTab] = uS("team");
+    uE(() => {
+      const onHash = () => setShow(location.hash === "#admin");
+      window.addEventListener("hashchange", onHash);
+      return () => window.removeEventListener("hashchange", onHash);
+    }, []);
+    uE(() => {
+      if (!window.PBData.isConfigured()) return;
+      window.PBData.getSession().then(setSession);
+      const { data } = window.PBData.onAuth(setSession);
+      return () => { try { data.subscription.unsubscribe(); } catch (e) {} };
+    }, []);
+
+    if (!show) return null;
+    const configured = window.PBData.isConfigured();
+    const close = () => { history.replaceState(null, "", location.pathname + location.search); setShow(false); };
+
+    return (
+      <div className="adm-overlay">
+        <div className="adm-shell">
+          <header className="adm-head">
+            <div className="adm-brand"><LogoMark size={26} variant="color" /> <span>Premier Admin</span></div>
+            <div className="adm-row">
+              {configured && session && <button className="adm-btn adm-sm" onClick={() => window.PBData.signOut()}>Sign out</button>}
+              <button className="adm-btn adm-sm" onClick={close}>Close ✕</button>
+            </div>
+          </header>
+
+          {!configured ? (
+            <div className="adm-body"><AdmSettings session={null} /></div>
+          ) : !session ? (
+            <div className="adm-body"><AdmLogin /></div>
+          ) : (
+            <>
+              <nav className="adm-tabs">
+                <button className={tab === "team" ? "is-active" : ""} onClick={() => setTab("team")}>Team</button>
+                <button className={tab === "posts" ? "is-active" : ""} onClick={() => setTab("posts")}>Posts & Press</button>
+                <button className={tab === "settings" ? "is-active" : ""} onClick={() => setTab("settings")}>Settings</button>
+              </nav>
+              <div className="adm-body">
+                {tab === "team" && <AdmTeam />}
+                {tab === "posts" && <AdmPosts />}
+                {tab === "settings" && <AdmSettings session={session} />}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById("admin-root")).render(<AdminApp />);
+})();
   </script>
 </body>
 </html>
