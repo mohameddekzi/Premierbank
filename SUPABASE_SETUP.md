@@ -89,10 +89,12 @@ create policy "posts read admin"  on public.posts for select to authenticated us
 create policy "posts write"        on public.posts for all
   to authenticated using (true) with check (true);
 
--- ============ STORAGE (images for photos & post covers) ============
+-- ============ STORAGE (images for logos, photos, covers, ATMs) ============
+-- IMPORTANT: the bucket id/name must be EXACTLY 'media' and MUST be public,
+-- otherwise uploads fail ("Bucket not found") or images show a broken icon.
 insert into storage.buckets (id, name, public)
 values ('media', 'media', true)
-on conflict (id) do nothing;
+on conflict (id) do update set public = true;
 
 create policy "media read"   on storage.objects for select using (bucket_id = 'media');
 create policy "media insert" on storage.objects for insert to authenticated with check (bucket_id = 'media');
@@ -140,19 +142,55 @@ The admin is a complete control centre with a sidebar:
 |---|---|
 | **Dashboard** | Overview & quick links |
 | **Branding** | Primary & accent colours — applied site-wide instantly |
-| **Hero slides** | Add / edit / reorder the homepage hero slides (EN + SO) |
+| **Logo** | Upload your own header / footer / mark logos (drag & drop) with a **live preview** before publishing |
+| **Hero slides** | Add / edit / reorder homepage hero slides (EN + SO) + optional side image or full background image |
 | **Page content** | Edit the title, eyebrow, tagline & feature cards of *any* About / Accounts / Cards / Services / News page (EN + SO) |
 | **Team** | Board, Senior Management & Shari'ah members with photos |
-| **News & Press** | Posts and press releases |
+| **News & Press** | Posts and press releases with cover images |
+| **ATM locations** | ATMs with photo, location, number, region & GPS (lat/lng) — searchable & filterable on the public ATM page |
 | **Settings** | Supabase connection & your password |
 
 Everything is bilingual (English / Somali) and goes live the moment you save —
-no code, no redeploy.
+no code, no redeploy. Detail pages now open **full-width** (like the home page)
+with the same header and footer.
 
-> **Already ran the SQL before this update?** Just run the new `site_content`
-> table + its two policies (they're included in the block above) once more — the
-> `create table if not exists` / `create policy` statements are safe to re-run;
-> if a policy already exists, ignore the "already exists" notice.
+> **Already created the tables before this update?** Just re-run the SQL block in
+> step 2 — every statement uses `create … if not exists` / `on conflict`, so it is
+> safe to run again. It adds the newer `site_content` and `atms` tables and makes
+> sure the `media` bucket is public. If you see an "already exists" notice for a
+> policy, ignore it.
+
+---
+
+## Troubleshooting (real issues we hit & fixed)
+
+**"Upload failed: Bucket not found"**
+The storage bucket must be named **exactly** `media` (lowercase, no spaces — not
+`media - pbs`, `Media`, etc.). Fix it by running:
+```sql
+delete from storage.buckets where id <> 'media' and name ilike '%media%';
+insert into storage.buckets (id, name, public) values ('media','media',true)
+on conflict (id) do update set public = true;
+```
+
+**Image uploads but shows a broken "?" icon**
+The bucket isn't public. Fix:
+```sql
+update storage.buckets set public = true where id = 'media';
+```
+
+**"Where did my image go?"** — When you upload an image, the *file* is stored in
+**Storage → media** (in folders like `logos/`, `atms/`, `team/`). The database
+table (e.g. `site_content`, `atms`) only stores the **public URL** that points to
+it. That's by design: big files live in Storage, the DB keeps a small link. The
+website reads both directly — no code editing ever needed.
+
+**Verify everything is set up** — run this and check the output:
+```sql
+select id, name, public from storage.buckets where id = 'media';  -- expect: media | media | true
+select table_name from information_schema.tables
+  where table_schema='public' order by table_name;                -- expect: atms, posts, site_content, team_members
+```
 
 ---
 
