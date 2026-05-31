@@ -852,6 +852,10 @@ img { max-width: 100%; display: block; }
 .adm-logo-prev-dark .adm-logo-prev-label { color: rgba(255,255,255,.6); }
 .adm-logo-prev em { color: var(--pb-muted); font-size: 13px; }
 .adm-preview-note { font-size: 12.5px; color: #9a6311; margin: 10px 0 0; }
+.adm-size-ctl { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.adm-size-label { font-size: 12px; font-weight: 700; color: var(--pb-muted); margin-right: 4px; }
+.adm-size-input { width: 64px; font-family: 'Lexend', sans-serif; font-size: 13px; padding: 6px 8px; border: 1px solid var(--pb-line); border-radius: 8px; text-align: center; }
+.adm-size-px { font-size: 12px; color: var(--pb-muted); }
 .adm-btn-block { width: 100%; justify-content: center; }
 .adm-login-wrap { padding: 36px 30px; }
 .adm-login { display: flex; flex-direction: column; gap: 14px; }
@@ -2128,14 +2132,17 @@ const LOGO_MARK_B64  = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAADbQAAAmxCA
 function PBLogo({ variant = "color", size = 40, showWord = true, className = "" }) {
   const lg = (window.PB_OVERRIDES && window.PB_OVERRIDES.logos) || {};
   if (!showWord || variant === "mark") {
-    return <img src={lg.mark || LOGO_MARK_B64} height={size} style={{width:"auto",display:"inline-block",verticalAlign:"middle"}} className={className} alt="Premier Bank" />;
+    const mh = lg.markSize || size;
+    return <img src={lg.mark || LOGO_MARK_B64} height={mh} style={{width:"auto",display:"inline-block",verticalAlign:"middle"}} className={className} alt="Premier Bank" />;
   }
   const isWhite = (variant === "white" || variant === "white-text");
   const src = isWhite ? (lg.white || LOGO_WHITE_B64) : (lg.color || LOGO_COLOR_B64);
   const custom = isWhite ? lg.white : lg.color;
-  // Official PNGs have ~40% transparent padding, so they render at size*1.4.
-  // A user-uploaded logo is tightly cropped, so render it at the requested size.
-  const h = custom ? size : Math.round(size * 1.4);
+  const slotSize = isWhite ? lg.footerSize : lg.headerSize;
+  // If the admin set an explicit size, use it. Otherwise: official PNGs have
+  // ~40% transparent padding so they render at size*1.4; a tightly-cropped
+  // uploaded logo renders at the requested size.
+  const h = slotSize ? slotSize : (custom ? size : Math.round(size * 1.4));
   return <img src={src} height={h} style={{width:"auto",display:"inline-block",verticalAlign:"middle"}} className={className} alt="Premier Bank" />;
 }
 
@@ -6429,60 +6436,80 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
   }
 
   /* ============================ LOGOS ============================ */
+  const LOGO_PRESETS = [["Small", 26], ["Medium", 40], ["Large", 56], ["Fit", 72]];
   function AdmLogos() {
     const cur = (window.PBData.getOverride("logos")) || {};
-    const [logos, setLogos] = uS({ color: cur.color || "", white: cur.white || "", mark: cur.mark || "" });
+    const [logos, setLogos] = uS({
+      color: cur.color || "", white: cur.white || "", mark: cur.mark || "",
+      headerSize: cur.headerSize || 40, footerSize: cur.footerSize || 44, markSize: cur.markSize || 30,
+    });
     const [busy, setBusy] = uS(false); const [saved, setSaved] = uS(false);
-    const set = (k, url) => { setLogos(Object.assign({}, logos, { [k]: url })); setSaved(false); };
+    const set = (k, v) => { setLogos(Object.assign({}, logos, { [k]: v })); setSaved(false); };
     // Defaults baked into the page (used when the user hasn't uploaded one).
     const DEF = { color: (typeof LOGO_COLOR_B64 !== "undefined" ? LOGO_COLOR_B64 : ""), white: (typeof LOGO_WHITE_B64 !== "undefined" ? LOGO_WHITE_B64 : ""), mark: (typeof LOGO_MARK_B64 !== "undefined" ? LOGO_MARK_B64 : "") };
     const previewSrc = (k) => logos[k] || DEF[k];
-    const dirty = (logos.color || "") !== (cur.color || "") || (logos.white || "") !== (cur.white || "") || (logos.mark || "") !== (cur.mark || "");
+    const DEFSIZE = { headerSize: 40, footerSize: 44, markSize: 30 };
+    const curVal = (f) => cur[f] != null ? cur[f] : (DEFSIZE[f] != null ? DEFSIZE[f] : "");
+    const dirty = ["color", "white", "mark", "headerSize", "footerSize", "markSize"]
+      .some(f => String(logos[f] || "") !== String(curVal(f) || ""));
     const save = async () => {
       setBusy(true);
-      const clean = {}; Object.keys(logos).forEach(k => { if (logos[k]) clean[k] = logos[k]; });
+      const clean = {};
+      ["color", "white", "mark"].forEach(k => { if (logos[k]) clean[k] = logos[k]; });
+      ["headerSize", "footerSize", "markSize"].forEach(k => { if (logos[k]) clean[k] = logos[k]; });
       const { error } = await window.PBData.saveContent("logos", clean);
       setBusy(false);
       if (error) alert("Failed: " + error.message); else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
     };
-    const Row = ({ k, title, hint, dark }) => (
+    const SizeCtl = ({ sk }) => (
+      <div className="adm-size-ctl">
+        <span className="adm-size-label">Size</span>
+        {LOGO_PRESETS.map(([lbl, px]) => (
+          <button key={lbl} type="button" className={"adm-btn adm-sm" + (logos[sk] === px ? " adm-btn-primary" : "")} onClick={() => set(sk, px)}>{lbl}</button>
+        ))}
+        <input type="number" min="14" max="140" value={logos[sk]} onChange={(e) => set(sk, parseInt(e.target.value || "0", 10))} className="adm-size-input" />
+        <span className="adm-size-px">px</span>
+      </div>
+    );
+    const Row = ({ k, sk, title, hint, dark }) => (
       <div className="adm-card">
         <div className="adm-card-head"><strong>{title}</strong>{logos[k] && <button className="adm-btn adm-sm adm-danger" onClick={() => set(k, "")}>Reset to default</button>}</div>
         <p className="adm-muted" style={{ margin: 0 }}>{hint}</p>
         <div style={dark ? { background: "var(--pb-primary)", borderRadius: 12, padding: 12 } : null}>
           <AdmDrop value={logos[k]} folder="logos" onUpload={(url) => set(k, url)} label="Drag a PNG with transparent background" />
         </div>
+        <SizeCtl sk={sk} />
       </div>
     );
     return (
       <div className="adm-pane">
         <h2 className="adm-h2">Logo upload</h2>
-        <p className="adm-muted">Upload your own logo (PNG with a transparent background works best). It replaces the logo in the header, footer and detail pages. Recommended height ≈ 80px; any width.</p>
+        <p className="adm-muted">Upload your own logo (PNG with a transparent background works best) and set the exact display size in pixels. It replaces the logo in the header, footer and detail pages.</p>
 
-        {/* LIVE PREVIEW — before publishing */}
+        {/* LIVE PREVIEW — before publishing, at the chosen sizes */}
         <div className="adm-preview-box">
           <div className="adm-preview-head">
             <strong>Live preview</strong>
             <span className={"adm-preview-tag" + (dirty ? " is-dirty" : "")}>{dirty ? "Test — not published yet" : "Currently published"}</span>
           </div>
           <div className="adm-logo-prev adm-logo-prev-light">
-            <span className="adm-logo-prev-label">Header</span>
-            {previewSrc("color") ? <img src={previewSrc("color")} alt="header logo" style={{ height: 38 }} /> : <em>No logo</em>}
+            <span className="adm-logo-prev-label">Header · {logos.headerSize}px</span>
+            {previewSrc("color") ? <img src={previewSrc("color")} alt="header logo" style={{ height: logos.headerSize }} /> : <em>No logo</em>}
           </div>
           <div className="adm-logo-prev adm-logo-prev-dark">
-            <span className="adm-logo-prev-label">Footer / login</span>
-            {previewSrc("white") ? <img src={previewSrc("white")} alt="footer logo" style={{ height: 38 }} /> : <em>No logo</em>}
+            <span className="adm-logo-prev-label">Footer · {logos.footerSize}px</span>
+            {previewSrc("white") ? <img src={previewSrc("white")} alt="footer logo" style={{ height: logos.footerSize }} /> : <em>No logo</em>}
           </div>
           <div className="adm-logo-prev adm-logo-prev-light">
-            <span className="adm-logo-prev-label">Mark</span>
-            {previewSrc("mark") ? <img src={previewSrc("mark")} alt="logo mark" style={{ height: 38 }} /> : <em>No mark</em>}
+            <span className="adm-logo-prev-label">Mark · {logos.markSize}px</span>
+            {previewSrc("mark") ? <img src={previewSrc("mark")} alt="logo mark" style={{ height: logos.markSize }} /> : <em>No mark</em>}
           </div>
-          {dirty && <p className="adm-preview-note">This is a preview of your test logo. Click <strong>Publish logo</strong> below to make it live on the website.</p>}
+          {dirty && <p className="adm-preview-note">This is a preview of your test logo at the selected sizes. Click <strong>Publish logo</strong> to make it live.</p>}
         </div>
 
-        <Row k="color" title="Header logo (dark logo on light background)" hint="Shown in the top navigation bar." />
-        <Row k="white" title="Footer / dark-background logo (white logo)" hint="Shown in the footer and the login modal." dark />
-        <Row k="mark"  title="Logo mark only (icon, no text)" hint="Used in compact places like cards and the phone mockup." />
+        <Row k="color" sk="headerSize" title="Header logo (dark logo on light background)" hint="Shown in the top navigation bar." />
+        <Row k="white" sk="footerSize" title="Footer / dark-background logo (white logo)" hint="Shown in the footer and the login modal." dark />
+        <Row k="mark"  sk="markSize"   title="Logo mark only (icon, no text)" hint="Used in compact places like cards and the phone mockup." />
         <div className="adm-savebar">
           <button className="adm-btn adm-btn-primary" onClick={save} disabled={busy || !dirty}>{busy ? "Publishing…" : (dirty ? "Publish logo" : "Nothing to publish")}</button>
           {saved && <span className="adm-saved">✓ Published & live</span>}
