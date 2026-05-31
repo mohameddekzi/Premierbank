@@ -833,9 +833,11 @@ img { max-width: 100%; display: block; }
 .adm-side-brand { display: flex; align-items: center; gap: 10px; padding: 20px; font-weight: 600; font-size: 15px; border-bottom: 1px solid rgba(255,255,255,.1); }
 .adm-side-nav { flex: 1; padding: 12px 10px; display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
 .adm-side-nav button { display: flex; align-items: center; gap: 11px; width: 100%; text-align: left; border: 0; background: none; color: rgba(255,255,255,.78); font-family: 'Lexend', sans-serif; font-size: 14px; font-weight: 500; padding: 11px 14px; border-radius: 10px; cursor: pointer; transition: background .15s ease, color .15s ease; }
-.adm-side-nav button i { font-style: normal; width: 20px; text-align: center; }
+.adm-nav-ico { font-style: normal; width: 30px; height: 30px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 8px; background: rgba(255,255,255,.08); color: rgba(255,255,255,.85); transition: all .15s ease; }
 .adm-side-nav button:hover { background: rgba(255,255,255,.08); color: #fff; }
+.adm-side-nav button:hover .adm-nav-ico { background: rgba(108,190,70,.25); color: #fff; }
 .adm-side-nav button.is-active { background: var(--pb-secondary); color: #06340a; font-weight: 600; }
+.adm-side-nav button.is-active .adm-nav-ico { background: rgba(6,52,10,.18); color: #06340a; }
 .adm-side-foot { padding: 14px; border-top: 1px solid rgba(255,255,255,.1); }
 .adm-btn-ghost { background: transparent; color: #fff; border-color: rgba(255,255,255,.25); width: 100%; }
 .adm-btn-ghost:hover { background: rgba(255,255,255,.1); }
@@ -6792,15 +6794,15 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
   /* ============================ DASHBOARD SHELL ============================ */
   const NAV = [
-    { id: "overview", label: "Dashboard", icon: "▦" },
-    { id: "branding", label: "Branding",  icon: "🎨" },
-    { id: "logos",    label: "Logo",      icon: "✦" },
-    { id: "hero",     label: "Hero slides", icon: "🖼️" },
-    { id: "pages",    label: "Page content", icon: "📄" },
-    { id: "team",     label: "Team",      icon: "👥" },
-    { id: "posts",    label: "News & Press", icon: "📰" },
-    { id: "atms",     label: "ATM locations", icon: "🏧" },
-    { id: "settings", label: "Settings",  icon: "⚙️" },
+    { id: "overview", label: "Dashboard",     icon: "invest" },
+    { id: "branding", label: "Branding",      icon: "star" },
+    { id: "logos",    label: "Logo",          icon: "shariah" },
+    { id: "hero",     label: "Hero slides",   icon: "gallery" },
+    { id: "pages",    label: "Page content",  icon: "news" },
+    { id: "team",     label: "Team",          icon: "team" },
+    { id: "posts",    label: "News & Press",  icon: "press" },
+    { id: "atms",     label: "ATM locations", icon: "atm" },
+    { id: "settings", label: "Settings",      icon: "shield" },
   ];
 
   function AdminApp() {
@@ -6839,7 +6841,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
             <nav className="adm-side-nav">
               {NAV.map((n) => (
                 <button key={n.id} className={view === n.id ? "is-active" : ""} onClick={() => go(n.id)}>
-                  <i>{n.icon}</i> {n.label}
+                  <i className="adm-nav-ico"><Icon name={n.icon} size={17} /></i> {n.label}
                 </button>
               ))}
             </nav>
