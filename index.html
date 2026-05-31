@@ -638,6 +638,32 @@ img { max-width: 100%; display: block; }
 .pb-footer-trust { display: flex; gap: 16px; flex-wrap: wrap; }
 .pb-footer-trust span { background: rgba(255, 255, 255, .05); padding: 4px 10px; border-radius: 999px; font-size: 11px; display: inline-flex; align-items: center; gap: 6px; }
 
+/* ---- Responsive: CTA closer + footer + section rhythm (all screens) ---- */
+@media (max-width: 1024px) {
+  .pb-section { padding: 84px 0; }
+}
+@media (max-width: 768px) {
+  .pb-section { padding: 60px 0; }
+  .pb-cta-card { padding: 44px 28px; }
+  .pb-cta-card-inner { max-width: 100%; }
+  .pb-footer { padding: 56px 0 24px; }
+  .pb-footer-top { gap: 32px; padding-bottom: 36px; }
+}
+@media (max-width: 560px) {
+  .pb-container { padding: 0 18px; }
+  .pb-section { padding: 44px 0; }
+  .pb-cta-card { padding: 32px 20px; border-radius: 20px; }
+  .pb-cta-card-bg { right: -180px; }
+  .pb-cta-card .pb-hero-ctas { flex-direction: column; align-items: stretch; gap: 10px; }
+  .pb-cta-card .pb-hero-ctas .pb-btn { width: 100%; justify-content: center; }
+  .pb-footer { padding: 40px 0 20px; }
+  .pb-footer-cols { grid-template-columns: 1fr 1fr; gap: 14px 18px; }
+  .pb-footer-bottom { flex-direction: column; align-items: flex-start; gap: 12px; }
+}
+@media (max-width: 380px) {
+  .pb-footer-cols { grid-template-columns: 1fr; }
+}
+
 /* ========================================================================== */
 /*  Login modal                                                               */
 /* ========================================================================== */
