@@ -840,6 +840,18 @@ img { max-width: 100%; display: block; }
 .adm-color { display: flex; gap: 8px; align-items: center; }
 .adm-color input[type=color] { width: 46px; height: 40px; padding: 0; border: 1px solid var(--pb-line); border-radius: 8px; background: none; cursor: pointer; }
 .adm-preview { display: flex; align-items: center; gap: 16px; padding: 22px; border-radius: 14px; margin: 18px 0; }
+.adm-preview-box { border: 1px solid var(--pb-line); border-radius: 14px; padding: 16px; margin: 14px 0 22px; background: #fafbfc; }
+.adm-preview-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.adm-preview-head strong { font-size: 14px; color: var(--pb-ink); }
+.adm-preview-tag { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; padding: 4px 10px; border-radius: 999px; background: var(--pb-secondary-100); color: var(--pb-secondary-700); }
+.adm-preview-tag.is-dirty { background: #fde8c8; color: #9a6311; }
+.adm-logo-prev { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border-radius: 10px; margin-bottom: 8px; }
+.adm-logo-prev-light { background: #fff; border: 1px solid var(--pb-line); }
+.adm-logo-prev-dark { background: var(--pb-primary); }
+.adm-logo-prev-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; width: 110px; flex-shrink: 0; color: var(--pb-muted); }
+.adm-logo-prev-dark .adm-logo-prev-label { color: rgba(255,255,255,.6); }
+.adm-logo-prev em { color: var(--pb-muted); font-size: 13px; }
+.adm-preview-note { font-size: 12.5px; color: #9a6311; margin: 10px 0 0; }
 .adm-btn-block { width: 100%; justify-content: center; }
 .adm-login-wrap { padding: 36px 30px; }
 .adm-login { display: flex; flex-direction: column; gap: 14px; }
@@ -6421,7 +6433,11 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     const cur = (window.PBData.getOverride("logos")) || {};
     const [logos, setLogos] = uS({ color: cur.color || "", white: cur.white || "", mark: cur.mark || "" });
     const [busy, setBusy] = uS(false); const [saved, setSaved] = uS(false);
-    const set = (k, url) => setLogos(Object.assign({}, logos, { [k]: url }));
+    const set = (k, url) => { setLogos(Object.assign({}, logos, { [k]: url })); setSaved(false); };
+    // Defaults baked into the page (used when the user hasn't uploaded one).
+    const DEF = { color: (typeof LOGO_COLOR_B64 !== "undefined" ? LOGO_COLOR_B64 : ""), white: (typeof LOGO_WHITE_B64 !== "undefined" ? LOGO_WHITE_B64 : ""), mark: (typeof LOGO_MARK_B64 !== "undefined" ? LOGO_MARK_B64 : "") };
+    const previewSrc = (k) => logos[k] || DEF[k];
+    const dirty = (logos.color || "") !== (cur.color || "") || (logos.white || "") !== (cur.white || "") || (logos.mark || "") !== (cur.mark || "");
     const save = async () => {
       setBusy(true);
       const clean = {}; Object.keys(logos).forEach(k => { if (logos[k]) clean[k] = logos[k]; });
@@ -6442,10 +6458,36 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       <div className="adm-pane">
         <h2 className="adm-h2">Logo upload</h2>
         <p className="adm-muted">Upload your own logo (PNG with a transparent background works best). It replaces the logo in the header, footer and detail pages. Recommended height ≈ 80px; any width.</p>
+
+        {/* LIVE PREVIEW — before publishing */}
+        <div className="adm-preview-box">
+          <div className="adm-preview-head">
+            <strong>Live preview</strong>
+            <span className={"adm-preview-tag" + (dirty ? " is-dirty" : "")}>{dirty ? "Test — not published yet" : "Currently published"}</span>
+          </div>
+          <div className="adm-logo-prev adm-logo-prev-light">
+            <span className="adm-logo-prev-label">Header</span>
+            {previewSrc("color") ? <img src={previewSrc("color")} alt="header logo" style={{ height: 38 }} /> : <em>No logo</em>}
+          </div>
+          <div className="adm-logo-prev adm-logo-prev-dark">
+            <span className="adm-logo-prev-label">Footer / login</span>
+            {previewSrc("white") ? <img src={previewSrc("white")} alt="footer logo" style={{ height: 38 }} /> : <em>No logo</em>}
+          </div>
+          <div className="adm-logo-prev adm-logo-prev-light">
+            <span className="adm-logo-prev-label">Mark</span>
+            {previewSrc("mark") ? <img src={previewSrc("mark")} alt="logo mark" style={{ height: 38 }} /> : <em>No mark</em>}
+          </div>
+          {dirty && <p className="adm-preview-note">This is a preview of your test logo. Click <strong>Publish logo</strong> below to make it live on the website.</p>}
+        </div>
+
         <Row k="color" title="Header logo (dark logo on light background)" hint="Shown in the top navigation bar." />
         <Row k="white" title="Footer / dark-background logo (white logo)" hint="Shown in the footer and the login modal." dark />
         <Row k="mark"  title="Logo mark only (icon, no text)" hint="Used in compact places like cards and the phone mockup." />
-        <AdmSaveBar onSave={save} busy={busy} saved={saved} />
+        <div className="adm-savebar">
+          <button className="adm-btn adm-btn-primary" onClick={save} disabled={busy || !dirty}>{busy ? "Publishing…" : (dirty ? "Publish logo" : "Nothing to publish")}</button>
+          {saved && <span className="adm-saved">✓ Published & live</span>}
+          {dirty && !saved && <span className="adm-muted">You have unpublished changes.</span>}
+        </div>
       </div>
     );
   }
