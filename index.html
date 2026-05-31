@@ -854,6 +854,10 @@ img { max-width: 100%; display: block; }
 .adm-stat strong { font-size: 30px; font-family: 'Lexend', sans-serif; color: var(--pb-primary); }
 .adm-stat span { font-size: 13px; color: var(--pb-muted); }
 .adm-quick h3 { font-size: 15px; color: var(--pb-ink); margin: 0 0 12px; }
+.adm-qa-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+.adm-qa { display: flex; align-items: center; gap: 12px; padding: 14px; border: 1px solid var(--pb-line); border-radius: 12px; background: #fff; cursor: pointer; font-family: 'Lexend', sans-serif; font-size: 14px; font-weight: 600; color: var(--pb-ink); text-align: left; transition: border-color .15s ease, transform .15s ease, box-shadow .15s ease; }
+.adm-qa:hover { border-color: var(--pb-secondary); transform: translateY(-2px); box-shadow: 0 8px 22px rgba(11,47,79,.08); }
+.adm-qa-ico { width: 38px; height: 38px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 10px; background: var(--pb-secondary-100); color: var(--pb-secondary-700); }
 .adm-wrap { flex-wrap: wrap; }
 .adm-card { border: 1px solid var(--pb-line); border-radius: 14px; padding: 18px; margin-bottom: 16px; display: flex; flex-direction: column; gap: 12px; }
 .adm-card-head { display: flex; align-items: center; justify-content: space-between; }
@@ -6226,14 +6230,21 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
         </div>
         <div className="adm-quick">
           <h3>Quick actions</h3>
-          <div className="adm-row adm-wrap">
-            <button className="adm-btn" onClick={() => go("branding")}>🎨 Brand colours</button>
-            <button className="adm-btn" onClick={() => go("logos")}>✦ Logo upload</button>
-            <button className="adm-btn" onClick={() => go("hero")}>🖼️ Hero slides</button>
-            <button className="adm-btn" onClick={() => go("pages")}>📄 Page content</button>
-            <button className="adm-btn" onClick={() => go("team")}>👥 Team</button>
-            <button className="adm-btn" onClick={() => go("posts")}>📰 News / press</button>
-            <button className="adm-btn" onClick={() => go("atms")}>🏧 ATM locations</button>
+          <div className="adm-qa-grid">
+            {[
+              ["branding", "Brand colours", "star"],
+              ["logos", "Logo upload", "shariah"],
+              ["hero", "Hero slides", "gallery"],
+              ["pages", "Page content", "news"],
+              ["team", "Team", "team"],
+              ["posts", "News / press", "press"],
+              ["atms", "ATM locations", "atm"],
+            ].map(([to, label, icon]) => (
+              <button key={to} className="adm-qa" onClick={() => go(to)}>
+                <i className="adm-qa-ico"><Icon name={icon} size={18} /></i>
+                <span>{label}</span>
+              </button>
+            ))}
           </div>
         </div>
       </div>
