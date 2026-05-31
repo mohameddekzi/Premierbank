@@ -865,6 +865,27 @@ img { max-width: 100%; display: block; }
 .adm-color-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .adm-color { display: flex; gap: 8px; align-items: center; }
 .adm-color input[type=color] { width: 46px; height: 40px; padding: 0; border: 1px solid var(--pb-line); border-radius: 8px; background: none; cursor: pointer; }
+.adm-sub { font-size: 13px; font-weight: 600; color: var(--pb-ink); margin: 20px 0 8px; }
+.adm-swatches { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.adm-swatch { width: 30px; height: 30px; border-radius: 8px; border: 2px solid transparent; cursor: pointer; box-shadow: 0 0 0 1px var(--pb-line); transition: transform .12s ease; }
+.adm-swatch:hover { transform: scale(1.08); }
+.adm-swatch.is-active { border-color: #fff; box-shadow: 0 0 0 2px var(--pb-ink); }
+.adm-theme-row { display: flex; flex-wrap: wrap; gap: 10px; }
+.adm-theme { display: flex; align-items: center; gap: 10px; padding: 9px 14px; border: 1px solid var(--pb-line); border-radius: 10px; background: #fff; cursor: pointer; font-family: 'Lexend', sans-serif; font-size: 13px; font-weight: 600; color: var(--pb-ink); transition: border-color .15s ease; }
+.adm-theme:hover { border-color: var(--pb-secondary); }
+.adm-theme.is-active { border-color: var(--pb-secondary); box-shadow: 0 0 0 1px var(--pb-secondary); }
+.adm-theme-dots { display: inline-flex; }
+.adm-theme-dots i { width: 16px; height: 16px; border-radius: 50%; display: inline-block; }
+.adm-theme-dots i:last-child { margin-left: -5px; }
+.adm-cat-tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+.adm-cat-tabs button { border: 1px solid var(--pb-line); background: #fff; color: var(--pb-muted); font-family: 'Lexend', sans-serif; font-size: 13px; font-weight: 600; padding: 7px 13px; border-radius: 999px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+.adm-cat-tabs button em { font-style: normal; font-size: 11px; background: var(--pb-secondary-100); color: var(--pb-secondary-700); padding: 1px 6px; border-radius: 999px; }
+.adm-cat-tabs button.is-active { background: var(--pb-primary); color: #fff; border-color: var(--pb-primary); }
+.adm-cat-tabs button.is-active em { background: rgba(255,255,255,.2); color: #fff; }
+.adm-edit-tabs { display: inline-flex; gap: 2px; background: #eef1f4; border-radius: 10px; padding: 3px; margin-bottom: 16px; }
+.adm-edit-tabs button { border: 0; background: none; font-family: 'Lexend', sans-serif; font-size: 13px; font-weight: 600; color: var(--pb-muted); padding: 8px 16px; border-radius: 8px; cursor: pointer; }
+.adm-edit-tabs button.is-active { background: #fff; color: var(--pb-primary); box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+.adm-post-preview { border: 1px solid var(--pb-line); border-radius: 14px; padding: 20px; background: #fafbfc; }
 .adm-preview { display: flex; align-items: center; gap: 16px; padding: 22px; border-radius: 14px; margin: 18px 0; }
 .adm-preview-box { border: 1px solid var(--pb-line); border-radius: 14px; padding: 16px; margin: 14px 0 22px; background: #fafbfc; }
 .adm-preview-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
@@ -925,6 +946,15 @@ img { max-width: 100%; display: block; }
 .pb-detail-closer h3 { font-family: 'Lexend', sans-serif; font-size: 28px; font-weight: 600; color: var(--pb-ink); letter-spacing: -.4px; margin: 0 0 8px; }
 .pb-detail-closer p { font-size: 15px; color: var(--pb-muted); margin: 0; max-width: 480px; }
 
+/* CENTRAL FIT — full-bleed backgrounds, content centered in a max 1180px column */
+.pb-detail-hero, .pb-detail-section, .pb-detail-related, .pb-detail-closer {
+  padding-left: max(40px, calc((100% - 1180px) / 2));
+  padding-right: max(40px, calc((100% - 1180px) / 2));
+}
+
+@media (max-width: 1100px) {
+  .pb-detail-hero, .pb-detail-section, .pb-detail-related, .pb-detail-closer { padding-left: 40px; padding-right: 40px; }
+}
 @media (max-width: 900px) {
   .pb-detail-hero, .pb-detail-section, .pb-detail-related, .pb-detail-closer { padding-left: 28px; padding-right: 28px; }
   .pb-detail-hero { padding-top: 56px; padding-bottom: 40px; }
@@ -934,6 +964,17 @@ img { max-width: 100%; display: block; }
   .pb-detail-step { grid-template-columns: 56px 1fr; gap: 16px; }
   .pb-detail-title { font-size: 36px; }
   .pb-detail-section-head h2 { font-size: 24px; }
+}
+@media (max-width: 560px) {
+  .pb-detail-hero, .pb-detail-section, .pb-detail-related, .pb-detail-closer { padding-left: 18px; padding-right: 18px; }
+  .pb-detail-hero { padding-top: 40px; padding-bottom: 32px; }
+  .pb-detail-section { padding-top: 36px; padding-bottom: 36px; }
+  .pb-detail-title { font-size: 28px; }
+  .pb-detail-tagline { font-size: 15px; }
+  .pb-member-grid, .pb-post-grid { grid-template-columns: 1fr; }
+  .pb-detail-closer { flex-direction: column; align-items: flex-start; padding-bottom: 48px; }
+  .pb-detail-cta-row { flex-wrap: wrap; }
+  .pb-detail-cta-row .pb-btn { width: 100%; justify-content: center; }
 }
 
   </style>
@@ -3555,7 +3596,11 @@ function BranchLocator({ lang }) {
 /* -------------------------------------------------------------------------- */
 /*  Footer                                                                    */
 /* -------------------------------------------------------------------------- */
-function Footer({ lang }) {
+function Footer({ lang, onOpenDetail }) {
+  const openLink = (label) => {
+    const key = window.PB_DETAIL_KEY && window.PB_DETAIL_KEY[label];
+    if (key && onOpenDetail) onOpenDetail(key);
+  };
   const cols = [
     { h: "Bank",     links: ["Personal Current", "Saving Account", "Salary Account", "Hajj & Umra", "Premier Wallet"] },
     { h: "Borrow",   links: ["Auto Finance", "Land & Construction", "Business Trade Financing"] },
@@ -3590,7 +3635,12 @@ function Footer({ lang }) {
             {cols.map((c) => (
               <div key={c.h}>
                 <h5>{c.h}</h5>
-                {c.links.map((l) => <a key={l} href="#">{l}</a>)}
+                {c.links.map((l) => {
+                  const key = window.PB_DETAIL_KEY && window.PB_DETAIL_KEY[l];
+                  return key && onOpenDetail
+                    ? <a key={l} href="#" onClick={(e) => { e.preventDefault(); openLink(l); }}>{l}</a>
+                    : <a key={l} href="#" onClick={(e) => e.preventDefault()}>{l}</a>;
+                })}
               </div>
             ))}
           </div>
@@ -5932,6 +5982,9 @@ function DetailPanel({ itemKey, lang, setLang, onClose, onJump, onOpenAccount, o
               </button>
             </div>
           </div>
+
+          {/* SAME FOOTER AS HOME */}
+          <Footer lang={lang} onOpenDetail={onJump} />
         </div>
       </div>
     </div>
@@ -6011,7 +6064,7 @@ function App() {
         <FAQ lang={lang} />
         <CTACloser lang={lang} />
       </main>
-      <Footer lang={lang} />
+      <Footer lang={lang} onOpenDetail={openDetail} />
       <LoginModal open={loginOpen} onClose={() => setLoginOpen(false)} />
       <DetailPanel
         itemKey={detailKey}
@@ -6186,29 +6239,62 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
   }
 
   /* ============================ BRANDING ============================ */
+  const BRAND_PRIMARY_SWATCHES = ["#0b2f4f", "#0a2540", "#0e3b66", "#102a43", "#1a1a2e", "#14213d", "#1b263b", "#0d1b2a"];
+  const BRAND_ACCENT_SWATCHES = ["#6cbe46", "#22c55e", "#16a085", "#0ea5e9", "#f59e0b", "#e11d48", "#8b5cf6", "#d4af37"];
+  const BRAND_THEMES = [
+    { name: "Premier (default)", primary: "#0b2f4f", secondary: "#6cbe46" },
+    { name: "Emerald", primary: "#0a2540", secondary: "#16a085" },
+    { name: "Royal Gold", primary: "#14213d", secondary: "#d4af37" },
+    { name: "Ocean", primary: "#0d1b2a", secondary: "#0ea5e9" },
+    { name: "Sunset", primary: "#1a1a2e", secondary: "#f59e0b" },
+  ];
   function AdmBranding() {
     const cur = window.PBData.getOverride("brand") || {};
     const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
     const [primary, setPrimary] = uS(cur.primary || css("--pb-primary") || "#0b2f4f");
     const [secondary, setSecondary] = uS(cur.secondary || css("--pb-secondary") || "#6cbe46");
     const [busy, setBusy] = uS(false); const [saved, setSaved] = uS(false);
+    const mark = () => setSaved(false);
     const save = async () => {
       setBusy(true);
       const { error } = await window.PBData.saveContent("brand", { primary, secondary });
       setBusy(false);
       if (error) alert("Failed: " + error.message); else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
     };
+    const Swatches = ({ list, value, onPick }) => (
+      <div className="adm-swatches">
+        {list.map(c => (
+          <button key={c} type="button" className={"adm-swatch" + (value.toLowerCase() === c.toLowerCase() ? " is-active" : "")} style={{ background: c }} onClick={() => { onPick(c); mark(); }} title={c} />
+        ))}
+      </div>
+    );
     return (
       <div className="adm-pane">
         <h2 className="adm-h2">Brand colours</h2>
-        <p className="adm-muted">These apply across the whole website — buttons, links, headers and accents.</p>
-        <div className="adm-color-row">
-          <AdmField label="Primary (navy)"><div className="adm-color"><input type="color" value={primary} onChange={(e) => setPrimary(e.target.value)} /><input value={primary} onChange={(e) => setPrimary(e.target.value)} /></div></AdmField>
-          <AdmField label="Accent (green)"><div className="adm-color"><input type="color" value={secondary} onChange={(e) => setSecondary(e.target.value)} /><input value={secondary} onChange={(e) => setSecondary(e.target.value)} /></div></AdmField>
+        <p className="adm-muted">Pick a ready-made theme, choose from the palette, or enter any custom HEX colour. Applies across the whole website — buttons, links, headers and accents.</p>
+
+        <h4 className="adm-sub">Quick themes</h4>
+        <div className="adm-theme-row">
+          {BRAND_THEMES.map(t => (
+            <button key={t.name} type="button" className={"adm-theme" + (primary.toLowerCase() === t.primary && secondary.toLowerCase() === t.secondary ? " is-active" : "")} onClick={() => { setPrimary(t.primary); setSecondary(t.secondary); mark(); }}>
+              <span className="adm-theme-dots"><i style={{ background: t.primary }} /><i style={{ background: t.secondary }} /></span>
+              <span>{t.name}</span>
+            </button>
+          ))}
         </div>
-        <div className="adm-preview" style={{ background: primary }}>
-          <span style={{ color: "#fff" }}>Preview</span>
+
+        <h4 className="adm-sub">Primary colour</h4>
+        <div className="adm-color"><input type="color" value={primary} onChange={(e) => { setPrimary(e.target.value); mark(); }} /><input value={primary} onChange={(e) => { setPrimary(e.target.value); mark(); }} placeholder="#0b2f4f" /></div>
+        <Swatches list={BRAND_PRIMARY_SWATCHES} value={primary} onPick={setPrimary} />
+
+        <h4 className="adm-sub">Accent colour</h4>
+        <div className="adm-color"><input type="color" value={secondary} onChange={(e) => { setSecondary(e.target.value); mark(); }} /><input value={secondary} onChange={(e) => { setSecondary(e.target.value); mark(); }} placeholder="#6cbe46" /></div>
+        <Swatches list={BRAND_ACCENT_SWATCHES} value={secondary} onPick={setSecondary} />
+
+        <div className="adm-preview" style={{ background: primary, marginTop: 18 }}>
+          <span style={{ color: "#fff", fontWeight: 600 }}>Live preview</span>
           <button style={{ background: secondary, color: "#06340a", border: 0, padding: "8px 16px", borderRadius: 8, fontWeight: 700 }}>Button</button>
+          <span style={{ color: secondary, fontWeight: 600 }}>Link</span>
         </div>
         <AdmSaveBar onSave={save} busy={busy} saved={saved} />
       </div>
@@ -6299,13 +6385,30 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       if (error) alert("Failed: " + error.message); else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
     };
     const label = (k) => { const d = D[k]; const t = d && d.title ? (d.title.en || k) : k; return t; };
+    // Group pages by their category (About, Accounts, Cards, Services, News…)
+    const CAT_ORDER = ["About", "Accounts", "Cards", "Financing", "Services", "News"];
+    const groups = {};
+    keys.forEach(k => { const c = (D[k] && D[k].cat) || "Other"; (groups[c] = groups[c] || []).push(k); });
+    const cats = Object.keys(groups).sort((a, b) => (CAT_ORDER.indexOf(a) + 99) - (CAT_ORDER.indexOf(b) + 99));
+    const curCat = (D[key] && D[key].cat) || "Other";
     return (
       <div className="adm-pane">
         <h2 className="adm-h2">Page content</h2>
-        <p className="adm-muted">Edit the text of any page that opens in the slide-in panel (About, Accounts, Cards, Services, News…).</p>
-        <AdmField label="Choose a page">
+        <p className="adm-muted">Pick a section, then a page to edit its text (bilingual EN / SO). Changes apply to the full-width page that opens from the menu.</p>
+        <AdmField label="Section">
+          <div className="adm-cat-tabs">
+            {cats.map(c => (
+              <button key={c} type="button" className={curCat === c ? "is-active" : ""} onClick={() => setKey(groups[c][0])}>{c} <em>{groups[c].length}</em></button>
+            ))}
+          </div>
+        </AdmField>
+        <AdmField label="Page">
           <select value={key} onChange={(e) => setKey(e.target.value)}>
-            {keys.map((k) => <option key={k} value={k}>{label(k)}</option>)}
+            {cats.map(c => (
+              <optgroup key={c} label={c}>
+                {groups[c].map(k => <option key={k} value={k}>{label(k)}</option>)}
+              </optgroup>
+            ))}
           </select>
         </AdmField>
         <AdmBi label="Title" value={draft.title} onChange={(v) => setF({ title: v })} />
@@ -6404,6 +6507,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     const [items, setItems] = uS([]);
     const [editing, setEditing] = uS(null);
     const [loading, setLoading] = uS(true);
+    const [preview, setPreview] = uS(false);
     const load = async () => {
       setLoading(true);
       const { data, error } = await window.PBData.listPosts();
@@ -6411,7 +6515,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       setLoading(false);
     };
     uE(() => { load(); }, []);
-    const newPost = () => setEditing({ category: "news", title: "", summary: "", body: "", cover_url: "", published: true });
+    const newPost = () => { setPreview(false); setEditing({ category: "news", title: "", summary: "", body: "", cover_url: "", published: true }); };
     const save = async () => {
       const p = Object.assign({}, editing);
       if (p.id == null) delete p.id;
@@ -6430,6 +6534,28 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       return (
         <div className="adm-pane">
           <h2 className="adm-h2">{editing.id ? "Edit post" : "New post / press release"}</h2>
+          <div className="adm-edit-tabs">
+            <button className={!preview ? "is-active" : ""} onClick={() => setPreview(false)}>✎ Edit</button>
+            <button className={preview ? "is-active" : ""} onClick={() => setPreview(true)}>👁 Preview</button>
+          </div>
+          {preview ? (
+            <div className="adm-post-preview">
+              <span className="adm-preview-tag is-dirty" style={{ marginBottom: 12, display: "inline-block" }}>Preview — {editing.published ? "will be published" : "draft (not visible yet)"}</span>
+              <article className="pb-post" style={{ maxWidth: 460 }}>
+                {editing.cover_url && <div className="pb-post-cover"><img src={editing.cover_url} alt="" /></div>}
+                <div className="pb-post-body">
+                  <div className="pb-post-meta">
+                    {editing.category === "press" && <span className="pb-post-tag">Press</span>}
+                    <time>{new Date().toLocaleDateString("en-GB", { year: "numeric", month: "short", day: "numeric" })}</time>
+                  </div>
+                  <h3>{editing.title || "Untitled post"}</h3>
+                  {editing.summary && <p className="pb-post-summary">{editing.summary}</p>}
+                  {editing.body && <div className="pb-post-content">{editing.body.split("\n").filter(Boolean).map((para, i) => <p key={i}>{para}</p>)}</div>}
+                </div>
+              </article>
+            </div>
+          ) : (
+          <>
           <AdmField label="Type">
             <select value={editing.category} onChange={(e) => setEditing(Object.assign({}, editing, { category: e.target.value }))}>
               <option value="news">News</option><option value="press">Press Release</option>
@@ -6440,6 +6566,8 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
           <AdmField label="Summary"><textarea rows={2} value={editing.summary || ""} onChange={(e) => setEditing(Object.assign({}, editing, { summary: e.target.value }))} /></AdmField>
           <AdmField label="Body"><textarea rows={8} value={editing.body || ""} onChange={(e) => setEditing(Object.assign({}, editing, { body: e.target.value }))} placeholder="Separate paragraphs with a blank line." /></AdmField>
           <label className="adm-check"><input type="checkbox" checked={!!editing.published} onChange={(e) => setEditing(Object.assign({}, editing, { published: e.target.checked }))} /> Published (visible on the site)</label>
+          </>
+          )}
           <div className="adm-row"><button className="adm-btn adm-btn-primary" onClick={save}>Save</button><button className="adm-btn" onClick={() => setEditing(null)}>Cancel</button></div>
         </div>
       );
@@ -6453,7 +6581,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
             <div key={p.id} className="adm-item">
               <div className="adm-item-av adm-item-av-wide">{p.cover_url ? <img src={p.cover_url} alt="" /> : <span>{p.category === "press" ? "PR" : "N"}</span>}</div>
               <div className="adm-item-main"><strong>{p.title}{p.published ? "" : " (draft)"}</strong><span>{p.category === "press" ? "Press Release" : "News"} · {p.summary || ""}</span></div>
-              <div className="adm-row"><button className="adm-btn adm-sm" onClick={() => setEditing(p)}>Edit</button><button className="adm-btn adm-sm adm-danger" onClick={() => del(p.id)}>Delete</button></div>
+              <div className="adm-row"><button className="adm-btn adm-sm" onClick={() => { setPreview(false); setEditing(p); }}>Edit</button><button className="adm-btn adm-sm adm-danger" onClick={() => del(p.id)}>Delete</button></div>
             </div>
           ))
         )}
@@ -6652,7 +6780,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     return (
       <div className="adm-login-wrap">
         <form className="adm-login" onSubmit={submit}>
-          <div className="adm-login-brand"><LogoMark size={34} variant="color" /><strong>Premier Admin</strong></div>
+          <div className="adm-login-brand"><PBLogo variant="color" size={30} /></div>
           <h3>Sign in to your dashboard</h3>
           <AdmField label="Email"><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoFocus /></AdmField>
           <AdmField label="Password"><input type="password" value={pw} onChange={(e) => setPw(e.target.value)} /></AdmField>
@@ -6707,7 +6835,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       <div className="adm-overlay">
         <div className="adm-shell adm-shell-dash">
           <aside className={"adm-side" + (menuOpen ? " is-open" : "")}>
-            <div className="adm-side-brand"><LogoMark size={28} variant="white" /><span>Premier Admin</span></div>
+            <div className="adm-side-brand"><PBLogo variant="white" size={26} /></div>
             <nav className="adm-side-nav">
               {NAV.map((n) => (
                 <button key={n.id} className={view === n.id ? "is-active" : ""} onClick={() => go(n.id)}>
