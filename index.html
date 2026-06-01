@@ -913,6 +913,11 @@ img { max-width: 100%; display: block; }
 .adm-pill.off { background: #fdecec; color: #c0392b; }
 .adm-set-kv { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--pb-line); margin-bottom: 14px; font-size: 13.5px; }
 .adm-set-kv span { color: var(--pb-muted); }
+.adm-diag { margin-top: 14px; padding: 12px 14px; border-radius: 10px; font-size: 13px; line-height: 1.5; }
+.adm-diag.ok { background: var(--pb-secondary-100); color: var(--pb-secondary-700); }
+.adm-diag.bad { background: #fdecec; color: #c0392b; }
+.adm-diag-fix { margin-top: 8px; font-size: 12px; color: var(--pb-ink); background: rgba(255,255,255,.6); padding: 8px 10px; border-radius: 8px; }
+.adm-diag-fix code { background: #eef1f4; padding: 1px 5px; border-radius: 4px; font-size: 11px; word-break: break-all; }
 .adm-preview { display: flex; align-items: center; gap: 16px; padding: 22px; border-radius: 14px; margin: 18px 0; }
 .adm-preview-box { border: 1px solid var(--pb-line); border-radius: 14px; padding: 16px; margin: 14px 0 22px; background: #fafbfc; }
 .adm-preview-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
@@ -6850,6 +6855,8 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     const [url, setUrl] = uS(localStorage.getItem("pb_sb_url") || "");
     const [key, setKey] = uS(localStorage.getItem("pb_sb_key") || "");
     const [pw, setPw] = uS("");
+    const [testing, setTesting] = uS(false);
+    const [diag, setDiag] = uS(null);
     const saveConn = () => { localStorage.setItem("pb_sb_url", url.trim()); localStorage.setItem("pb_sb_key", key.trim()); alert("Saved. Reloading to connect."); location.reload(); };
     const clearConn = () => { localStorage.removeItem("pb_sb_url"); localStorage.removeItem("pb_sb_key"); location.reload(); };
     const changePw = async () => {
@@ -6858,12 +6865,46 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       alert(error ? ("Failed: " + error.message) : "Password updated.");
       setPw("");
     };
+    // Full image pipeline test: upload a 1×1 PNG, then load it back publicly.
+    const runStorageTest = async () => {
+      setTesting(true); setDiag(null);
+      try {
+        const b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/AP3AAAAAElFTkSuQmCC";
+        const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+        const file = new File([bytes], "healthcheck.png", { type: "image/png" });
+        let url2;
+        try { url2 = await window.PBData.uploadImage(file, "_healthcheck"); }
+        catch (e) { setDiag({ ok: false, step: "upload", msg: e.message }); setTesting(false); return; }
+        await new Promise((res, rej) => { const im = new Image(); im.onload = res; im.onerror = () => rej(new Error("Uploaded OK, but the public URL did not load. The 'media' bucket is not public.")); im.src = url2 + "?t=" + Date.now(); });
+        setDiag({ ok: true, msg: "Storage is fully working — uploads save and are publicly viewable.", url: url2 });
+      } catch (e) { setDiag({ ok: false, step: "read", msg: e.message }); }
+      setTesting(false);
+    };
     const connected = window.PBData.isConfigured();
     const projectRef = (() => { try { return (window.PBData.cfg.url || "").replace("https://", "").split(".")[0]; } catch (e) { return ""; } })();
     const email = (session && session.user && session.user.email) || "";
     return (
       <div className="adm-pane">
         <h2 className="adm-h2">Settings</h2>
+
+        {/* Storage health check */}
+        <div className="adm-set-card">
+          <h3 className="adm-set-h">Image storage health check</h3>
+          <p className="adm-muted" style={{ marginTop: 0 }}>Run this if uploaded images don't show. It uploads a tiny test image and checks it loads publicly.</p>
+          <button className="adm-btn adm-btn-primary" onClick={runStorageTest} disabled={testing}>{testing ? "Testing…" : "Run storage test"}</button>
+          {diag && (
+            <div className={"adm-diag " + (diag.ok ? "ok" : "bad")}>
+              {diag.ok ? "✅ " : "❌ "}{diag.msg}
+              {!diag.ok && diag.step === "upload" && /bucket/i.test(diag.msg) && (
+                <div className="adm-diag-fix">Fix: Supabase → Storage → create a bucket named <code>media</code> and turn ON “Public bucket”. Or run in SQL editor:<br /><code>insert into storage.buckets (id,name,public) values ('media','media',true) on conflict (id) do update set public=true;</code></div>
+              )}
+              {!diag.ok && diag.step === "read" && (
+                <div className="adm-diag-fix">Fix: make the bucket public — SQL editor:<br /><code>update storage.buckets set public=true where id='media';</code></div>
+              )}
+              {diag.ok && <div className="adm-diag-fix">Now re-upload your real images (logo, team, posts) — they will display.</div>}
+            </div>
+          )}
+        </div>
 
         {/* Connection status card */}
         <div className="adm-set-card">
