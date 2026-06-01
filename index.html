@@ -3771,7 +3771,15 @@ function Footer({ lang, onOpenDetail }) {
             <span><Icon name="shariah" size={12} color="#6cbe46" /> Shari'ah Certified</span>
             <span><Icon name="globe" size={12} color="#6cbe46" /> SWIFT BIC: PBSMSOSM</span>
           </div>
-          <p>{copyright}</p>
+          <p>
+            {copyright}
+            <a href="#admin"
+              onClick={(e) => { e.preventDefault(); if (location.hash !== "#admin") { location.hash = "admin"; } }}
+              style={{ marginLeft: 14, color: "rgba(255,255,255,.45)", fontSize: 12, textDecoration: "none", display: "inline-flex", alignItems: "center", gap: 5 }}
+              title="Staff / admin login">
+              <Icon name="shield" size={12} color="rgba(255,255,255,.45)" /> {lang === "en" ? "Admin login" : "Gelitaanka maamulka"}
+            </a>
+          </p>
         </div>
       </div>
     </footer>
