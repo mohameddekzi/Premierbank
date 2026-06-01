@@ -6700,122 +6700,126 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     const [items, setItems] = uS([]);
     const [editing, setEditing] = uS(null);
     const [loading, setLoading] = uS(true);
-    const [importing, setImporting] = uS(false);
+    const [syncing, setSyncing] = uS(false);
+
+    const flat = (v) => (v && typeof v === “object” ? (v.en || v.so || “”) : (v || “”));
+
+    // All seed members from PB_DETAILS across the three sections
+    const getSeed = () => {
+      const D = window.PB_DETAILS || {};
+      const out = [];
+      [[“board”,”board”],[“leadership”,”leadership”],[“shariah”,”shariah”]].forEach(([key, cat]) => {
+        const list = ((D[key] && D[key].members) || []).filter(m => !m.placeholder && flat(m.name).trim());
+        list.forEach((m, i) => out.push({ category: cat, name: flat(m.name).trim(), title: flat(m.title), bio: flat(m.bio) || “”, photo_url: “”, sort: i }));
+      });
+      return out;
+    };
+
+    // Sync: upsert any seed member missing from Supabase (by name, case-insensitive).
+    // Existing rows are not overwritten — only absent names are added.
+    // Also repairs wrong category for members that exist under a different section.
+    const syncSeed = async (current) => {
+      const seed = getSeed();
+      if (!seed.length) return current;
+      const byName = {};
+      (current || []).forEach(m => { byName[(m.name || “”).trim().toLowerCase()] = m; });
+      const toSave = [];
+      seed.forEach((s, i) => {
+        const key = s.name.toLowerCase();
+        const existing = byName[key];
+        if (!existing) {
+          toSave.push({ category: s.category, name: s.name, title: s.title, bio: s.bio, photo_url: “”, sort: s.sort });
+        } else if (existing.category !== s.category) {
+          // Fix wrong category (e.g. Chairman filed under Senior Management)
+          toSave.push(Object.assign({}, existing, { category: s.category }));
+        }
+      });
+      if (!toSave.length) return current;
+      setSyncing(true);
+      for (const rec of toSave) {
+        const row = Object.assign({}, rec);
+        if (row.id == null) delete row.id;
+        await window.PBData.saveMember(row);
+      }
+      setSyncing(false);
+      const { data } = await window.PBData.listMembers();
+      window.PBData.loadTeam();
+      return data || current;
+    };
+
     const load = async () => {
       setLoading(true);
       const { data, error } = await window.PBData.listMembers();
-      if (error) alert("Load failed: " + error.message); else setItems(data || []);
+      if (error) { alert(“Load failed: “ + error.message); setLoading(false); return; }
+      const synced = await syncSeed(data || []);
+      setItems(synced);
       setLoading(false);
     };
+
     uE(() => { load(); }, []);
-    const newMember = () => setEditing({ category: "board", name: "", title: "", bio: "", photo_url: "", sort: items.length });
 
-    // Flatten an {en,so} bilingual object (or plain string) to a single string.
-    const flat = (v) => (v && typeof v === "object" ? (v.en || v.so || "") : (v || ""));
-    // Members baked into the website (PB_DETAILS) for board / leadership / shariah,
-    // available to import into the dashboard so they become editable.
-    const seededFor = (key) => {
-      const D = window.PB_DETAILS || {};
-      return ((D[key] && D[key].members) || []).filter(m => !m.placeholder && flat(m.name).trim());
-    };
-    const seedCount = ["board", "leadership", "shariah"].reduce((n, k) => n + seededFor(k).length, 0);
-    const existingKey = (name, cat) => (name || "").trim().toLowerCase() + "|" + cat;
-    const importSeed = async () => {
-      const existing = new Set(items.map(m => existingKey(m.name, m.category)));
-      const toAdd = [];
-      ["board", "leadership", "shariah"].forEach(key => {
-        let sort = items.filter(m => m.category === key).length;
-        seededFor(key).forEach(m => {
-          const name = flat(m.name).trim();
-          if (existing.has(existingKey(name, key))) return;
-          existing.add(existingKey(name, key));
-          toAdd.push({ category: key, name, title: flat(m.title), bio: flat(m.bio) || "", photo_url: "", sort: sort++ });
-        });
-      });
-      if (!toAdd.length) { alert("All website team members are already in your dashboard. Nothing to import."); return; }
-      if (!confirm("Import " + toAdd.length + " team member" + (toAdd.length === 1 ? "" : "s") + " (Board, Senior Management, Shari'ah) from the website into your dashboard? You can then add photos and edit each one. Duplicates are skipped.")) return;
-      setImporting(true);
-      for (const rec of toAdd) {
-        const { error } = await window.PBData.saveMember(rec);
-        if (error) { setImporting(false); alert("Import stopped at “" + rec.name + "”: " + error.message); await load(); window.PBData.loadTeam(); return; }
-      }
-      setImporting(false);
-      alert("✓ Imported " + toAdd.length + " member" + (toAdd.length === 1 ? "" : "s") + ". Click any member to add a photo or edit details.");
-      await load(); window.PBData.loadTeam();
-    };
-
+    const newMember = () => setEditing({ category: “board”, name: “”, title: “”, bio: “”, photo_url: “”, sort: items.length });
     const save = async () => {
       const m = Object.assign({}, editing);
       if (m.id == null) delete m.id;
-      if (!m.name) { alert("Name is required."); return; }
+      if (!m.name) { alert(“Name is required.”); return; }
       const { error } = await window.PBData.saveMember(m);
-      if (error) { alert("Save failed: " + error.message); return; }
+      if (error) { alert(“Save failed: “ + error.message); return; }
       setEditing(null); await load(); window.PBData.loadTeam();
     };
     const del = async (id) => {
-      if (!confirm("Delete this member?")) return;
+      if (!confirm(“Delete this member?”)) return;
       const { error } = await window.PBData.deleteMember(id);
-      if (error) { alert("Delete failed: " + error.message); return; }
+      if (error) { alert(“Delete failed: “ + error.message); return; }
       await load(); window.PBData.loadTeam();
     };
+
     if (editing) {
       return (
-        <div className="adm-pane">
-          <h2 className="adm-h2">{editing.id ? "Edit member" : "New member"}</h2>
-          <AdmField label="Section">
+        <div className=”adm-pane”>
+          <h2 className=”adm-h2”>{editing.id ? “Edit member” : “New member”}</h2>
+          <AdmField label=”Section”>
             <select value={editing.category} onChange={(e) => setEditing(Object.assign({}, editing, { category: e.target.value }))}>
               {ADM_CATS.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
             </select>
           </AdmField>
-          <AdmField label="Photo"><AdmDrop value={editing.photo_url} folder="team" onUpload={(url) => setEditing(Object.assign({}, editing, { photo_url: url }))} /></AdmField>
-          <AdmField label="Full name"><input value={editing.name} onChange={(e) => setEditing(Object.assign({}, editing, { name: e.target.value }))} placeholder="e.g. Jibril Hassan Mohamed" /></AdmField>
-          <AdmField label="Title / role"><input value={editing.title || ""} onChange={(e) => setEditing(Object.assign({}, editing, { title: e.target.value }))} placeholder="e.g. Chairman" /></AdmField>
-          <AdmField label="Bio"><textarea rows={5} value={editing.bio || ""} onChange={(e) => setEditing(Object.assign({}, editing, { bio: e.target.value }))} /></AdmField>
-          <AdmField label="Sort order"><input type="number" value={editing.sort == null ? 0 : editing.sort} onChange={(e) => setEditing(Object.assign({}, editing, { sort: parseInt(e.target.value || "0", 10) }))} /></AdmField>
-          <div className="adm-row"><button className="adm-btn adm-btn-primary" onClick={save}>Save</button><button className="adm-btn" onClick={() => setEditing(null)}>Cancel</button></div>
+          <AdmField label=”Photo”><AdmDrop value={editing.photo_url} folder=”team” onUpload={(url) => setEditing(Object.assign({}, editing, { photo_url: url }))} /></AdmField>
+          <AdmField label=”Full name”><input value={editing.name} onChange={(e) => setEditing(Object.assign({}, editing, { name: e.target.value }))} placeholder=”e.g. Jibril Hassan Mohamed” /></AdmField>
+          <AdmField label=”Title / role”><input value={editing.title || “”} onChange={(e) => setEditing(Object.assign({}, editing, { title: e.target.value }))} placeholder=”e.g. Chairman” /></AdmField>
+          <AdmField label=”Bio”><textarea rows={5} value={editing.bio || “”} onChange={(e) => setEditing(Object.assign({}, editing, { bio: e.target.value }))} /></AdmField>
+          <AdmField label=”Sort order”><input type=”number” value={editing.sort == null ? 0 : editing.sort} onChange={(e) => setEditing(Object.assign({}, editing, { sort: parseInt(e.target.value || “0”, 10) }))} /></AdmField>
+          <div className=”adm-row”><button className=”adm-btn adm-btn-primary” onClick={save}>Save</button><button className=”adm-btn” onClick={() => setEditing(null)}>Cancel</button></div>
         </div>
       );
     }
-    const unimported = (() => {
-      const existing = new Set(items.map(m => existingKey(m.name, m.category)));
-      return ["board", "leadership", "shariah"].reduce((n, k) => n + seededFor(k).filter(m => !existing.has(existingKey(flat(m.name).trim(), k))).length, 0);
-    })();
+
     return (
-      <div className="adm-pane">
-        <div className="adm-toolbar">
-          <h2 className="adm-h2">Team members</h2>
-          <div className="adm-row">
-            {seedCount > 0 && unimported > 0 && (
-              <button className="adm-btn" onClick={importSeed} disabled={importing}>
-                {importing ? "Importing…" : "⬇ Import website team (" + unimported + ")"}
-              </button>
-            )}
-            <button className="adm-btn adm-btn-primary" onClick={newMember}>+ Add member</button>
-          </div>
+      <div className=”adm-pane”>
+        <div className=”adm-toolbar”>
+          <h2 className=”adm-h2”>Team members</h2>
+          <button className=”adm-btn adm-btn-primary” onClick={newMember}>+ Add member</button>
         </div>
-        {!loading && items.length === 0 && seedCount > 0 && (
-          <div className="adm-diag ok" style={{ marginBottom: 16 }}>
-            💡 The website already shows {seedCount} people (Board, Senior Management, Shari'ah). Click <strong>“Import website team”</strong> to bring them into your dashboard, then add photos and edit details.
-          </div>
-        )}
-        {loading ? <p className="adm-muted">Loading…</p> : (
-          items.length === 0 ? <p className="adm-muted">No members yet. Import the website team above, or click “Add member”.</p> :
-          ADM_CATS.map((c) => {
-            const group = items.filter((m) => m.category === c.value);
-            if (!group.length) return null;
-            return (
-              <div key={c.value} className="adm-group">
-                <h4>{c.label}</h4>
-                {group.map((m) => (
-                  <div key={m.id} className="adm-item">
-                    <div className="adm-item-av">{m.photo_url ? <img src={m.photo_url} alt="" /> : <span>{(m.name || "?").slice(0, 1)}</span>}</div>
-                    <div className="adm-item-main"><strong>{m.name}</strong><span>{m.title}</span></div>
-                    <div className="adm-row"><button className="adm-btn adm-sm" onClick={() => setEditing(m)}>Edit</button><button className="adm-btn adm-sm adm-danger" onClick={() => del(m.id)}>Delete</button></div>
+        {(loading || syncing) ? (
+          <p className=”adm-muted”>{syncing ? “⏳ Syncing website data…” : “Loading…”}</p>
+        ) : (
+          items.length === 0
+            ? <p className=”adm-muted”>No members yet. Click “+ Add member”.</p>
+            : ADM_CATS.map((c) => {
+                const group = items.filter((m) => m.category === c.value);
+                if (!group.length) return null;
+                return (
+                  <div key={c.value} className=”adm-group”>
+                    <h4>{c.label} <span style={{ fontWeight: 400, color: “var(--pb-muted)”, fontSize: 13 }}>({group.length})</span></h4>
+                    {group.map((m) => (
+                      <div key={m.id} className=”adm-item”>
+                        <div className=”adm-item-av”>{m.photo_url ? <img src={m.photo_url} alt=”” /> : <span>{(m.name || “?”).slice(0, 1)}</span>}</div>
+                        <div className=”adm-item-main”><strong>{m.name}</strong><span>{m.title}</span></div>
+                        <div className=”adm-row”><button className=”adm-btn adm-sm” onClick={() => setEditing(m)}>Edit</button><button className=”adm-btn adm-sm adm-danger” onClick={() => del(m.id)}>Delete</button></div>
+                      </div>
+                    ))}
                   </div>
-                ))}
-              </div>
-            );
-          })
+                );
+              })
         )}
       </div>
     );
