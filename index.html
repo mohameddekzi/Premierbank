@@ -941,10 +941,13 @@ img { max-width: 100%; display: block; }
 .adm-login-brand { display: flex; align-items: center; gap: 10px; font-size: 16px; color: var(--pb-ink); }
 .adm-login-close { position: absolute; top: 14px; right: 14px; z-index: 2; }
 @media (max-width: 760px) {
-  .adm-shell-dash { height: 92vh; }
-  .adm-side { position: absolute; left: 0; top: 0; bottom: 0; z-index: 5; transform: translateX(-100%); transition: transform .2s ease; }
+  .adm-overlay { padding: 0; }
+  .adm-shell-dash { height: 100vh; max-width: 100%; border-radius: 0; }
+  .adm-side { position: absolute; left: 0; top: 0; bottom: 0; width: 250px; z-index: 5; transform: translateX(-100%); transition: transform .2s ease; box-shadow: 0 0 40px rgba(0,0,0,.4); }
   .adm-side.is-open { transform: translateX(0); }
+  .adm-side-backdrop { position: absolute; inset: 0; z-index: 4; background: rgba(8,24,40,.4); }
   .adm-burger { display: block; }
+  .adm-main-body { padding: 18px; }
   .adm-stats { grid-template-columns: 1fr; }
   .adm-bi, .adm-color-row { grid-template-columns: 1fr; }
 }
@@ -7267,6 +7270,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     return (
       <div className="adm-overlay">
         <div className="adm-shell adm-shell-dash">
+          {menuOpen && <div className="adm-side-backdrop" onClick={() => setMenuOpen(false)} />}
           <aside className={"adm-side" + (menuOpen ? " is-open" : "")}>
             <div className="adm-side-brand"><PBLogo variant="white" size={26} /></div>
             <nav className="adm-side-nav">
