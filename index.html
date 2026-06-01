@@ -6700,6 +6700,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     const [items, setItems] = uS([]);
     const [editing, setEditing] = uS(null);
     const [loading, setLoading] = uS(true);
+    const [importing, setImporting] = uS(false);
     const load = async () => {
       setLoading(true);
       const { data, error } = await window.PBData.listMembers();
@@ -6708,6 +6709,41 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     };
     uE(() => { load(); }, []);
     const newMember = () => setEditing({ category: "board", name: "", title: "", bio: "", photo_url: "", sort: items.length });
+
+    // Flatten an {en,so} bilingual object (or plain string) to a single string.
+    const flat = (v) => (v && typeof v === "object" ? (v.en || v.so || "") : (v || ""));
+    // Members baked into the website (PB_DETAILS) for board / leadership / shariah,
+    // available to import into the dashboard so they become editable.
+    const seededFor = (key) => {
+      const D = window.PB_DETAILS || {};
+      return ((D[key] && D[key].members) || []).filter(m => !m.placeholder && flat(m.name).trim());
+    };
+    const seedCount = ["board", "leadership", "shariah"].reduce((n, k) => n + seededFor(k).length, 0);
+    const existingKey = (name, cat) => (name || "").trim().toLowerCase() + "|" + cat;
+    const importSeed = async () => {
+      const existing = new Set(items.map(m => existingKey(m.name, m.category)));
+      const toAdd = [];
+      ["board", "leadership", "shariah"].forEach(key => {
+        let sort = items.filter(m => m.category === key).length;
+        seededFor(key).forEach(m => {
+          const name = flat(m.name).trim();
+          if (existing.has(existingKey(name, key))) return;
+          existing.add(existingKey(name, key));
+          toAdd.push({ category: key, name, title: flat(m.title), bio: flat(m.bio) || "", photo_url: "", sort: sort++ });
+        });
+      });
+      if (!toAdd.length) { alert("All website team members are already in your dashboard. Nothing to import."); return; }
+      if (!confirm("Import " + toAdd.length + " team member" + (toAdd.length === 1 ? "" : "s") + " (Board, Senior Management, Shari'ah) from the website into your dashboard? You can then add photos and edit each one. Duplicates are skipped.")) return;
+      setImporting(true);
+      for (const rec of toAdd) {
+        const { error } = await window.PBData.saveMember(rec);
+        if (error) { setImporting(false); alert("Import stopped at “" + rec.name + "”: " + error.message); await load(); window.PBData.loadTeam(); return; }
+      }
+      setImporting(false);
+      alert("✓ Imported " + toAdd.length + " member" + (toAdd.length === 1 ? "" : "s") + ". Click any member to add a photo or edit details.");
+      await load(); window.PBData.loadTeam();
+    };
+
     const save = async () => {
       const m = Object.assign({}, editing);
       if (m.id == null) delete m.id;
@@ -6740,11 +6776,30 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
         </div>
       );
     }
+    const unimported = (() => {
+      const existing = new Set(items.map(m => existingKey(m.name, m.category)));
+      return ["board", "leadership", "shariah"].reduce((n, k) => n + seededFor(k).filter(m => !existing.has(existingKey(flat(m.name).trim(), k))).length, 0);
+    })();
     return (
       <div className="adm-pane">
-        <div className="adm-toolbar"><h2 className="adm-h2">Team members</h2><button className="adm-btn adm-btn-primary" onClick={newMember}>+ Add member</button></div>
+        <div className="adm-toolbar">
+          <h2 className="adm-h2">Team members</h2>
+          <div className="adm-row">
+            {seedCount > 0 && unimported > 0 && (
+              <button className="adm-btn" onClick={importSeed} disabled={importing}>
+                {importing ? "Importing…" : "⬇ Import website team (" + unimported + ")"}
+              </button>
+            )}
+            <button className="adm-btn adm-btn-primary" onClick={newMember}>+ Add member</button>
+          </div>
+        </div>
+        {!loading && items.length === 0 && seedCount > 0 && (
+          <div className="adm-diag ok" style={{ marginBottom: 16 }}>
+            💡 The website already shows {seedCount} people (Board, Senior Management, Shari'ah). Click <strong>“Import website team”</strong> to bring them into your dashboard, then add photos and edit details.
+          </div>
+        )}
         {loading ? <p className="adm-muted">Loading…</p> : (
-          items.length === 0 ? <p className="adm-muted">No members yet. Click “Add member”.</p> :
+          items.length === 0 ? <p className="adm-muted">No members yet. Import the website team above, or click “Add member”.</p> :
           ADM_CATS.map((c) => {
             const group = items.filter((m) => m.category === c.value);
             if (!group.length) return null;
