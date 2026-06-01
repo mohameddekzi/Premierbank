@@ -821,10 +821,17 @@ img { max-width: 100%; display: block; }
 .adm-field input, .adm-field select, .adm-field textarea { font-family: 'Lexend', sans-serif; font-size: 14px; padding: 10px 12px; border: 1px solid var(--pb-line); border-radius: 10px; color: var(--pb-ink); background: #fff; width: 100%; box-sizing: border-box; }
 .adm-field textarea { resize: vertical; }
 .adm-check { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--pb-ink); }
-.adm-drop { border: 2px dashed var(--pb-line); border-radius: 12px; padding: 18px; text-align: center; cursor: pointer; position: relative; transition: border-color .15s ease, background .15s ease; }
+.adm-up { display: flex; flex-direction: column; gap: 8px; }
+.adm-drop { border: 2px dashed var(--pb-line); border-radius: 12px; padding: 22px 18px; text-align: center; cursor: pointer; position: relative; transition: border-color .15s ease, background .15s ease; }
 .adm-drop.is-over { border-color: var(--pb-secondary); background: var(--pb-secondary-100); }
-.adm-drop-img { max-height: 140px; max-width: 100%; border-radius: 8px; margin-bottom: 10px; display: block; margin-left: auto; margin-right: auto; }
-.adm-drop-hint { font-size: 13px; color: var(--pb-muted); }
+.adm-drop.is-busy { opacity: .7; pointer-events: none; }
+.adm-drop-img { max-height: 150px; max-width: 100%; border-radius: 8px; margin-bottom: 10px; display: block; margin-left: auto; margin-right: auto; }
+.adm-drop-ph { width: 52px; height: 52px; border-radius: 12px; background: var(--pb-secondary-100); color: var(--pb-secondary-700); display: flex; align-items: center; justify-content: center; margin: 0 auto 10px; }
+.adm-drop-hint { font-size: 13.5px; color: var(--pb-ink); font-weight: 500; }
+.adm-drop-sub { font-size: 11.5px; color: var(--pb-muted); margin-top: 4px; }
+.adm-up-err { font-size: 12.5px; color: #c0392b; background: #fdecec; border: 1px solid #f5c6c6; border-radius: 8px; padding: 8px 10px; }
+.adm-up-ok { font-size: 12.5px; color: var(--pb-secondary-700); font-weight: 600; }
+.adm-up-rm { align-self: flex-start; }
 
 /* ---- Full dashboard ---- */
 .adm-shell-dash { max-width: 1120px; height: 88vh; display: flex; }
@@ -892,6 +899,20 @@ img { max-width: 100%; display: block; }
 .adm-edit-tabs button { border: 0; background: none; font-family: 'Lexend', sans-serif; font-size: 13px; font-weight: 600; color: var(--pb-muted); padding: 8px 16px; border-radius: 8px; cursor: pointer; }
 .adm-edit-tabs button.is-active { background: #fff; color: var(--pb-primary); box-shadow: 0 1px 3px rgba(0,0,0,.08); }
 .adm-post-preview { border: 1px solid var(--pb-line); border-radius: 14px; padding: 20px; background: #fafbfc; }
+.adm-set-card { border: 1px solid var(--pb-line); border-radius: 14px; padding: 18px 20px; margin-bottom: 16px; }
+.adm-set-h { font-size: 14px; font-weight: 600; color: var(--pb-ink); margin: 0 0 14px; }
+.adm-set-status { display: flex; align-items: center; gap: 14px; }
+.adm-set-status > div { flex: 1; display: flex; flex-direction: column; }
+.adm-set-status strong { font-size: 14px; color: var(--pb-ink); }
+.adm-set-status span { font-size: 12.5px; color: var(--pb-muted); }
+.adm-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+.adm-dot.ok { background: #22c55e; box-shadow: 0 0 0 4px rgba(34,197,94,.15); }
+.adm-dot.off { background: #c0392b; box-shadow: 0 0 0 4px rgba(192,57,43,.12); }
+.adm-pill { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; padding: 4px 10px; border-radius: 999px; }
+.adm-pill.ok { background: var(--pb-secondary-100); color: var(--pb-secondary-700); }
+.adm-pill.off { background: #fdecec; color: #c0392b; }
+.adm-set-kv { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--pb-line); margin-bottom: 14px; font-size: 13.5px; }
+.adm-set-kv span { color: var(--pb-muted); }
 .adm-preview { display: flex; align-items: center; gap: 16px; padding: 22px; border-radius: 14px; margin: 18px 0; }
 .adm-preview-box { border: 1px solid var(--pb-line); border-radius: 14px; padding: 16px; margin: 14px 0 22px; background: #fafbfc; }
 .adm-preview-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
@@ -2110,11 +2131,17 @@ window.PB_SUPABASE = {
 
     /* storage (drag & drop images) */
     async uploadImage(file, folder) {
-      const ext = (file.name.split(".").pop() || "png").toLowerCase();
+      if (!client) throw new Error("Supabase is not connected.");
+      const ext = (file.name.split(".").pop() || "png").toLowerCase().replace(/[^a-z0-9]/g, "") || "png";
       const path = (folder || "misc") + "/" + Date.now() + "-" + Math.random().toString(36).slice(2, 8) + "." + ext;
-      const { error } = await client.storage.from("media").upload(path, file, { upsert: true, contentType: file.type });
-      if (error) throw error;
-      return client.storage.from("media").getPublicUrl(path).data.publicUrl;
+      const { error } = await client.storage.from("media").upload(path, file, { upsert: true, contentType: file.type || "image/png", cacheControl: "3600" });
+      if (error) {
+        if (/bucket not found/i.test(error.message)) throw new Error("Storage bucket 'media' is missing. Create it in Supabase → Storage (public).");
+        throw error;
+      }
+      const url = client.storage.from("media").getPublicUrl(path).data.publicUrl;
+      if (!url) throw new Error("Could not get a public URL — make sure the 'media' bucket is public.");
+      return url;
     },
   };
 
@@ -3603,10 +3630,17 @@ function BranchLocator({ lang }) {
 /*  Footer                                                                    */
 /* -------------------------------------------------------------------------- */
 function Footer({ lang, onOpenDetail }) {
+  const fo = (window.PB_OVERRIDES && window.PB_OVERRIDES.footer) || {};
   const openLink = (label) => {
     const key = window.PB_DETAIL_KEY && window.PB_DETAIL_KEY[label];
     if (key && onOpenDetail) onOpenDetail(key);
   };
+  const defDesc = lang === "en"
+    ? "Premier Bank is a Shari'ah-compliant commercial bank incorporated in Somalia in 2013 and licensed by the Central Bank of Somalia in 2014."
+    : "Premier Bank waa bangi waafaqsan Shareecada, Soomaaliya laga aasaasay 2013, oo shati ka qaatay CBS 2014.";
+  const desc = (lang === "en" ? fo.descEn : fo.descSo) || defDesc;
+  const socials = [["f", "Facebook"], ["ig", "Instagram"], ["x", "X"], ["in", "LinkedIn"], ["yt", "YouTube"]];
+  const copyright = fo.copyright || ("© " + new Date().getFullYear() + " Premier Bank Ltd. All rights reserved · Mogadishu · Hargeisa · Dubai · Nairobi · London");
   const cols = [
     { h: "Bank",     links: ["Personal Current", "Saving Account", "Salary Account", "Hajj & Umra", "Premier Wallet"] },
     { h: "Borrow",   links: ["Auto Finance", "Land & Construction", "Business Trade Financing"] },
@@ -3620,9 +3654,7 @@ function Footer({ lang, onOpenDetail }) {
         <div className="pb-footer-top">
           <div className="pb-footer-brand">
             <PBLogo variant="white-text" size={42} />
-            <p>{lang === "en"
-              ? "Premier Bank is a Shari'ah-compliant commercial bank incorporated in Somalia in 2013 and licensed by the Central Bank of Somalia in 2014."
-              : "Premier Bank waa bangi waafaqsan Shareecada, Soomaaliya laga aasaasay 2013, oo shati ka qaatay CBS 2014."}</p>
+            <p>{desc}</p>
             <div className="pb-footer-app">
               <a className="pb-store">
                 <span><Icon name="download" size={20} color="#fff" /></span>
@@ -3634,7 +3666,12 @@ function Footer({ lang, onOpenDetail }) {
               </a>
             </div>
             <div className="pb-footer-social">
-              {["f","ig","x","in","yt"].map((s) => <a key={s}>{s.toUpperCase()}</a>)}
+              {socials.map(([s, name]) => {
+                const href = (fo.social && fo.social[s]) || "";
+                return href
+                  ? <a key={s} href={href} target="_blank" rel="noopener" title={name}>{s.toUpperCase()}</a>
+                  : <a key={s} href="#" onClick={(e) => e.preventDefault()} title={name}>{s.toUpperCase()}</a>;
+              })}
             </div>
           </div>
           <div className="pb-footer-cols">
@@ -3658,7 +3695,7 @@ function Footer({ lang, onOpenDetail }) {
             <span><Icon name="shariah" size={12} color="#6cbe46" /> Shari'ah Certified</span>
             <span><Icon name="globe" size={12} color="#6cbe46" /> SWIFT BIC: PBSMSOSM</span>
           </div>
-          <p>© {new Date().getFullYear()} Premier Bank Ltd. All rights reserved · Mogadishu · Hargeisa · Dubai · Nairobi · London</p>
+          <p>{copyright}</p>
         </div>
       </div>
     </footer>
@@ -6139,24 +6176,41 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
   function AdmDrop({ value, onUpload, folder, label }) {
     const [busy, setBusy] = uS(false);
     const [over, setOver] = uS(false);
+    const [err, setErr] = uS("");
+    const [ok, setOk] = uS(false);
     const inputRef = uR(null);
     const handle = async (file) => {
+      setErr(""); setOk(false);
       if (!file) return;
-      if (!window.PBData.isConfigured()) { alert("Connect Supabase first (Settings)."); return; }
+      if (!window.PBData.isConfigured()) { setErr("Supabase is not connected — open Settings first."); return; }
+      if (!/^image\//.test(file.type)) { setErr("Please choose an image file (PNG, JPG, WEBP, SVG)."); return; }
+      if (file.size > 5 * 1024 * 1024) { setErr("Image is larger than 5 MB — please use a smaller file."); return; }
       setBusy(true);
-      try { const url = await window.PBData.uploadImage(file, folder); onUpload(url); }
-      catch (e) { alert("Upload failed: " + e.message); }
+      try {
+        const url = await window.PBData.uploadImage(file, folder);
+        // Verify the public URL actually loads before accepting it.
+        await new Promise((res, rej) => { const im = new Image(); im.onload = res; im.onerror = () => rej(new Error("Uploaded, but the image URL is not publicly viewable. Make the 'media' bucket public.")); im.src = url; });
+        onUpload(url); setOk(true); setTimeout(() => setOk(false), 2500);
+      } catch (e) { setErr("Upload failed: " + (e.message || e)); }
       setBusy(false);
     };
     return (
-      <div className={"adm-drop" + (over ? " is-over" : "")}
-        onDragOver={(e) => { e.preventDefault(); setOver(true); }}
-        onDragLeave={() => setOver(false)}
-        onDrop={(e) => { e.preventDefault(); setOver(false); handle(e.dataTransfer.files[0]); }}
-        onClick={() => inputRef.current && inputRef.current.click()}>
-        {value ? <img src={value} alt="" className="adm-drop-img" /> : null}
-        <div className="adm-drop-hint">{busy ? "Uploading…" : (value ? "Drop / click to replace" : (label || "Drag an image here, or click to browse"))}</div>
-        <input ref={inputRef} type="file" accept="image/*" hidden onChange={(e) => handle(e.target.files[0])} />
+      <div className="adm-up">
+        <div className={"adm-drop" + (over ? " is-over" : "") + (busy ? " is-busy" : "")}
+          onDragOver={(e) => { e.preventDefault(); setOver(true); }}
+          onDragLeave={() => setOver(false)}
+          onDrop={(e) => { e.preventDefault(); setOver(false); handle(e.dataTransfer.files[0]); }}
+          onClick={() => !busy && inputRef.current && inputRef.current.click()}>
+          {value ? <img src={value} alt="" className="adm-drop-img" /> : <div className="adm-drop-ph"><Icon name="download" size={22} /></div>}
+          <div className="adm-drop-hint">
+            {busy ? "⏳ Uploading…" : (value ? "Drop a new image or click to replace" : (label || "Drag an image here, or click to browse"))}
+          </div>
+          {!busy && <div className="adm-drop-sub">PNG · JPG · WEBP · SVG — up to 5 MB</div>}
+          <input ref={inputRef} type="file" accept="image/*" hidden onChange={(e) => handle(e.target.files[0])} />
+        </div>
+        {err && <div className="adm-up-err">⚠️ {err}</div>}
+        {ok && <div className="adm-up-ok">✓ Uploaded & verified</div>}
+        {value && !busy && <button type="button" className="adm-btn adm-sm adm-danger adm-up-rm" onClick={(e) => { e.stopPropagation(); onUpload(""); setOk(false); setErr(""); }}>Remove image</button>}
       </div>
     );
   }
@@ -6759,6 +6813,38 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     );
   }
 
+  /* ============================ FOOTER & SOCIAL ============================ */
+  function AdmFooter() {
+    const cur = window.PBData.getOverride("footer") || {};
+    const [f, setF] = uS({
+      descEn: cur.descEn || "", descSo: cur.descSo || "", copyright: cur.copyright || "",
+      social: Object.assign({ f: "", ig: "", x: "", in: "", yt: "" }, cur.social || {}),
+    });
+    const [busy, setBusy] = uS(false); const [saved, setSaved] = uS(false);
+    const set = (k, v) => { setF(Object.assign({}, f, { [k]: v })); setSaved(false); };
+    const setSoc = (k, v) => { setF(Object.assign({}, f, { social: Object.assign({}, f.social, { [k]: v }) })); setSaved(false); };
+    const save = async () => {
+      setBusy(true);
+      const { error } = await window.PBData.saveContent("footer", f);
+      setBusy(false);
+      if (error) alert("Failed: " + error.message); else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
+    };
+    const SOC = [["f", "Facebook"], ["ig", "Instagram"], ["x", "X (Twitter)"], ["in", "LinkedIn"], ["yt", "YouTube"]];
+    return (
+      <div className="adm-pane">
+        <h2 className="adm-h2">Footer & social</h2>
+        <p className="adm-muted">Edit the footer description, copyright line and social media links shown at the bottom of every page.</p>
+        <AdmBi label="Footer description" value={{ en: f.descEn, so: f.descSo }} onChange={(v) => setF(Object.assign({}, f, { descEn: v.en, descSo: v.so }))} textarea rows={3} />
+        <AdmField label="Copyright line (bottom)"><input value={f.copyright} onChange={(e) => set("copyright", e.target.value)} placeholder="© 2026 Premier Bank Ltd. All rights reserved…" /></AdmField>
+        <h4 className="adm-sub">Social media links</h4>
+        {SOC.map(([k, name]) => (
+          <AdmField key={k} label={name}><input value={f.social[k]} onChange={(e) => setSoc(k, e.target.value)} placeholder={"https://…"} /></AdmField>
+        ))}
+        <AdmSaveBar onSave={save} busy={busy} saved={saved} />
+      </div>
+    );
+  }
+
   /* ============================ SETTINGS ============================ */
   function AdmSettings({ session }) {
     const [url, setUrl] = uS(localStorage.getItem("pb_sb_url") || "");
@@ -6772,16 +6858,43 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       alert(error ? ("Failed: " + error.message) : "Password updated.");
       setPw("");
     };
+    const connected = window.PBData.isConfigured();
+    const projectRef = (() => { try { return (window.PBData.cfg.url || "").replace("https://", "").split(".")[0]; } catch (e) { return ""; } })();
+    const email = (session && session.user && session.user.email) || "";
     return (
       <div className="adm-pane">
-        <h2 className="adm-h2">Connect Supabase</h2>
-        <p className="adm-muted">Your project URL and anon (public) key. Stored locally in this browser.</p>
-        <AdmField label="Project URL"><input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://xxxx.supabase.co" /></AdmField>
-        <AdmField label="Anon public key"><input value={key} onChange={(e) => setKey(e.target.value)} placeholder="eyJhbGci…" /></AdmField>
-        <div className="adm-row"><button className="adm-btn adm-btn-primary" onClick={saveConn}>Save & reload</button><button className="adm-btn" onClick={clearConn}>Clear</button></div>
-        {session && (<><h3 style={{ marginTop: 28 }}>Change password</h3>
-          <AdmField label="New password"><input type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="At least 6 characters" /></AdmField>
-          <div className="adm-row"><button className="adm-btn adm-btn-primary" onClick={changePw}>Update password</button></div></>)}
+        <h2 className="adm-h2">Settings</h2>
+
+        {/* Connection status card */}
+        <div className="adm-set-card">
+          <div className="adm-set-status">
+            <span className={"adm-dot " + (connected ? "ok" : "off")} />
+            <div>
+              <strong>{connected ? "Backend connected" : "Not connected"}</strong>
+              <span>{connected ? ("Supabase project: " + projectRef) : "Enter your Supabase credentials below."}</span>
+            </div>
+            <span className={"adm-pill " + (connected ? "ok" : "off")}>{connected ? "Live" : "Offline"}</span>
+          </div>
+        </div>
+
+        {/* Account */}
+        {session && (
+          <div className="adm-set-card">
+            <h3 className="adm-set-h">Your account</h3>
+            <div className="adm-set-kv"><span>Signed in as</span><strong>{email}</strong></div>
+            <AdmField label="New password"><input type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="At least 6 characters" /></AdmField>
+            <button className="adm-btn adm-btn-primary" onClick={changePw}>Update password</button>
+          </div>
+        )}
+
+        {/* Connection */}
+        <div className="adm-set-card">
+          <h3 className="adm-set-h">Backend connection</h3>
+          <p className="adm-muted" style={{ marginTop: 0 }}>Your Supabase project URL and anon (public) key. The site already ships connected for all visitors; this only overrides it in your browser.</p>
+          <AdmField label="Project URL"><input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://xxxx.supabase.co" /></AdmField>
+          <AdmField label="Anon public key"><input value={key} onChange={(e) => setKey(e.target.value)} placeholder="eyJhbGci…" /></AdmField>
+          <div className="adm-row"><button className="adm-btn adm-btn-primary" onClick={saveConn}>Save & reload</button><button className="adm-btn" onClick={clearConn}>Reset to default</button></div>
+        </div>
       </div>
     );
   }
@@ -6813,6 +6926,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     { id: "team",     label: "Team",          icon: "team" },
     { id: "posts",    label: "News & Press",  icon: "press" },
     { id: "atms",     label: "ATM locations", icon: "atm" },
+    { id: "footer",   label: "Footer & social", icon: "globe" },
     { id: "settings", label: "Settings",      icon: "shield" },
   ];
 
@@ -6842,7 +6956,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
     const VIEWS = {
       overview: <AdmOverview go={go} />, branding: <AdmBranding />, logos: <AdmLogos />, hero: <AdmHero />,
-      pages: <AdmPages />, team: <AdmTeam />, posts: <AdmPosts />, atms: <AdmAtms />, settings: <AdmSettings session={session} />,
+      pages: <AdmPages />, team: <AdmTeam />, posts: <AdmPosts />, atms: <AdmAtms />, footer: <AdmFooter />, settings: <AdmSettings session={session} />,
     };
     return (
       <div className="adm-overlay">
