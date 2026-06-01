@@ -825,7 +825,7 @@ img { max-width: 100%; display: block; }
 .adm-drop { border: 2px dashed var(--pb-line); border-radius: 12px; padding: 22px 18px; text-align: center; cursor: pointer; position: relative; transition: border-color .15s ease, background .15s ease; }
 .adm-drop.is-over { border-color: var(--pb-secondary); background: var(--pb-secondary-100); }
 .adm-drop.is-busy { opacity: .7; pointer-events: none; }
-.adm-drop-img { max-height: 150px; max-width: 100%; border-radius: 8px; margin-bottom: 10px; display: block; margin-left: auto; margin-right: auto; }
+.adm-drop-img { max-height: 180px; max-width: 100%; border-radius: 8px; margin: 0 auto 10px; display: block; object-fit: contain; background: var(--pb-cream); }
 .adm-drop-ph { width: 52px; height: 52px; border-radius: 12px; background: var(--pb-secondary-100); color: var(--pb-secondary-700); display: flex; align-items: center; justify-content: center; margin: 0 auto 10px; }
 .adm-drop-hint { font-size: 13.5px; color: var(--pb-ink); font-weight: 500; }
 .adm-drop-sub { font-size: 11.5px; color: var(--pb-muted); margin-top: 4px; }
@@ -3551,10 +3551,29 @@ function LoginModal({ open, onClose }) {
 /*  Branch locator                                                            */
 /* -------------------------------------------------------------------------- */
 function BranchLocator({ lang }) {
-  const branches = window.PB_CONTENT.branches;
+  const staticBranches = window.PB_CONTENT.branches;
+  const liveAtms = window.PB_LIVE_ATMS || [];
+  const hasLive = liveAtms.length > 0;
+
+  // Convert lat/lng to approximate SVG x/y (Somalia bbox: lat 0-12, lng 41-51)
+  const latLngToXY = (lat, lng) => ({
+    x: Math.min(95, Math.max(5, ((parseFloat(lng) - 41) / 10) * 100)),
+    y: Math.min(95, Math.max(5, ((12 - parseFloat(lat)) / 12) * 100)),
+  });
+
+  // Build branch items: live ATMs grouped by region, or static fallback
   const [active, setActive] = useState(0);
   const [filter, setFilter] = useState("all");
-  const filtered = filter === "all" ? branches : filter === "intl" ? branches.filter(b => b.intl) : branches.filter(b => !b.intl);
+  const [atmFilter, setAtmFilter] = useState("all");
+
+  // Static branch locator (always shown)
+  const filtered = filter === "all" ? staticBranches : filter === "intl" ? staticBranches.filter(b => b.intl) : staticBranches.filter(b => !b.intl);
+
+  // Live ATM list — filtered by region
+  const atmRegions = hasLive ? ["all"].concat([...new Set(liveAtms.map(a => a.region).filter(Boolean))]) : [];
+  const filteredAtms = hasLive
+    ? (atmFilter === "all" ? liveAtms : liveAtms.filter(a => a.region === atmFilter))
+    : [];
 
   return (
     <section className="pb-section pb-locator-section" id="locator">
@@ -3567,6 +3586,7 @@ function BranchLocator({ lang }) {
             : "Berbera ilaa Kismaayo, Hargeysa ilaa London — Premier wuxuu joogaa meel kasta oo Soomaali joogto."}</p>
         </div>
 
+        {/* Branch map — static city pins */}
         <div className="pb-locator">
           <div className="pb-locator-list">
             <div className="pb-locator-filter">
@@ -3620,12 +3640,63 @@ function BranchLocator({ lang }) {
                 )}
               </button>
             ))}
+            {/* Live ATM pins from Supabase */}
+            {hasLive && liveAtms.filter(a => a.lat && a.lng).map((a) => {
+              const { x, y } = latLngToXY(a.lat, a.lng);
+              return (
+                <span key={a.id} className="pb-locator-pin-btn is-atm" style={{ left: `${x}%`, top: `${y}%`, pointerEvents: "none" }} title={a.location}>
+                  <span className="pb-locator-dot" style={{ background: "#6cbe46", width: 8, height: 8 }} />
+                </span>
+              );
+            })}
             <div className="pb-locator-legend">
               <span><i className="dom" /> Somalia</span>
               <span><i className="intl" /> International</span>
+              {hasLive && <span><i style={{ background: "#6cbe46", borderRadius: "50%", display: "inline-block", width: 8, height: 8 }} /> ATM</span>}
             </div>
           </div>
         </div>
+
+        {/* Live ATM directory from Supabase */}
+        {hasLive && (
+          <div style={{ marginTop: 40 }}>
+            <div className="pb-section-head" style={{ marginBottom: 20 }}>
+              <span className="pb-eyebrow"><Icon name="atm" size={14} /> {lang === "en" ? `${liveAtms.length} ATMs` : `${liveAtms.length} ATM`}</span>
+              <h3 style={{ fontSize: 22, margin: 0 }}>{lang === "en" ? "ATM Network" : "Shabakadda ATM"}</h3>
+            </div>
+            <div className="pb-locator-filter" style={{ marginBottom: 16, display: "flex", gap: 4, flexWrap: "wrap" }}>
+              {atmRegions.map(r => (
+                <button key={r} className={"pb-btn pb-btn-sm" + (atmFilter === r ? " pb-btn-secondary" : " pb-btn-outline")} style={{ padding: "6px 14px", fontSize: 13 }}
+                  onClick={() => setAtmFilter(r)}>
+                  {r === "all" ? (lang === "en" ? "All regions" : "Dhammaan") : r}
+                </button>
+              ))}
+            </div>
+            <div className="pb-atm-grid">
+              {filteredAtms.map(a => (
+                <div key={a.id} className="pb-atm-card">
+                  <div className="pb-atm-photo">
+                    {a.image
+                      ? <img src={a.image} alt={a.location} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                      : <IconCircle name="atm" size={40} tone="ghost-green" />}
+                  </div>
+                  <div className="pb-atm-body">
+                    {a.region && <span className="pb-atm-region">{a.region}</span>}
+                    <h3>{a.location}</h3>
+                    {a.number && <p className="pb-atm-num">ATM #{a.number}</p>}
+                    {a.lat && a.lng && (
+                      <a className="pb-atm-link"
+                        href={`https://www.google.com/maps/search/?api=1&query=${a.lat},${a.lng}`}
+                        target="_blank" rel="noopener">
+                        {lang === "en" ? "Open in Maps →" : "Fur Maps →"}
+                      </a>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </section>
   );
@@ -6047,6 +6118,108 @@ window.DetailPanel = DetailPanel;
 // Premier Bank — main app
 const { useState: useStateA, useEffect: useEffectA } = React;
 
+/* -------------------------------------------------------------------------- */
+/*  TeamSection — live team from Supabase (renders only when data exists)     */
+/* -------------------------------------------------------------------------- */
+function TeamSection({ lang, onOpenDetail }) {
+  const liveTeam = window.PB_LIVE_TEAM || {};
+  const board = (liveTeam.board || []).filter(m => !m.placeholder);
+  const leadership = (liveTeam.leadership || []).filter(m => !m.placeholder);
+  const all = [...board, ...leadership].slice(0, 8);
+  if (!all.length) return null;
+  return (
+    <section className="pb-section" style={{ background: "var(--pb-cream)" }}>
+      <div className="pb-container">
+        <div className="pb-section-head">
+          <span className="pb-eyebrow"><Icon name="team" size={14} /> {lang === "en" ? "Our people" : "Dadkeenna"}</span>
+          <h2>{lang === "en" ? "Leadership" : "Hoggaanka"}</h2>
+          <p>{lang === "en" ? "The people who lead Premier Bank." : "Dadka hoggaamiya Premier Bank."}</p>
+        </div>
+        <div className="pb-member-grid">
+          {all.map((m) => {
+            const initials = (m.name || "?").split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join("").toUpperCase();
+            return (
+              <div key={m.id} className="pb-member">
+                <div className="pb-member-photo">
+                  {m.photo
+                    ? <img src={m.photo} alt={m.name} />
+                    : <span className="pb-member-initials">{initials}</span>}
+                </div>
+                <div className="pb-member-body">
+                  <h3>{m.name}</h3>
+                  <p className="pb-member-role">{m.title}</p>
+                  {m.bio && <p className="pb-member-bio">{m.bio}</p>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div style={{ textAlign: "center", marginTop: 32 }}>
+          <button className="pb-btn pb-btn-outline" onClick={() => onOpenDetail && onOpenDetail("board")}>
+            {lang === "en" ? "Meet the full board →" : "La kulmow guddiga oo dhan →"}
+          </button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  NewsSection — live posts from Supabase (renders only when posts exist)    */
+/* -------------------------------------------------------------------------- */
+function NewsSection({ lang, onOpenDetail }) {
+  const posts = (window.PB_LIVE_POSTS || []).filter(p => p.published !== false);
+  if (!posts.length) return null;
+  const recent = posts.slice(0, 3);
+  const fmtDate = (s) => { try { return new Date(s).toLocaleDateString(lang === "so" ? "so-SO" : "en-GB", { year: "numeric", month: "short", day: "numeric" }); } catch (e) { return ""; } };
+  return (
+    <section className="pb-section">
+      <div className="pb-container">
+        <div className="pb-section-head">
+          <span className="pb-eyebrow"><Icon name="news" size={14} /> {lang === "en" ? "Latest news" : "Wararkii ugu dambeeyay"}</span>
+          <h2>{lang === "en" ? "Newsroom" : "Warfaafinta"}</h2>
+          <p>{lang === "en" ? "Updates from Premier Bank." : "Wararkii Premier Bank."}</p>
+        </div>
+        <div className="pb-post-grid">
+          {recent.map(p => (
+            <article key={p.id} className="pb-post">
+              {p.cover_url && (
+                <div className="pb-post-cover">
+                  <img src={p.cover_url} alt={p.title}
+                    style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                </div>
+              )}
+              <div className="pb-post-body">
+                <div className="pb-post-meta">
+                  {p.category === "press" && <span className="pb-post-tag">{lang === "en" ? "Press" : "Saxaafad"}</span>}
+                  <time>{fmtDate(p.created_at)}</time>
+                </div>
+                <h3>{p.title}</h3>
+                {p.summary && <p className="pb-post-summary">{p.summary}</p>}
+                {p.body && (
+                  <details className="pb-post-more">
+                    <summary>{lang === "en" ? "Read more" : "Dheeraad ka akhri"}</summary>
+                    <div className="pb-post-content">
+                      {p.body.split("\n").filter(Boolean).map((para, i) => <p key={i}>{para}</p>)}
+                    </div>
+                  </details>
+                )}
+              </div>
+            </article>
+          ))}
+        </div>
+        {posts.length > 3 && (
+          <div style={{ textAlign: "center", marginTop: 32 }}>
+            <button className="pb-btn pb-btn-outline" onClick={() => onOpenDetail && onOpenDetail("news")}>
+              {lang === "en" ? `View all ${posts.length} stories →` : `Dhammaan ${posts.length} wararkood →`}
+            </button>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 const PB_DEFAULTS = /*EDITMODE-BEGIN*/{
   "primary": "#0b2f4f",
   "secondary": "#6cbe46",
@@ -6061,7 +6234,7 @@ function App() {
   const [lang, setLang] = useStateA(t.language || "en");
   const [loginOpen, setLoginOpen] = useStateA(false);
   const [detailKey, setDetailKey] = useStateA(null);
-  const [, setDataTick] = useStateA(0);
+  const [_tick, setDataTick] = useStateA(0);
 
   // Re-render when live Supabase data (team / posts / content) arrives.
   useEffectA(() => {
@@ -6098,14 +6271,16 @@ function App() {
       />
       <Ticker />
       <main>
-        <HeroSlider lang={lang} customHeadline={t.headline} />
+        <HeroSlider lang={lang} customHeadline={t.headline} _tick={_tick} />
         <StatsBar lang={lang} />
         <Values lang={lang} />
         <AccountsShowcase lang={lang} onOpenDetail={openDetail} />
         <CardsShowcase lang={lang} onOpenDetail={openDetail} />
         <WalletSection lang={lang} />
         <MoreServices lang={lang} onOpenDetail={openDetail} />
-        <BranchLocator lang={lang} />
+        <TeamSection lang={lang} onOpenDetail={openDetail} _tick={_tick} />
+        <NewsSection lang={lang} onOpenDetail={openDetail} _tick={_tick} />
+        <BranchLocator lang={lang} _tick={_tick} />
         <Testimonials lang={lang} />
         <SecurityBand lang={lang} />
         <TrustStrip lang={lang} />
@@ -6183,7 +6358,11 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     const [over, setOver] = uS(false);
     const [err, setErr] = uS("");
     const [ok, setOk] = uS(false);
+    // localPreview lets the drop zone show the image immediately after upload,
+    // independent of when the parent state propagates the new value prop.
+    const [localPreview, setLocalPreview] = uS("");
     const inputRef = uR(null);
+    const displaySrc = localPreview || value || "";
     const handle = async (file) => {
       setErr(""); setOk(false);
       if (!file) return;
@@ -6192,13 +6371,23 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       if (file.size > 5 * 1024 * 1024) { setErr("Image is larger than 5 MB — please use a smaller file."); return; }
       setBusy(true);
       try {
+        // Show a local blob preview immediately while uploading
+        const blobUrl = URL.createObjectURL(file);
+        setLocalPreview(blobUrl);
         const url = await window.PBData.uploadImage(file, folder);
-        // Verify the public URL actually loads before accepting it.
+        // Verify the public URL loads
         await new Promise((res, rej) => { const im = new Image(); im.onload = res; im.onerror = () => rej(new Error("Uploaded, but the image URL is not publicly viewable. Make the 'media' bucket public.")); im.src = url; });
-        onUpload(url); setOk(true); setTimeout(() => setOk(false), 2500);
-      } catch (e) { setErr("Upload failed: " + (e.message || e)); }
+        URL.revokeObjectURL(blobUrl);
+        setLocalPreview(url);
+        onUpload(url); setOk(true); setTimeout(() => setOk(false), 3000);
+      } catch (e) {
+        setLocalPreview("");
+        setErr("Upload failed: " + (e.message || e));
+      }
       setBusy(false);
     };
+    // Sync localPreview when value is cleared externally
+    uE(() => { if (!value) setLocalPreview(""); }, [value]);
     return (
       <div className="adm-up">
         <div className={"adm-drop" + (over ? " is-over" : "") + (busy ? " is-busy" : "")}
@@ -6206,16 +6395,19 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
           onDragLeave={() => setOver(false)}
           onDrop={(e) => { e.preventDefault(); setOver(false); handle(e.dataTransfer.files[0]); }}
           onClick={() => !busy && inputRef.current && inputRef.current.click()}>
-          {value ? <img src={value} alt="" className="adm-drop-img" /> : <div className="adm-drop-ph"><Icon name="download" size={22} /></div>}
+          {displaySrc
+            ? <img src={displaySrc} alt="" className="adm-drop-img"
+                onError={(e) => { e.target.style.display = "none"; }} />
+            : <div className="adm-drop-ph"><Icon name="download" size={22} /></div>}
           <div className="adm-drop-hint">
-            {busy ? "⏳ Uploading…" : (value ? "Drop a new image or click to replace" : (label || "Drag an image here, or click to browse"))}
+            {busy ? "⏳ Uploading…" : (displaySrc ? "Drop a new image or click to replace" : (label || "Drag an image here, or click to browse"))}
           </div>
           {!busy && <div className="adm-drop-sub">PNG · JPG · WEBP · SVG — up to 5 MB</div>}
           <input ref={inputRef} type="file" accept="image/*" hidden onChange={(e) => handle(e.target.files[0])} />
         </div>
         {err && <div className="adm-up-err">⚠️ {err}</div>}
-        {ok && <div className="adm-up-ok">✓ Uploaded & verified</div>}
-        {value && !busy && <button type="button" className="adm-btn adm-sm adm-danger adm-up-rm" onClick={(e) => { e.stopPropagation(); onUpload(""); setOk(false); setErr(""); }}>Remove image</button>}
+        {ok && <div className="adm-up-ok">✓ Uploaded — image saved to Supabase storage</div>}
+        {displaySrc && !busy && <button type="button" className="adm-btn adm-sm adm-danger adm-up-rm" onClick={(e) => { e.stopPropagation(); onUpload(""); setLocalPreview(""); setOk(false); setErr(""); }}>Remove image</button>}
       </div>
     );
   }
