@@ -2067,7 +2067,13 @@ window.PB_SUPABASE = {
 
   window.PBData = {
     cfg,
-    isConfigured() { return !!client; },
+    isConfigured() {
+      if (!client && ready && window.supabase) {
+        try { client = window.supabase.createClient(cfg.url, cfg.anonKey); }
+        catch (e) { console.warn("Supabase init retry failed:", e.message); }
+      }
+      return !!client;
+    },
     get client() { return client; },
 
     async loadTeam() {
