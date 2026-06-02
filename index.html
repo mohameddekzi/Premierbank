@@ -2134,9 +2134,13 @@ window.PB_SUPABASE = {
     async getSession() { const { data } = await client.auth.getSession(); return data.session; },
     onAuth(cb) { return client.auth.onAuthStateChange((_e, s) => cb(s)); },
     async changePassword(newPassword) { return client.auth.updateUser({ password: newPassword }); },
-    /* email OTP (2FA second factor) — sends a 6-digit code to the user's email */
-    async sendEmailOtp(email) { return client.auth.signInWithOtp({ email: email, options: { shouldCreateUser: false } }); },
-    async verifyEmailOtp(email, token) { return client.auth.verifyOtp({ email: email, token: token, type: "email" }); },
+    /* TOTP 2FA (Google Authenticator / Authy etc.) via Supabase MFA */
+    async mfaListFactors() { return client.auth.mfa.listFactors(); },
+    async mfaEnroll() { return client.auth.mfa.enroll({ factorType: "totp" }); },
+    async mfaChallenge(factorId) { return client.auth.mfa.challenge({ factorId: factorId }); },
+    async mfaVerify(factorId, challengeId, code) { return client.auth.mfa.verify({ factorId: factorId, challengeId: challengeId, code: code }); },
+    async mfaUnenroll(factorId) { return client.auth.mfa.unenroll({ factorId: factorId }); },
+    async mfaAAL() { return client.auth.mfa.getAuthenticatorAssuranceLevel(); },
 
     /* team CRUD */
     async listMembers() { return client.from("team_members").select("*").order("category", { ascending: true }).order("sort", { ascending: true }); },
@@ -7225,35 +7229,56 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
   /* ---- 2FA PIN ---- */
   function AdmPin({ email, onVerified, onClose }) {
+    const [mode, setMode] = uS("loading");   // loading | enroll | challenge | error
     const [code, setCode] = uS("");
     const [err, setErr] = uS("");
-    const [info, setInfo] = uS("");
-    const [sending, setSending] = uS(false);
     const [verifying, setVerifying] = uS(false);
-    const [cooldown, setCooldown] = uS(0);
+    const [factorId, setFactorId] = uS("");
+    const [challengeId, setChallengeId] = uS("");
+    const [qr, setQr] = uS("");               // SVG data-URL for enrollment
+    const [secret, setSecret] = uS("");       // manual-entry secret
 
-    // Send a code automatically when this screen opens
-    const sendCode = async () => {
-      if (!email) { setErr("No email on this account."); return; }
-      setErr(""); setInfo(""); setSending(true);
-      const { error } = await window.PBData.sendEmailOtp(email);
-      setSending(false);
-      if (error) { setErr("Could not send code: " + error.message); return; }
-      setInfo("A verification code was sent to " + email);
-      setCooldown(45);
+    // Decide whether the admin already has Google Authenticator set up.
+    const init = async () => {
+      setErr("");
+      const { data, error } = await window.PBData.mfaListFactors();
+      if (error) { setErr(error.message); setMode("error"); return; }
+      const totp = (data && data.totp) || [];
+      const verified = totp.find((f) => f.status === "verified");
+      if (verified) {
+        // Returning user — challenge the existing factor.
+        setFactorId(verified.id);
+        const { data: ch, error: cErr } = await window.PBData.mfaChallenge(verified.id);
+        if (cErr) { setErr(cErr.message); setMode("error"); return; }
+        setChallengeId(ch.id);
+        setMode("challenge");
+      } else {
+        // First time — clean up any half-finished factors, then enroll.
+        for (const f of totp) { if (f.status === "unverified") { await window.PBData.mfaUnenroll(f.id); } }
+        const { data: en, error: eErr } = await window.PBData.mfaEnroll();
+        if (eErr) { setErr(eErr.message); setMode("error"); return; }
+        setFactorId(en.id);
+        setQr(en.totp.qr_code);
+        setSecret(en.totp.secret);
+        const { data: ch, error: cErr } = await window.PBData.mfaChallenge(en.id);
+        if (cErr) { setErr(cErr.message); setMode("error"); return; }
+        setChallengeId(ch.id);
+        setMode("enroll");
+      }
     };
-    uE(() => { sendCode(); }, []);
-    // Resend cooldown timer
-    uE(() => {
-      if (cooldown <= 0) return;
-      const t = setTimeout(() => setCooldown(cooldown - 1), 1000);
-      return () => clearTimeout(t);
-    }, [cooldown]);
+    uE(() => { init(); }, []);
 
     const verify = async () => {
-      if (code.length < 6 || code.length > 8) { setErr("Enter the verification code."); return; }
+      if (code.length !== 6) { setErr("Enter the 6-digit code from your authenticator app."); return; }
       setErr(""); setVerifying(true);
-      const { error } = await window.PBData.verifyEmailOtp(email, code);
+      let chId = challengeId;
+      // Challenges are short-lived; for a returning user request a fresh one each attempt.
+      if (mode === "challenge") {
+        const { data: ch, error: cErr } = await window.PBData.mfaChallenge(factorId);
+        if (cErr) { setVerifying(false); setErr(cErr.message); return; }
+        chId = ch.id; setChallengeId(ch.id);
+      }
+      const { error } = await window.PBData.mfaVerify(factorId, chId, code);
       setVerifying(false);
       if (error) { setErr("Incorrect or expired code — try again."); setCode(""); return; }
       onVerified();
@@ -7265,27 +7290,50 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
           {onClose && <button className="adm-login-close adm-btn adm-sm" onClick={onClose}>Close ✕</button>}
           <div className="adm-login-wrap">
             <div className="adm-login-brand" style={{ justifyContent: "center", marginBottom: 8 }}><PBLogo variant="color" size={36} /></div>
-            <h3 style={{ textAlign: "center", marginBottom: 4 }}>Two-factor verification</h3>
-            <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 14, marginBottom: 20 }}>
-              {sending ? "Sending a code to your email…" : "Enter the verification code we emailed you."}
-            </p>
-            <AdmField label="Email code">
-              <input type="text" inputMode="numeric" maxLength={8} value={code}
-                onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
-                onKeyDown={(e) => e.key === "Enter" && verify()} autoFocus
-                placeholder="------" style={{ letterSpacing: 10, fontSize: 22, textAlign: "center" }} />
-            </AdmField>
-            <button className="adm-btn adm-btn-primary adm-btn-block" onClick={verify} disabled={verifying || sending} style={{ marginTop: 8 }}>
-              {verifying ? "Verifying…" : "Verify & sign in"}
-            </button>
-            {info && !err && <div className="adm-up-ok" style={{ marginTop: 10 }}>✓ {info}</div>}
-            {err && <div className="adm-up-err" style={{ marginTop: 10 }}>⚠️ {err}</div>}
-            <div style={{ textAlign: "center", marginTop: 16 }}>
-              <button type="button" className="adm-btn adm-sm" onClick={sendCode} disabled={sending || cooldown > 0}
-                style={{ background: "none", border: "none", color: cooldown > 0 ? "var(--pb-muted)" : "var(--pb-primary)", cursor: cooldown > 0 ? "default" : "pointer" }}>
-                {cooldown > 0 ? "Resend code in " + cooldown + "s" : "Resend code"}
-              </button>
-            </div>
+            <h3 style={{ textAlign: "center", marginBottom: 4 }}>Two-factor authentication</h3>
+
+            {mode === "loading" && (
+              <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 14, marginTop: 16 }}>Checking your security settings…</p>
+            )}
+
+            {mode === "error" && (
+              <div className="adm-up-err" style={{ marginTop: 16 }}>⚠️ {err || "Something went wrong."}</div>
+            )}
+
+            {mode === "enroll" && (
+              <>
+                <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 14, marginBottom: 14 }}>
+                  Set up <strong>Google Authenticator</strong>. Scan this QR code in the app, then enter the 6-digit code it shows.
+                </p>
+                {qr && <div style={{ textAlign: "center", marginBottom: 12 }}><img src={qr} alt="Authenticator QR code" style={{ width: 188, height: 188 }} /></div>}
+                {secret && (
+                  <p style={{ textAlign: "center", fontSize: 12, color: "var(--pb-muted)", marginBottom: 16, wordBreak: "break-all" }}>
+                    Can't scan? Enter this key manually:<br /><code style={{ fontSize: 13, letterSpacing: 1 }}>{secret}</code>
+                  </p>
+                )}
+              </>
+            )}
+
+            {mode === "challenge" && (
+              <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 14, marginBottom: 20 }}>
+                Open Google Authenticator and enter the current 6-digit code.
+              </p>
+            )}
+
+            {(mode === "enroll" || mode === "challenge") && (
+              <>
+                <AdmField label="Authenticator code">
+                  <input type="text" inputMode="numeric" maxLength={6} value={code}
+                    onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
+                    onKeyDown={(e) => e.key === "Enter" && verify()} autoFocus
+                    placeholder="------" style={{ letterSpacing: 10, fontSize: 22, textAlign: "center" }} />
+                </AdmField>
+                <button className="adm-btn adm-btn-primary adm-btn-block" onClick={verify} disabled={verifying} style={{ marginTop: 8 }}>
+                  {verifying ? "Verifying…" : (mode === "enroll" ? "Activate & sign in" : "Verify & sign in")}
+                </button>
+                {err && <div className="adm-up-err" style={{ marginTop: 10 }}>⚠️ {err}</div>}
+              </>
+            )}
           </div>
         </div>
       </div>
