@@ -63,8 +63,8 @@ img { max-width: 100%; display: block; }
 
 .pb-container { max-width: 1280px; margin: 0 auto; padding: 0 32px; }
 
-.pb-section { padding: calc(120px * var(--pb-density)) 0; }
-.pb-section-head { max-width: 760px; margin: 0 auto calc(64px * var(--pb-density)); text-align: center; }
+.pb-section { padding: calc(80px * var(--pb-density)) 0; }
+.pb-section-head { max-width: 760px; margin: 0 auto calc(44px * var(--pb-density)); text-align: center; }
 .pb-section-head h2 { font-size: clamp(32px, 4vw, 56px); line-height: 1.05; letter-spacing: -1px; margin: 12px 0 16px; font-weight: 600; text-wrap: balance; }
 .pb-section-head h2 em { font-style: italic; color: var(--pb-secondary-700); font-weight: 500; }
 .pb-section-head p { color: var(--pb-muted); font-size: 18px; line-height: 1.55; max-width: 600px; margin: 0 auto; }
@@ -6138,106 +6138,6 @@ window.DetailPanel = DetailPanel;
 const { useState: useStateA, useEffect: useEffectA } = React;
 
 /* -------------------------------------------------------------------------- */
-/*  TeamSection — live team from Supabase (renders only when data exists)     */
-/* -------------------------------------------------------------------------- */
-function TeamSection({ lang, onOpenDetail }) {
-  const liveTeam = window.PB_LIVE_TEAM || {};
-  const board = (liveTeam.board || []).filter(m => !m.placeholder);
-  const leadership = (liveTeam.leadership || []).filter(m => !m.placeholder);
-  const all = [...board, ...leadership].slice(0, 8);
-  if (!all.length) return null;
-  return (
-    <section className="pb-section" style={{ background: "var(--pb-cream)" }}>
-      <div className="pb-container">
-        <div className="pb-section-head">
-          <span className="pb-eyebrow"><Icon name="team" size={14} /> {lang === "en" ? "Our people" : "Dadkeenna"}</span>
-          <h2>{lang === "en" ? "Leadership" : "Hoggaanka"}</h2>
-          <p>{lang === "en" ? "The people who lead Premier Bank." : "Dadka hoggaamiya Premier Bank."}</p>
-        </div>
-        <div className="pb-member-grid">
-          {all.map((m) => {
-            const initials = (m.name || "?").split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join("").toUpperCase();
-            return (
-              <div key={m.id} className="pb-member">
-                <div className="pb-member-photo">
-                  {m.photo
-                    ? <img src={m.photo} alt={m.name} />
-                    : <span className="pb-member-initials">{initials}</span>}
-                </div>
-                <div className="pb-member-body">
-                  <h3>{m.name}</h3>
-                  <p className="pb-member-role">{m.title}</p>
-                  {m.bio && <p className="pb-member-bio">{m.bio}</p>}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-        <div style={{ textAlign: "center", marginTop: 32 }}>
-          <button className="pb-btn pb-btn-outline" onClick={() => onOpenDetail && onOpenDetail("board")}>
-            {lang === "en" ? "Meet the full board →" : "La kulmow guddiga oo dhan →"}
-          </button>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* -------------------------------------------------------------------------- */
-/*  NewsSection — live posts from Supabase (renders only when posts exist)    */
-/* -------------------------------------------------------------------------- */
-function NewsSection({ lang, onOpenDetail }) {
-  const posts = (window.PB_LIVE_POSTS || []).filter(p => p.published !== false);
-  if (!posts.length) return null;
-  const recent = posts.slice(0, 3);
-  const fmtDate = (s) => { try { return new Date(s).toLocaleDateString(lang === "so" ? "so-SO" : "en-GB", { year: "numeric", month: "short", day: "numeric" }); } catch (e) { return ""; } };
-  return (
-    <section className="pb-section">
-      <div className="pb-container">
-        <div className="pb-section-head">
-          <span className="pb-eyebrow"><Icon name="news" size={14} /> {lang === "en" ? "Latest news" : "Wararkii ugu dambeeyay"}</span>
-          <h2>{lang === "en" ? "Newsroom" : "Warfaafinta"}</h2>
-          <p>{lang === "en" ? "Updates from Premier Bank." : "Wararkii Premier Bank."}</p>
-        </div>
-        <div className="pb-post-grid">
-          {recent.map(p => (
-            <article key={p.id} className="pb-post">
-              {p.cover_url && (
-                <div className="pb-post-cover">
-                  <img src={p.cover_url} alt={p.title}
-                    style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
-                </div>
-              )}
-              <div className="pb-post-body">
-                <div className="pb-post-meta">
-                  {p.category === "press" && <span className="pb-post-tag">{lang === "en" ? "Press" : "Saxaafad"}</span>}
-                  <time>{fmtDate(p.created_at)}</time>
-                </div>
-                <h3>{p.title}</h3>
-                {p.summary && <p className="pb-post-summary">{p.summary}</p>}
-                {p.body && (
-                  <details className="pb-post-more">
-                    <summary>{lang === "en" ? "Read more" : "Dheeraad ka akhri"}</summary>
-                    <div className="pb-post-content">
-                      {p.body.split("\n").filter(Boolean).map((para, i) => <p key={i}>{para}</p>)}
-                    </div>
-                  </details>
-                )}
-              </div>
-            </article>
-          ))}
-        </div>
-        {posts.length > 3 && (
-          <div style={{ textAlign: "center", marginTop: 32 }}>
-            <button className="pb-btn pb-btn-outline" onClick={() => onOpenDetail && onOpenDetail("news")}>
-              {lang === "en" ? `View all ${posts.length} stories →` : `Dhammaan ${posts.length} wararkood →`}
-            </button>
-          </div>
-        )}
-      </div>
-    </section>
-  );
-}
 
 const PB_DEFAULTS = /*EDITMODE-BEGIN*/{
   "primary": "#0b2f4f",
@@ -6297,9 +6197,6 @@ function App() {
         <CardsShowcase lang={lang} onOpenDetail={openDetail} />
         <WalletSection lang={lang} />
         <MoreServices lang={lang} onOpenDetail={openDetail} />
-        <TeamSection lang={lang} onOpenDetail={openDetail} _tick={_tick} />
-        <NewsSection lang={lang} onOpenDetail={openDetail} _tick={_tick} />
-        <BranchLocator lang={lang} _tick={_tick} />
         <Testimonials lang={lang} />
         <SecurityBand lang={lang} />
         <TrustStrip lang={lang} />
