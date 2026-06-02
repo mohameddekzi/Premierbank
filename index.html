@@ -7239,7 +7239,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       const { error } = await window.PBData.sendEmailOtp(email);
       setSending(false);
       if (error) { setErr("Could not send code: " + error.message); return; }
-      setInfo("A 6-digit code was sent to " + email);
+      setInfo("A verification code was sent to " + email);
       setCooldown(45);
     };
     uE(() => { sendCode(); }, []);
@@ -7251,7 +7251,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     }, [cooldown]);
 
     const verify = async () => {
-      if (code.length !== 6) { setErr("Enter the 6-digit code."); return; }
+      if (code.length < 6 || code.length > 8) { setErr("Enter the verification code."); return; }
       setErr(""); setVerifying(true);
       const { error } = await window.PBData.verifyEmailOtp(email, code);
       setVerifying(false);
@@ -7267,10 +7267,10 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
             <div className="adm-login-brand" style={{ justifyContent: "center", marginBottom: 8 }}><PBLogo variant="color" size={36} /></div>
             <h3 style={{ textAlign: "center", marginBottom: 4 }}>Two-factor verification</h3>
             <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 14, marginBottom: 20 }}>
-              {sending ? "Sending a code to your email…" : "Enter the 6-digit code we emailed you."}
+              {sending ? "Sending a code to your email…" : "Enter the verification code we emailed you."}
             </p>
             <AdmField label="Email code">
-              <input type="text" inputMode="numeric" maxLength={6} value={code}
+              <input type="text" inputMode="numeric" maxLength={8} value={code}
                 onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
                 onKeyDown={(e) => e.key === "Enter" && verify()} autoFocus
                 placeholder="------" style={{ letterSpacing: 10, fontSize: 22, textAlign: "center" }} />
