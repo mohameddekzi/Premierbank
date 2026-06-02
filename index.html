@@ -2134,6 +2134,9 @@ window.PB_SUPABASE = {
     async getSession() { const { data } = await client.auth.getSession(); return data.session; },
     onAuth(cb) { return client.auth.onAuthStateChange((_e, s) => cb(s)); },
     async changePassword(newPassword) { return client.auth.updateUser({ password: newPassword }); },
+    /* email OTP (2FA second factor) — sends a 6-digit code to the user's email */
+    async sendEmailOtp(email) { return client.auth.signInWithOtp({ email: email, options: { shouldCreateUser: false } }); },
+    async verifyEmailOtp(email, token) { return client.auth.verifyOtp({ email: email, token: token, type: "email" }); },
 
     /* team CRUD */
     async listMembers() { return client.from("team_members").select("*").order("category", { ascending: true }).order("sort", { ascending: true }); },
@@ -7092,15 +7095,8 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     const [url, setUrl] = uS(localStorage.getItem("pb_sb_url") || "");
     const [key, setKey] = uS(localStorage.getItem("pb_sb_key") || "");
     const [pw, setPw] = uS("");
-    const [newPin, setNewPin] = uS("");
     const [testing, setTesting] = uS(false);
     const [diag, setDiag] = uS(null);
-    const savePin = async () => {
-      if (newPin.length !== 6) { alert("PIN must be exactly 6 digits."); return; }
-      await window.PBData.saveContent("admin_pin", newPin);
-      alert("PIN updated successfully.");
-      setNewPin("");
-    };
     const saveConn = () => { localStorage.setItem("pb_sb_url", url.trim()); localStorage.setItem("pb_sb_key", key.trim()); alert("Saved. Reloading to connect."); location.reload(); };
     const clearConn = () => { localStorage.removeItem("pb_sb_url"); localStorage.removeItem("pb_sb_key"); location.reload(); };
     const changePw = async () => {
@@ -7172,12 +7168,10 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
           </div>
         )}
 
-        {/* 2FA PIN */}
+        {/* 2FA — email OTP */}
         <div className="adm-set-card">
-          <h3 className="adm-set-h">Two-factor PIN</h3>
-          <p className="adm-muted" style={{ marginTop: 0 }}>6-digit PIN required after login. Default is 000000.</p>
-          <AdmField label="New PIN (6 digits)"><input type="password" maxLength={6} value={newPin} onChange={(e) => setNewPin(e.target.value.replace(/\D/g,""))} placeholder="&bull;&bull;&bull;&bull;&bull;&bull;" /></AdmField>
-          <button className="adm-btn adm-btn-primary" onClick={savePin}>Save PIN</button>
+          <h3 className="adm-set-h">Two-factor authentication</h3>
+          <p className="adm-muted" style={{ marginTop: 0 }}>Email codes are enabled. After entering your password, a fresh 6-digit code is automatically emailed to <strong>{(session && session.user && session.user.email) || "your email"}</strong> — you enter it to finish signing in. No setup needed.</p>
         </div>
 
         {/* Connection */}
@@ -7230,28 +7224,68 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
   }
 
   /* ---- 2FA PIN ---- */
-  function AdmPin({ onVerified }) {
-    const [pin, setPin] = uS("");
+  function AdmPin({ email, onVerified, onClose }) {
+    const [code, setCode] = uS("");
     const [err, setErr] = uS("");
-    const verify = async () => {
-      const stored = ((window.PB_OVERRIDES || {}).admin_pin) || "000000";
-      if (pin === stored) { onVerified(); }
-      else { setErr("Incorrect PIN — try again."); setPin(""); }
+    const [info, setInfo] = uS("");
+    const [sending, setSending] = uS(false);
+    const [verifying, setVerifying] = uS(false);
+    const [cooldown, setCooldown] = uS(0);
+
+    // Send a code automatically when this screen opens
+    const sendCode = async () => {
+      if (!email) { setErr("No email on this account."); return; }
+      setErr(""); setInfo(""); setSending(true);
+      const { error } = await window.PBData.sendEmailOtp(email);
+      setSending(false);
+      if (error) { setErr("Could not send code: " + error.message); return; }
+      setInfo("A 6-digit code was sent to " + email);
+      setCooldown(45);
     };
+    uE(() => { sendCode(); }, []);
+    // Resend cooldown timer
+    uE(() => {
+      if (cooldown <= 0) return;
+      const t = setTimeout(() => setCooldown(cooldown - 1), 1000);
+      return () => clearTimeout(t);
+    }, [cooldown]);
+
+    const verify = async () => {
+      if (code.length !== 6) { setErr("Enter the 6-digit code."); return; }
+      setErr(""); setVerifying(true);
+      const { error } = await window.PBData.verifyEmailOtp(email, code);
+      setVerifying(false);
+      if (error) { setErr("Incorrect or expired code — try again."); setCode(""); return; }
+      onVerified();
+    };
+
     return (
       <div className="adm-overlay">
         <div className="adm-shell adm-shell-login">
+          {onClose && <button className="adm-login-close adm-btn adm-sm" onClick={onClose}>Close ✕</button>}
           <div className="adm-login-wrap">
             <div className="adm-login-brand" style={{ justifyContent: "center", marginBottom: 8 }}><PBLogo variant="color" size={36} /></div>
             <h3 style={{ textAlign: "center", marginBottom: 4 }}>Two-factor verification</h3>
-            <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 14, marginBottom: 24 }}>Enter your 6-digit admin PIN to continue.</p>
-            <AdmField label="PIN code">
-              <input type="password" maxLength={6} value={pin} onChange={(e) => setPin(e.target.value.replace(/\D/g,""))}
-                onKeyDown={(e) => e.key === "Enter" && verify()} autoFocus placeholder="&bull;&bull;&bull;&bull;&bull;&bull;" style={{ letterSpacing: 8, fontSize: 20, textAlign: "center" }} />
+            <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 14, marginBottom: 20 }}>
+              {sending ? "Sending a code to your email…" : "Enter the 6-digit code we emailed you."}
+            </p>
+            <AdmField label="Email code">
+              <input type="text" inputMode="numeric" maxLength={6} value={code}
+                onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
+                onKeyDown={(e) => e.key === "Enter" && verify()} autoFocus
+                placeholder="------" style={{ letterSpacing: 10, fontSize: 22, textAlign: "center" }} />
             </AdmField>
-            <button className="adm-btn adm-btn-primary adm-btn-block" onClick={verify} style={{ marginTop: 8 }}>Verify</button>
-            {err && <div className="adm-up-err" style={{ marginTop: 10 }}>&#9888;&#65039; {err}</div>}
-            <p style={{ textAlign: "center", fontSize: 12, color: "var(--pb-muted)", marginTop: 16 }}>Default PIN is 000000. Change it in Settings after login.</p>
+            <button className="adm-btn adm-btn-primary adm-btn-block" onClick={verify} disabled={verifying || sending} style={{ marginTop: 8 }}>
+              {verifying ? "Verifying…" : "Verify & sign in"}
+            </button>
+            {info && !err && <div className="adm-up-ok" style={{ marginTop: 10 }}>✓ {info}</div>}
+            {err && <div className="adm-up-err" style={{ marginTop: 10 }}>⚠️ {err}</div>}
+            <div style={{ textAlign: "center", marginTop: 16 }}>
+              <button type="button" className="adm-btn adm-sm" onClick={sendCode} disabled={sending || cooldown > 0}
+                style={{ background: "none", border: "none", color: cooldown > 0 ? "var(--pb-muted)" : "var(--pb-primary)", cursor: cooldown > 0 ? "default" : "pointer" }}>
+                {cooldown > 0 ? "Resend code in " + cooldown + "s" : "Resend code"}
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -7338,7 +7372,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
     if (!configured) return (<div className="adm-overlay"><div className="adm-shell"><header className="adm-head"><div className="adm-brand"><LogoMark size={26} variant="color" /> <span>Premier Admin</span></div><button className="adm-btn adm-sm" onClick={close}>Close ✕</button></header><div className="adm-body"><AdmSettings session={null} /></div></div></div>);
     if (!session) return (<div className="adm-overlay"><div className="adm-shell adm-shell-login"><button className="adm-login-close adm-btn adm-sm" onClick={close}>Close ✕</button><AdmLogin /></div></div>);
-    if (!pinVerified) return <AdmPin onVerified={() => setPinVerified(true)} />;
+    if (!pinVerified) return <AdmPin email={(session.user && session.user.email) || ""} onVerified={() => setPinVerified(true)} onClose={close} />;
 
     const VIEWS = {
       overview: <AdmOverview go={go} />, branding: <AdmBranding />, logos: <AdmLogos />, hero: <AdmHero />,
