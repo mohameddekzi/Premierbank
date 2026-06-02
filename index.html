@@ -517,6 +517,9 @@ img { max-width: 100%; display: block; }
 .pb-trust-grid { display: flex; justify-content: space-between; gap: 24px; flex-wrap: wrap; align-items: center; }
 .pb-trust-grid span { font-size: 14px; font-weight: 700; letter-spacing: 1px; color: var(--pb-muted); opacity: .65; transition: opacity .2s ease; }
 .pb-trust-grid span:hover { opacity: 1; color: var(--pb-primary); }
+.pb-trust-logo { display: inline-flex; align-items: center; justify-content: center; height: 44px; padding: 4px 8px; cursor: default; }
+.pb-trust-logo img { max-height: 40px; max-width: 120px; object-fit: contain; filter: grayscale(100%) opacity(0.55); transition: filter .3s ease, transform .25s ease; }
+.pb-trust-logo:hover img { filter: grayscale(0%) opacity(1); transform: scale(1.07); }
 
 /* ========================================================================== */
 /*  Branch locator                                                            */
@@ -4081,6 +4084,7 @@ function ArtAgency() {
 /* -------------------------------------------------------------------------- */
 function TrustStrip({ lang }) {
   const logos = window.PB_CONTENT.trustLogos;
+  const imgs = (window.PB_OVERRIDES && window.PB_OVERRIDES.trustLogoImages) || {};
   return (
     <section className="pb-trust">
       <div className="pb-container">
@@ -4088,11 +4092,14 @@ function TrustStrip({ lang }) {
           {lang === "en" ? "Licensed by the Central Bank of Somalia · partners we work with" : "Shati ka leh CBS · macaamiisheenna caalami"}
         </p>
         <div className="pb-trust-grid">
-          {logos.map((l) => <span key={l}>{l}</span>)}
+          {logos.map((l) =>
+            imgs[l]
+              ? <span key={l} className="pb-trust-logo"><img src={imgs[l]} alt={l} title={l} /></span>
+              : <span key={l}>{l}</span>
+          )}
         </div>
       </div>
     </section>);
-
 }
 
 /* -------------------------------------------------------------------------- */
@@ -6911,9 +6918,65 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
         <Row k="white" sk="footerSize" title="Footer / dark-background logo (white logo)" hint="Shown in the footer and the login modal." dark />
         <Row k="mark"  sk="markSize"   title="Logo mark only (icon, no text)" hint="Used in compact places like cards and the phone mockup." />
         <div className="adm-savebar">
-          <button className="adm-btn adm-btn-primary" onClick={save} disabled={busy || !dirty}>{busy ? "Publishing…" : (dirty ? "Publish logo" : "Nothing to publish")}</button>
+          <button className="adm-btn adm-btn-primary" onClick={save} disabled={busy || !dirty}>{busy ? "Publishing..." : (dirty ? "Publish logo" : "Nothing to publish")}</button>
           {saved && <span className="adm-saved">✓ Published & live</span>}
           {dirty && !saved && <span className="adm-muted">You have unpublished changes.</span>}
+        </div>
+
+        {/* ---- Partner / trust logos ---- */}
+        <AdmPartnerLogos />
+      </div>
+    );
+  }
+
+  function AdmPartnerLogos() {
+    const LABELS = window.PB_CONTENT.trustLogos || [];
+    const saved0 = (window.PBData.getOverride("trustLogoImages")) || {};
+    const [imgs, setImgs] = uS(Object.assign({}, saved0));
+    const [saving, setSaving] = uS(false);
+    const [ok, setOk] = uS(false);
+
+    const setImg = (label, url) => setImgs((prev) => Object.assign({}, prev, { [label]: url }));
+
+    const save = async () => {
+      setSaving(true);
+      const { error } = await window.PBData.saveContent("trustLogoImages", imgs);
+      setSaving(false);
+      if (error) { alert("Save failed: " + error.message); return; }
+      setOk(true); setTimeout(() => setOk(false), 3000);
+    };
+
+    return (
+      <div className="adm-card" style={{ marginTop: 28 }}>
+        <div className="adm-card-head">
+          <strong>Partner / trust-strip logos</strong>
+          <span className="adm-muted" style={{ fontSize: 12 }}>Shown at the bottom of the homepage. Black &amp; white by default, colour on hover.</span>
+        </div>
+        <p className="adm-muted" style={{ margin: "0 0 16px" }}>Upload a colour PNG for each partner. Leave blank to show the text label.</p>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 16 }}>
+          {LABELS.map((label) => (
+            <div key={label} style={{ border: "1px solid var(--pb-line)", borderRadius: 10, padding: 12 }}>
+              <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8 }}>{label}</div>
+              {imgs[label] && (
+                <div style={{ marginBottom: 8, background: "#f4f6f8", borderRadius: 6, padding: 8, textAlign: "center" }}>
+                  <img src={imgs[label]} alt={label} style={{ maxHeight: 36, maxWidth: 120, objectFit: "contain", filter: "grayscale(100%)", transition: "filter .3s" }}
+                    onMouseEnter={(e) => e.target.style.filter = "grayscale(0%)"}
+                    onMouseLeave={(e) => e.target.style.filter = "grayscale(100%)"} />
+                </div>
+              )}
+              <AdmDrop value={imgs[label] || ""} folder="logos" onUpload={(url) => setImg(label, url)} />
+              {imgs[label] && (
+                <button className="adm-btn adm-sm adm-danger" style={{ marginTop: 6, width: "100%" }}
+                  onClick={() => setImg(label, "")}>Remove</button>
+              )}
+            </div>
+          ))}
+        </div>
+        <div className="adm-savebar" style={{ marginTop: 20 }}>
+          <button className="adm-btn adm-btn-primary" onClick={save} disabled={saving}>
+            {saving ? "Saving..." : "Save partner logos"}
+          </button>
+          {ok && <span className="adm-saved">✓ Saved & live</span>}
         </div>
       </div>
     );
