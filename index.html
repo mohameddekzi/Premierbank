@@ -3808,7 +3808,7 @@ const { useState: useStateS, useEffect: useEffectS, useRef: useRefS } = React;
 /* -------------------------------------------------------------------------- */
 /*  HERO SLIDER — 5 slides, autoplay, dot nav, arrow nav                      */
 /* -------------------------------------------------------------------------- */
-function HeroSlider({ lang, customHeadline }) {
+function HeroSlider({ lang, customHeadline, _tick }) {
   const slides = window.PB_CONTENT.heroSlides;
   const [i, setI] = useStateS(0);
   const [paused, setPaused] = useStateS(false);
@@ -6268,10 +6268,9 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     return window.PBData.saveContent("details", Object.assign({}, cur, { [pageKey]: partial }));
   }
 
-  /* ---- image uploader (button + drag-and-drop) ---- */
+  /* ---- image uploader (button only) ---- */
   function AdmDrop({ value, onUpload, folder, label }) {
     const [busy, setBusy] = uS(false);
-    const [over, setOver] = uS(false);
     const [err, setErr] = uS("");
     const [ok, setOk] = uS(false);
     const [preview, setPreview] = uS("");
@@ -6281,13 +6280,11 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     const handle = async (file) => {
       if (!file) return;
       setErr(""); setOk(false);
-      if (!window.PBData.isConfigured()) { setErr("Supabase not connected — check Settings."); return; }
+      if (!window.PBData.isConfigured()) { setErr("Supabase not connected - check Settings."); return; }
       if (!/^image\//i.test(file.type) && !/\.(png|jpe?g|webp|svg|gif)$/i.test(file.name)) {
         setErr("Please choose an image file (PNG, JPG, WEBP, SVG)."); return;
       }
       if (file.size > 8 * 1024 * 1024) { setErr("Image must be under 8 MB."); return; }
-
-      // Show instant local preview
       const blob = URL.createObjectURL(file);
       setPreview(blob);
       setBusy(true);
@@ -6312,19 +6309,16 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
     return (
       <div className="adm-up">
-        {/* Preview area */}
         {displaySrc && (
           <div className="adm-up-preview">
             <img src={displaySrc} alt="preview" onError={(e) => { e.target.style.opacity = 0; }} />
           </div>
         )}
-
-        {/* Primary action: big button */}
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <button type="button" className="adm-btn adm-btn-primary" onClick={open} disabled={busy}
             style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <Icon name="download" size={15} />
-            {busy ? "Uploading…" : (displaySrc ? "Replace photo" : "Choose photo")}
+            {busy ? "Uploading..." : (displaySrc ? "Replace photo" : "Choose photo")}
           </button>
           {displaySrc && !busy && (
             <button type="button" className="adm-btn adm-sm adm-danger" onClick={() => { onUpload(""); setPreview(""); setErr(""); setOk(false); }}>
@@ -6333,23 +6327,10 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
           )}
           <span style={{ fontSize: 12, color: "var(--pb-muted)" }}>PNG · JPG · WEBP · SVG · max 8 MB</span>
         </div>
-
-        {/* Drag-and-drop zone (secondary) */}
-        <div className={"adm-drop" + (over ? " is-over" : "") + (busy ? " is-busy" : "")}
-          style={{ marginTop: 10 }}
-          onDragOver={(e) => { e.preventDefault(); setOver(true); }}
-          onDragLeave={() => setOver(false)}
-          onDrop={(e) => { e.preventDefault(); setOver(false); handle(e.dataTransfer.files[0]); }}
-          onClick={open}>
-          <div className="adm-drop-ph"><Icon name="download" size={18} /></div>
-          <div className="adm-drop-hint">{busy ? "⏳ Uploading to Supabase…" : "or drag & drop an image here"}</div>
-        </div>
-
         <input ref={inputRef} type="file" accept="image/*" hidden
           onChange={(e) => { const f = e.target.files && e.target.files[0]; if (f) handle(f); }} />
-
-        {err && <div className="adm-up-err">⚠️ {err}</div>}
-        {ok  && <div className="adm-up-ok">✓ Photo saved to Supabase storage</div>}
+        {err && <div className="adm-up-err">&#9888; {err}</div>}
+        {ok  && <div className="adm-up-ok">&#10003; Saved</div>}
       </div>
     );
   }
@@ -7048,8 +7029,15 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     const [url, setUrl] = uS(localStorage.getItem("pb_sb_url") || "");
     const [key, setKey] = uS(localStorage.getItem("pb_sb_key") || "");
     const [pw, setPw] = uS("");
+    const [newPin, setNewPin] = uS("");
     const [testing, setTesting] = uS(false);
     const [diag, setDiag] = uS(null);
+    const savePin = async () => {
+      if (newPin.length !== 6) { alert("PIN must be exactly 6 digits."); return; }
+      await window.PBData.saveContent("admin_pin", newPin);
+      alert("PIN updated successfully.");
+      setNewPin("");
+    };
     const saveConn = () => { localStorage.setItem("pb_sb_url", url.trim()); localStorage.setItem("pb_sb_key", key.trim()); alert("Saved. Reloading to connect."); location.reload(); };
     const clearConn = () => { localStorage.removeItem("pb_sb_url"); localStorage.removeItem("pb_sb_key"); location.reload(); };
     const changePw = async () => {
@@ -7121,6 +7109,14 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
           </div>
         )}
 
+        {/* 2FA PIN */}
+        <div className="adm-set-card">
+          <h3 className="adm-set-h">Two-factor PIN</h3>
+          <p className="adm-muted" style={{ marginTop: 0 }}>6-digit PIN required after login. Default is 000000.</p>
+          <AdmField label="New PIN (6 digits)"><input type="password" maxLength={6} value={newPin} onChange={(e) => setNewPin(e.target.value.replace(/\D/g,""))} placeholder="&bull;&bull;&bull;&bull;&bull;&bull;" /></AdmField>
+          <button className="adm-btn adm-btn-primary" onClick={savePin}>Save PIN</button>
+        </div>
+
         {/* Connection */}
         <div className="adm-set-card">
           <h3 className="adm-set-h">Backend connection</h3>
@@ -7135,17 +7131,66 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
   /* ---- login ---- */
   function AdmLogin() {
-    const [email, setEmail] = uS(""); const [pw, setPw] = uS(""); const [busy, setBusy] = uS(false);
-    const submit = async (e) => { e.preventDefault(); setBusy(true); const { error } = await window.PBData.signIn(email, pw); setBusy(false); if (error) alert("Login failed: " + error.message); };
+    const [email, setEmail] = uS("");
+    const [pw, setPw] = uS("");
+    const [showPw, setShowPw] = uS(false);
+    const [busy, setBusy] = uS(false);
+    const [loginErr, setLoginErr] = uS("");
+    const submit = async (e) => {
+      e.preventDefault();
+      setBusy(true); setLoginErr("");
+      const { error } = await window.PBData.signIn(email, pw);
+      setBusy(false);
+      if (error) setLoginErr("Login failed: " + error.message);
+    };
     return (
       <div className="adm-login-wrap">
-        <form className="adm-login" onSubmit={submit}>
-          <div className="adm-login-brand"><PBLogo variant="color" size={30} /></div>
-          <h3>Sign in to your dashboard</h3>
+        <form className="adm-login" onSubmit={submit} style={{ background: "#fff", borderRadius: 16, padding: 40, maxWidth: 400, width: "100%", boxShadow: "0 8px 32px rgba(0,0,0,0.18)" }}>
+          <div className="adm-login-brand" style={{ justifyContent: "center", marginBottom: 12 }}><PBLogo variant="color" size={36} /></div>
+          <h3 style={{ fontSize: 22, fontWeight: 700, textAlign: "center", margin: "0 0 4px" }}>Welcome back</h3>
+          <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 13, marginBottom: 24 }}>Sign in to your admin dashboard</p>
           <AdmField label="Email"><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoFocus /></AdmField>
-          <AdmField label="Password"><input type="password" value={pw} onChange={(e) => setPw(e.target.value)} /></AdmField>
-          <button className="adm-btn adm-btn-primary adm-btn-block" disabled={busy}>{busy ? "Signing in…" : "Sign in"}</button>
+          <AdmField label="Password">
+            <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+              <input type={showPw ? "text" : "password"} value={pw} onChange={(e) => setPw(e.target.value)} style={{ flex: 1, paddingRight: 36 }} />
+              <button type="button" onClick={() => setShowPw(!showPw)}
+                style={{ position: "absolute", right: 8, background: "none", border: "none", cursor: "pointer", fontSize: 16, color: "var(--pb-muted)", padding: 0 }}>
+                {showPw ? "🙈" : "👁"}
+              </button>
+            </div>
+          </AdmField>
+          <button className="adm-btn adm-btn-primary adm-btn-block" disabled={busy} style={{ marginTop: 8 }}>{busy ? "Signing in..." : "Sign in"}</button>
+          {loginErr && <div className="adm-up-err" style={{ marginTop: 10 }}>&#9888; {loginErr}</div>}
         </form>
+      </div>
+    );
+  }
+
+  /* ---- 2FA PIN ---- */
+  function AdmPin({ onVerified }) {
+    const [pin, setPin] = uS("");
+    const [err, setErr] = uS("");
+    const verify = async () => {
+      const stored = ((window.PB_OVERRIDES || {}).admin_pin) || "000000";
+      if (pin === stored) { onVerified(); }
+      else { setErr("Incorrect PIN — try again."); setPin(""); }
+    };
+    return (
+      <div className="adm-overlay">
+        <div className="adm-shell adm-shell-login">
+          <div className="adm-login-wrap">
+            <div className="adm-login-brand" style={{ justifyContent: "center", marginBottom: 8 }}><PBLogo variant="color" size={36} /></div>
+            <h3 style={{ textAlign: "center", marginBottom: 4 }}>Two-factor verification</h3>
+            <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 14, marginBottom: 24 }}>Enter your 6-digit admin PIN to continue.</p>
+            <AdmField label="PIN code">
+              <input type="password" maxLength={6} value={pin} onChange={(e) => setPin(e.target.value.replace(/\D/g,""))}
+                onKeyDown={(e) => e.key === "Enter" && verify()} autoFocus placeholder="&bull;&bull;&bull;&bull;&bull;&bull;" style={{ letterSpacing: 8, fontSize: 20, textAlign: "center" }} />
+            </AdmField>
+            <button className="adm-btn adm-btn-primary adm-btn-block" onClick={verify} style={{ marginTop: 8 }}>Verify</button>
+            {err && <div className="adm-up-err" style={{ marginTop: 10 }}>&#9888;&#65039; {err}</div>}
+            <p style={{ textAlign: "center", fontSize: 12, color: "var(--pb-muted)", marginTop: 16 }}>Default PIN is 000000. Change it in Settings after login.</p>
+          </div>
+        </div>
       </div>
     );
   }
@@ -7157,6 +7202,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     { id: "logos",    label: "Logo",          icon: "shariah" },
     { id: "hero",     label: "Hero slides",   icon: "gallery" },
     { id: "pages",    label: "Page content",  icon: "news" },
+    { id: "services", label: "Services",      icon: "pos" },
     { id: "team",     label: "Team",          icon: "team" },
     { id: "posts",    label: "News & Press",  icon: "press" },
     { id: "atms",     label: "ATM locations", icon: "atm" },
@@ -7164,9 +7210,51 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     { id: "settings", label: "Settings",      icon: "shield" },
   ];
 
+  /* ============================ SERVICES ============================ */
+  function AdmServices() {
+    const [tiles, setTiles] = uS(() => clone(window.PB_CONTENT && window.PB_CONTENT.tiles || []));
+    const [busy, setBusy] = uS(false);
+    const [saved, setSaved] = uS(false);
+    const upd = (i, patch) => setTiles(tiles.map((t, j) => j === i ? Object.assign({}, t, patch) : t));
+    const updLabel = (i, lang, val) => upd(i, { label: Object.assign({}, tiles[i].label, { [lang]: val }) });
+    const updBlurb = (i, lang, val) => upd(i, { blurb: Object.assign({}, tiles[i].blurb, { [lang]: val }) });
+    const save = async () => {
+      setBusy(true);
+      const { error } = await saveContentKey("tiles", tiles);
+      setBusy(false);
+      if (error) alert("Failed: " + error.message);
+      else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
+    };
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar">
+          <h2 className="adm-h2">Services tiles</h2>
+        </div>
+        <p className="adm-muted" style={{ marginBottom: 20 }}>Edit the service cards shown on the homepage.</p>
+        {tiles.map((t, i) => (
+          <div key={t.id} className="adm-card" style={{ marginBottom: 14 }}>
+            <div className="adm-card-head">
+              <strong style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ width: 18, height: 18, borderRadius: 4, background: t.bg, display: "inline-block", border: "1px solid #ddd" }} />
+                {t.id}
+              </strong>
+            </div>
+            <AdmField label="Label (English)"><input value={(t.label && t.label.en) || ""} onChange={(e) => updLabel(i, "en", e.target.value)} /></AdmField>
+            <AdmField label="Label (Somali)"><input value={(t.label && t.label.so) || ""} onChange={(e) => updLabel(i, "so", e.target.value)} /></AdmField>
+            <AdmField label="Blurb (English)"><input value={(t.blurb && t.blurb.en) || ""} onChange={(e) => updBlurb(i, "en", e.target.value)} /></AdmField>
+            <AdmField label="Blurb (Somali)"><input value={(t.blurb && t.blurb.so) || ""} onChange={(e) => updBlurb(i, "so", e.target.value)} /></AdmField>
+            <AdmField label="Background colour"><input type="color" value={t.bg || "#0b2f4f"} onChange={(e) => upd(i, { bg: e.target.value })} style={{ width: 60, height: 36, padding: 2, cursor: "pointer" }} /></AdmField>
+          </div>
+        ))}
+        <AdmSaveBar onSave={save} busy={busy} saved={saved} />
+      </div>
+    );
+  }
+
   function AdminApp() {
     const [show, setShow] = uS(location.hash === "#admin");
     const [session, setSession] = uS(null);
+    const [pinVerified, setPinVerified] = uS(false);
     const [view, setView] = uS("overview");
     const [menuOpen, setMenuOpen] = uS(false);
     uE(() => {
@@ -7187,10 +7275,11 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
     if (!configured) return (<div className="adm-overlay"><div className="adm-shell"><header className="adm-head"><div className="adm-brand"><LogoMark size={26} variant="color" /> <span>Premier Admin</span></div><button className="adm-btn adm-sm" onClick={close}>Close ✕</button></header><div className="adm-body"><AdmSettings session={null} /></div></div></div>);
     if (!session) return (<div className="adm-overlay"><div className="adm-shell adm-shell-login"><button className="adm-login-close adm-btn adm-sm" onClick={close}>Close ✕</button><AdmLogin /></div></div>);
+    if (!pinVerified) return <AdmPin onVerified={() => setPinVerified(true)} />;
 
     const VIEWS = {
       overview: <AdmOverview go={go} />, branding: <AdmBranding />, logos: <AdmLogos />, hero: <AdmHero />,
-      pages: <AdmPages />, team: <AdmTeam />, posts: <AdmPosts />, atms: <AdmAtms />, footer: <AdmFooter />, settings: <AdmSettings session={session} />,
+      pages: <AdmPages />, services: <AdmServices />, team: <AdmTeam />, posts: <AdmPosts />, atms: <AdmAtms />, footer: <AdmFooter />, settings: <AdmSettings session={session} />,
     };
     return (
       <div className="adm-overlay">
