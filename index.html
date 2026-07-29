@@ -975,9 +975,24 @@ img { max-width: 100%; display: block; }
 .adm-bi-col { display: flex; flex-direction: column; gap: 4px; }
 .adm-bi-col em { font-style: normal; font-size: 10px; font-weight: 700; letter-spacing: .08em; color: var(--pb-muted); }
 .adm-bi-col input, .adm-bi-col textarea { font-family: 'Lexend', sans-serif; font-size: 13.5px; padding: 9px 11px; border: 1px solid var(--pb-line); border-radius: 9px; width: 100%; box-sizing: border-box; resize: vertical; }
-.adm-savebar { display: flex; align-items: center; gap: 14px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--pb-line); position: sticky; bottom: 0; background: #fff; }
+.adm-savebar { display: flex; align-items: center; gap: 14px; margin-top: 22px; padding: 14px 0; border-top: 1px solid var(--pb-line); position: sticky; bottom: 0; background: #fff; box-shadow: 0 -8px 20px -8px rgba(11,47,79,.12); z-index: 3; }
 .adm-saved { color: var(--pb-secondary-700); font-size: 13px; font-weight: 600; }
 .adm-color-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+/* Wide editor panes (hero, etc.) */
+.adm-pane-wide { max-width: 940px; }
+/* Grouped slide cards */
+.adm-slide-card { padding: 0; overflow: hidden; gap: 0; }
+.adm-slide-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 20px; background: #f7f9fb; border-bottom: 1px solid var(--pb-line); }
+.adm-slide-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.adm-slide-title strong { font-size: 15px; }
+.adm-slide-sub { font-size: 13px; color: var(--pb-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 340px; }
+.adm-tint-dot { width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0; border: 2px solid #fff; box-shadow: 0 0 0 1px var(--pb-line); }
+.adm-tint-navy { background: #0b2f4f; }
+.adm-tint-green { background: #6cbe46; }
+.adm-fieldset { padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; }
+.adm-fieldset + .adm-fieldset { border-top: 1px solid var(--pb-line); }
+.adm-fs-title { margin: 0; font-family: 'Lexend', sans-serif; font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--pb-secondary-700); }
 .adm-color { display: flex; gap: 8px; align-items: center; }
 .adm-color input[type=color] { width: 46px; height: 40px; padding: 0; border: 1px solid var(--pb-line); border-radius: 8px; background: none; cursor: pointer; }
 .adm-sub { font-size: 13px; font-weight: 600; color: var(--pb-ink); margin: 20px 0 8px; }
@@ -6641,39 +6656,62 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       if (error) alert("Failed: " + error.message); else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
     };
     return (
-      <div className="adm-pane">
-        <div className="adm-toolbar"><h2 className="adm-h2">Hero slides</h2><button className="adm-btn adm-btn-primary" onClick={add}>+ Add slide</button></div>
+      <div className="adm-pane adm-pane-wide">
+        <div className="adm-toolbar">
+          <div>
+            <h2 className="adm-h2">Hero slides</h2>
+            <p className="adm-muted" style={{ margin: "4px 0 0" }}>The rotating banners at the top of the homepage. Reorder with ↑ ↓; each field is bilingual (English / Somali).</p>
+          </div>
+          <button className="adm-btn adm-btn-primary" onClick={add}>+ Add slide</button>
+        </div>
         {slides.map((s, i) => (
-          <div key={s.id || i} className="adm-card">
-            <div className="adm-card-head">
-              <strong>Slide {i + 1}</strong>
+          <div key={s.id || i} className="adm-card adm-slide-card">
+            <div className="adm-slide-head">
+              <div className="adm-slide-title">
+                <span className={"adm-tint-dot adm-tint-" + (s.tint || "navy")} />
+                <strong>Slide {i + 1}</strong>
+                {(s.title && s.title.en) ? <span className="adm-slide-sub">{s.title.en}</span> : null}
+              </div>
               <div className="adm-row">
-                <button className="adm-btn adm-sm" onClick={() => move(i, -1)}>↑</button>
-                <button className="adm-btn adm-sm" onClick={() => move(i, 1)}>↓</button>
+                <button className="adm-btn adm-sm" disabled={i === 0} onClick={() => move(i, -1)} title="Move up">↑</button>
+                <button className="adm-btn adm-sm" disabled={i === slides.length - 1} onClick={() => move(i, 1)} title="Move down">↓</button>
                 <button className="adm-btn adm-sm adm-danger" onClick={() => remove(i)}>Remove</button>
               </div>
             </div>
-            <AdmBi label="Eyebrow" value={s.eyebrow} onChange={(v) => upd(i, { eyebrow: v })} />
-            <AdmBi label="Headline" value={s.title} onChange={(v) => upd(i, { title: v })} />
-            <AdmBi label="Sub-text" value={s.sub} onChange={(v) => upd(i, { sub: v })} textarea rows={2} />
-            <AdmBi label="Button label" value={s.cta} onChange={(v) => upd(i, { cta: v })} />
-            <div className="adm-color-row">
-              <AdmField label="Side image (replaces the vector art)">
-                <AdmDrop value={s.artImage} folder="hero" onUpload={(url) => upd(i, { artImage: url })} />
-                {s.artImage && <button className="adm-btn adm-sm" onClick={() => upd(i, { artImage: "" })}>Remove image → use vector</button>}
-              </AdmField>
-              <AdmField label="Full background image (optional)">
-                <AdmDrop value={s.image} folder="hero" onUpload={(url) => upd(i, { image: url })} />
-                {s.image && <button className="adm-btn adm-sm" onClick={() => upd(i, { image: "" })}>Remove background</button>}
+
+            <div className="adm-fieldset">
+              <h5 className="adm-fs-title">Text content</h5>
+              <AdmBi label="Eyebrow (small label above the headline)" value={s.eyebrow} onChange={(v) => upd(i, { eyebrow: v })} />
+              <AdmBi label="Headline" value={s.title} onChange={(v) => upd(i, { title: v })} />
+              <AdmBi label="Sub-text" value={s.sub} onChange={(v) => upd(i, { sub: v })} textarea rows={3} />
+              <AdmBi label="Button label" value={s.cta} onChange={(v) => upd(i, { cta: v })} />
+            </div>
+
+            <div className="adm-fieldset">
+              <h5 className="adm-fs-title">Media</h5>
+              <div className="adm-color-row">
+                <AdmField label="Side image (replaces the vector art)">
+                  <AdmDrop value={s.artImage} folder="hero" onUpload={(url) => upd(i, { artImage: url })} />
+                  {s.artImage && <button className="adm-btn adm-sm" onClick={() => upd(i, { artImage: "" })}>Remove image → use vector</button>}
+                </AdmField>
+                <AdmField label="Full background image (optional)">
+                  <AdmDrop value={s.image} folder="hero" onUpload={(url) => upd(i, { image: url })} />
+                  {s.image && <button className="adm-btn adm-sm" onClick={() => upd(i, { image: "" })}>Remove background</button>}
+                </AdmField>
+              </div>
+            </div>
+
+            <div className="adm-fieldset">
+              <h5 className="adm-fs-title">Style</h5>
+              <AdmField label="Background tint">
+                <select value={s.tint} onChange={(e) => upd(i, { tint: e.target.value })}>
+                  <option value="navy">Navy</option><option value="green">Green</option>
+                </select>
               </AdmField>
             </div>
-            <AdmField label="Background tint">
-              <select value={s.tint} onChange={(e) => upd(i, { tint: e.target.value })}>
-                <option value="navy">Navy</option><option value="green">Green</option>
-              </select>
-            </AdmField>
           </div>
         ))}
+        {slides.length === 0 && <p className="adm-muted">No slides yet — click “+ Add slide”.</p>}
         <AdmSaveBar onSave={save} busy={busy} saved={saved} />
       </div>
     );
