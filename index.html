@@ -6805,6 +6805,9 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     const [editing, setEditing] = uS(null);
     const [loading, setLoading] = uS(true);
     const [syncing, setSyncing] = uS(false);
+    const [busy, setBusy] = uS(false);
+    const [sub, setSub] = uS("all");
+    const [q, setQ] = uS("");
 
     const flat = (v) => (v && typeof v === "object" ? (v.en || v.so || "") : (v || ""));
 
@@ -6862,12 +6865,14 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
     uE(() => { load(); }, []);
 
-    const newMember = () => setEditing({ category: "board", name: "", title: "", bio: "", photo_url: "", sort: items.length });
+    const newMember = () => setEditing({ category: sub === "all" ? "board" : sub, name: "", title: "", bio: "", photo_url: "", sort: items.length });
     const save = async () => {
       const m = Object.assign({}, editing);
       if (m.id == null) delete m.id;
       if (!m.name) { alert("Name is required."); return; }
+      setBusy(true);
       const { error } = await window.PBData.saveMember(m);
+      setBusy(false);
       if (error) { alert("Save failed: " + error.message); return; }
       setEditing(null); await load(); window.PBData.loadTeam();
     };
@@ -6877,54 +6882,114 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       if (error) { alert("Delete failed: " + error.message); return; }
       await load(); window.PBData.loadTeam();
     };
+    const catLabel = (v) => (ADM_CATS.find((c) => c.value === v) || {}).label || v;
 
+    /* ---- Editor (News & Press-style: grouped fieldset cards) ---- */
     if (editing) {
+      const setE = (patch) => setEditing(Object.assign({}, editing, patch));
       return (
         <div className="adm-pane">
-          <h2 className="adm-h2">{editing.id ? "Edit member" : "New member"}</h2>
-          <AdmField label="Section">
-            <select value={editing.category} onChange={(e) => setEditing(Object.assign({}, editing, { category: e.target.value }))}>
-              {ADM_CATS.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
-            </select>
-          </AdmField>
-          <AdmField label="Photo"><AdmDrop value={editing.photo_url} folder="team" onUpload={(url) => setEditing(Object.assign({}, editing, { photo_url: url }))} /></AdmField>
-          <AdmField label="Full name"><input value={editing.name} onChange={(e) => setEditing(Object.assign({}, editing, { name: e.target.value }))} placeholder="e.g. Jibril Hassan Mohamed" /></AdmField>
-          <AdmField label="Title / role"><input value={editing.title || ""} onChange={(e) => setEditing(Object.assign({}, editing, { title: e.target.value }))} placeholder="e.g. Chairman" /></AdmField>
-          <AdmField label="Bio"><textarea rows={5} value={editing.bio || ""} onChange={(e) => setEditing(Object.assign({}, editing, { bio: e.target.value }))} /></AdmField>
-          <AdmField label="Sort order"><input type="number" value={editing.sort == null ? 0 : editing.sort} onChange={(e) => setEditing(Object.assign({}, editing, { sort: parseInt(e.target.value || "0", 10) }))} /></AdmField>
-          <div className="adm-row"><button className="adm-btn adm-btn-primary" onClick={save}>Save</button><button className="adm-btn" onClick={() => setEditing(null)}>Cancel</button></div>
+          <div className="adm-toolbar">
+            <h2 className="adm-h2">{editing.id ? "Edit member" : "Add member"}</h2>
+            <div className="adm-row">
+              <button className="adm-btn adm-sm" onClick={() => setEditing(null)}>← Back</button>
+              <button className="adm-btn adm-btn-primary adm-sm" disabled={busy} onClick={save}>{busy ? "Saving…" : "Save member"}</button>
+            </div>
+          </div>
+
+          <div className="adm-card adm-slide-card">
+            <div className="adm-slide-head"><div className="adm-slide-title">
+              <span className="adm-item-av" style={{ width: 34, height: 34 }}>{editing.photo_url ? <img src={editing.photo_url} alt="" /> : <span>{(editing.name || "?").slice(0, 1)}</span>}</span>
+              <strong>Identity</strong>
+            </div></div>
+            <div className="adm-fieldset">
+              <AdmField label="Photo"><AdmDrop value={editing.photo_url} folder="team" onUpload={(url) => setE({ photo_url: url })} /></AdmField>
+              <div className="adm-color-row">
+                <AdmField label="Full name"><input value={editing.name} onChange={(e) => setE({ name: e.target.value })} placeholder="e.g. Jibril Hassan Mohamed" /></AdmField>
+                <AdmField label="Title / role"><input value={editing.title || ""} onChange={(e) => setE({ title: e.target.value })} placeholder="e.g. Chairman" /></AdmField>
+              </div>
+              <AdmField label="Section">
+                <select value={editing.category} onChange={(e) => setE({ category: e.target.value })}>
+                  {ADM_CATS.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
+                </select>
+              </AdmField>
+            </div>
+          </div>
+
+          <div className="adm-card adm-slide-card">
+            <div className="adm-slide-head"><div className="adm-slide-title"><strong>Profile</strong></div></div>
+            <div className="adm-fieldset">
+              <AdmField label="Bio"><textarea rows={5} value={editing.bio || ""} onChange={(e) => setE({ bio: e.target.value })} placeholder="Short professional biography…" /></AdmField>
+              <AdmField label="Sort order (lower shows first)"><input type="number" value={editing.sort == null ? 0 : editing.sort} onChange={(e) => setE({ sort: parseInt(e.target.value || "0", 10) })} style={{ maxWidth: 140 }} /></AdmField>
+            </div>
+          </div>
+
+          <div className="adm-savebar">
+            <button className="adm-btn adm-btn-primary" disabled={busy} onClick={save}>{busy ? "Saving…" : "Save member"}</button>
+            <button className="adm-btn" onClick={() => setEditing(null)}>Cancel</button>
+          </div>
         </div>
       );
     }
 
+    /* ---- List (News & Press-style: KPIs + filter pills + search + rows) ---- */
+    const count = (v) => items.filter((m) => m.category === v).length;
+    const SUBNAV = [{ id: "all", label: "All" }].concat(ADM_CATS.map((c) => ({ id: c.value, label: c.label })));
+    const shown = items.filter((m) => (sub === "all" || m.category === sub) && (!q || (m.name || "").toLowerCase().includes(q.toLowerCase()) || (m.title || "").toLowerCase().includes(q.toLowerCase())));
+    const renderMemberRow = (m) => (
+      <div key={m.id} className="adm-item">
+        <div className="adm-item-av">{m.photo_url ? <img src={m.photo_url} alt="" /> : <span>{(m.name || "?").slice(0, 1)}</span>}</div>
+        <div className="adm-item-main">
+          <strong>{m.name}</strong>
+          <span><span className="adm-status is-pub">{catLabel(m.category)}</span> · {m.title || "—"}</span>
+        </div>
+        <div className="adm-row">
+          <button className="adm-btn adm-sm" onClick={() => setEditing(m)}>Edit</button>
+          <button className="adm-btn adm-sm adm-danger" onClick={() => del(m.id)}>Delete</button>
+        </div>
+      </div>
+    );
+
     return (
       <div className="adm-pane">
         <div className="adm-toolbar">
-          <h2 className="adm-h2">Team members</h2>
+          <div>
+            <h2 className="adm-h2">Team members</h2>
+            <p className="adm-muted" style={{ margin: "4px 0 0" }}>The people shown on the Board, Senior Management and Shari’ah Board pages.</p>
+          </div>
           <button className="adm-btn adm-btn-primary" onClick={newMember}>+ Add member</button>
         </div>
+
+        <div className="adm-kpi-row">
+          <div className="adm-kpi"><span>{items.length}</span><em>Total members</em></div>
+          <div className="adm-kpi"><span>{count("board")}</span><em>Board of Directors</em></div>
+          <div className="adm-kpi"><span>{count("leadership")}</span><em>Senior Management</em></div>
+          <div className="adm-kpi"><span>{count("shariah")}</span><em>Shari’ah Board</em></div>
+        </div>
+
+        <div className="adm-subnav">
+          {SUBNAV.map((n) => <button key={n.id} className={sub === n.id ? "is-active" : ""} onClick={() => setSub(n.id)}>{n.label}{n.id !== "all" ? " (" + count(n.id) + ")" : ""}</button>)}
+        </div>
+        <div className="adm-row" style={{ marginBottom: 16 }}>
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search by name or title…" style={{ maxWidth: 320 }} />
+        </div>
+
         {(loading || syncing) ? (
           <p className="adm-muted">{syncing ? "⏳ Syncing website data…" : "Loading…"}</p>
-        ) : (
-          items.length === 0
-            ? <p className="adm-muted">No members yet. Click "+ Add member".</p>
-            : ADM_CATS.map((c) => {
-                const group = items.filter((m) => m.category === c.value);
-                if (!group.length) return null;
-                return (
-                  <div key={c.value} className="adm-group">
-                    <h4>{c.label} <span style={{ fontWeight: 400, color: "var(--pb-muted)", fontSize: 13 }}>({group.length})</span></h4>
-                    {group.map((m) => (
-                      <div key={m.id} className="adm-item">
-                        <div className="adm-item-av">{m.photo_url ? <img src={m.photo_url} alt="" /> : <span>{(m.name || "?").slice(0, 1)}</span>}</div>
-                        <div className="adm-item-main"><strong>{m.name}</strong><span>{m.title}</span></div>
-                        <div className="adm-row"><button className="adm-btn adm-sm" onClick={() => setEditing(m)}>Edit</button><button className="adm-btn adm-sm adm-danger" onClick={() => del(m.id)}>Delete</button></div>
-                      </div>
-                    ))}
-                  </div>
-                );
-              })
-        )}
+        ) : shown.length === 0 ? (
+          <p className="adm-muted">{items.length === 0 ? 'No members yet. Click "+ Add member".' : "No members match."}</p>
+        ) : sub === "all" ? (
+          ADM_CATS.map((c) => {
+            const group = shown.filter((m) => m.category === c.value);
+            if (!group.length) return null;
+            return (
+              <div key={c.value} className="adm-group">
+                <h4>{c.label} <span style={{ fontWeight: 400, color: "var(--pb-muted)", fontSize: 13 }}>({group.length})</span></h4>
+                {group.map((m) => renderMemberRow(m))}
+              </div>
+            );
+          })
+        ) : shown.map((m) => renderMemberRow(m))}
       </div>
     );
   }
