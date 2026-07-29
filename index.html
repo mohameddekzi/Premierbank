@@ -838,6 +838,9 @@ img { max-width: 100%; display: block; }
 
 /* ---- Full dashboard ---- */
 .adm-shell-dash { max-width: 1120px; height: 88vh; display: flex; }
+/* WordPress-style full-screen dashboard */
+.adm-overlay-full { padding: 0; align-items: stretch; background: rgba(8,24,40,.35); }
+.adm-overlay-full .adm-shell-dash { max-width: none; width: 100vw; height: 100vh; border-radius: 0; }
 .adm-shell-login { max-width: 440px; position: relative; }
 .adm-side { width: 230px; flex-shrink: 0; background: var(--pb-primary); color: #fff; display: flex; flex-direction: column; }
 .adm-side-brand { display: flex; align-items: center; gap: 10px; padding: 20px; font-weight: 600; font-size: 15px; border-bottom: 1px solid rgba(255,255,255,.1); }
@@ -950,12 +953,13 @@ img { max-width: 100%; display: block; }
 .pb-post-content h3 { font-size: 15px; margin: 12px 0 6px; }
 .pb-post-content img { max-width: 100%; border-radius: 8px; margin: 8px 0; }
 .pb-post-content blockquote { border-left: 3px solid var(--pb-secondary); margin: 10px 0; padding: 4px 14px; color: var(--pb-muted); }
-.adm-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-.adm-main-head { display: flex; align-items: center; gap: 14px; padding: 14px 22px; border-bottom: 1px solid var(--pb-line); }
+.adm-main { flex: 1; display: flex; flex-direction: column; min-width: 0; background: #fff; }
+.adm-main-head { display: flex; align-items: center; gap: 14px; padding: 15px 34px; border-bottom: 1px solid var(--pb-line); background: #fff; position: sticky; top: 0; z-index: 4; }
 .adm-crumb { flex: 1; font-weight: 600; color: var(--pb-ink); }
 .adm-burger { display: none; border: 0; background: none; font-size: 20px; cursor: pointer; color: var(--pb-ink); }
-.adm-main-body { flex: 1; overflow-y: auto; padding: 26px; }
-.adm-pane { max-width: 640px; }
+.adm-main-body { flex: 1; overflow-y: auto; padding: 30px 40px 44px; }
+.adm-pane { max-width: 960px; margin: 0 auto; }
+.adm-pane > .adm-toolbar { margin-bottom: 20px; }
 .adm-h2 { font-family: 'Lexend', sans-serif; font-size: 22px; font-weight: 600; color: var(--pb-ink); margin: 0 0 6px; letter-spacing: -.3px; }
 .adm-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin: 20px 0 28px; }
 .adm-stat { border: 1px solid var(--pb-line); border-radius: 14px; padding: 20px; text-align: left; cursor: pointer; background: #fff; transition: border-color .15s ease, transform .15s ease; display: flex; flex-direction: column; gap: 4px; }
@@ -990,6 +994,7 @@ img { max-width: 100%; display: block; }
 .adm-tint-dot { width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0; border: 2px solid #fff; box-shadow: 0 0 0 1px var(--pb-line); }
 .adm-tint-navy { background: #0b2f4f; }
 .adm-tint-green { background: #6cbe46; }
+.adm-idx { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 7px; background: var(--pb-secondary-100); color: var(--pb-secondary-700); font-size: 12px; font-weight: 700; flex-shrink: 0; }
 .adm-fieldset { padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; }
 .adm-fieldset + .adm-fieldset { border-top: 1px solid var(--pb-line); }
 .adm-fs-title { margin: 0; font-family: 'Lexend', sans-serif; font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--pb-secondary-700); }
@@ -8049,18 +8054,24 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
         </div>
         <p className="adm-muted" style={{ marginBottom: 20 }}>Edit the service cards shown on the homepage.</p>
         {tiles.map((t, i) => (
-          <div key={t.id} className="adm-card" style={{ marginBottom: 14 }}>
-            <div className="adm-card-head">
-              <strong style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ width: 18, height: 18, borderRadius: 4, background: t.bg, display: "inline-block", border: "1px solid #ddd" }} />
-                {t.id}
-              </strong>
+          <div key={t.id} className="adm-card adm-slide-card">
+            <div className="adm-slide-head">
+              <div className="adm-slide-title">
+                <span className="adm-tint-dot" style={{ background: t.bg }} />
+                <strong>{(t.label && t.label.en) || t.id}</strong>
+              </div>
             </div>
-            <AdmField label="Label (English)"><input value={(t.label && t.label.en) || ""} onChange={(e) => updLabel(i, "en", e.target.value)} /></AdmField>
-            <AdmField label="Label (Somali)"><input value={(t.label && t.label.so) || ""} onChange={(e) => updLabel(i, "so", e.target.value)} /></AdmField>
-            <AdmField label="Blurb (English)"><input value={(t.blurb && t.blurb.en) || ""} onChange={(e) => updBlurb(i, "en", e.target.value)} /></AdmField>
-            <AdmField label="Blurb (Somali)"><input value={(t.blurb && t.blurb.so) || ""} onChange={(e) => updBlurb(i, "so", e.target.value)} /></AdmField>
-            <AdmField label="Background colour"><input type="color" value={t.bg || "#0b2f4f"} onChange={(e) => upd(i, { bg: e.target.value })} style={{ width: 60, height: 36, padding: 2, cursor: "pointer" }} /></AdmField>
+            <div className="adm-fieldset">
+              <div className="adm-color-row">
+                <AdmField label="Label (English)"><input value={(t.label && t.label.en) || ""} onChange={(e) => updLabel(i, "en", e.target.value)} /></AdmField>
+                <AdmField label="Label (Somali)"><input value={(t.label && t.label.so) || ""} onChange={(e) => updLabel(i, "so", e.target.value)} /></AdmField>
+              </div>
+              <div className="adm-color-row">
+                <AdmField label="Blurb (English)"><input value={(t.blurb && t.blurb.en) || ""} onChange={(e) => updBlurb(i, "en", e.target.value)} /></AdmField>
+                <AdmField label="Blurb (Somali)"><input value={(t.blurb && t.blurb.so) || ""} onChange={(e) => updBlurb(i, "so", e.target.value)} /></AdmField>
+              </div>
+              <AdmField label="Background colour"><input type="color" value={t.bg || "#0b2f4f"} onChange={(e) => upd(i, { bg: e.target.value })} style={{ width: 60, height: 36, padding: 2, cursor: "pointer" }} /></AdmField>
+            </div>
           </div>
         ))}
         <AdmSaveBar onSave={save} busy={busy} saved={saved} />
@@ -8097,16 +8108,16 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
         </div>
         {intro && <p className="adm-muted" style={{ marginBottom: 18 }}>{intro}</p>}
         {items.map((it, i) => (
-          <div key={i} className="adm-card" style={{ marginBottom: 14 }}>
-            <div className="adm-card-head">
-              <strong>{itemTitle ? itemTitle(it, i) : "Item " + (i + 1)}</strong>
+          <div key={i} className="adm-card adm-slide-card">
+            <div className="adm-slide-head">
+              <div className="adm-slide-title"><span className="adm-idx">{i + 1}</span><strong>{itemTitle ? itemTitle(it, i) : "Item " + (i + 1)}</strong></div>
               <div className="adm-row">
                 {reorder && <button className="adm-btn adm-sm" disabled={i === 0} onClick={() => move(i, -1)} title="Move up">↑</button>}
                 {reorder && <button className="adm-btn adm-sm" disabled={i === items.length - 1} onClick={() => move(i, 1)} title="Move down">↓</button>}
                 {blank && <button className="adm-btn adm-sm adm-danger" onClick={() => rm(i)}>Remove</button>}
               </div>
             </div>
-            {renderItem(it, (patch) => upd(i, patch), i)}
+            <div className="adm-fieldset">{renderItem(it, (patch) => upd(i, patch), i)}</div>
           </div>
         ))}
         <AdmSaveBar onSave={save} busy={busy} saved={saved} />
@@ -8149,16 +8160,16 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
         </div>
         {intro && <p className="adm-muted" style={{ marginBottom: 18 }}>{intro}</p>}
         {rows.map((r, i) => (
-          <div key={i} className="adm-card" style={{ marginBottom: 14 }}>
-            <div className="adm-card-head">
-              <strong>{itemTitle ? itemTitle(r, i) : "Item " + (i + 1)}</strong>
+          <div key={i} className="adm-card adm-slide-card">
+            <div className="adm-slide-head">
+              <div className="adm-slide-title"><span className="adm-idx">{i + 1}</span><strong>{itemTitle ? itemTitle(r, i) : "Item " + (i + 1)}</strong></div>
               <div className="adm-row">
                 <button className="adm-btn adm-sm" disabled={i === 0} onClick={() => move(i, -1)} title="Move up">↑</button>
                 <button className="adm-btn adm-sm" disabled={i === rows.length - 1} onClick={() => move(i, 1)} title="Move down">↓</button>
                 <button className="adm-btn adm-sm adm-danger" onClick={() => rm(i)}>Remove</button>
               </div>
             </div>
-            {renderItem(r, (patch) => upd(i, patch), i)}
+            <div className="adm-fieldset">{renderItem(r, (patch) => upd(i, patch), i)}</div>
           </div>
         ))}
         <AdmSaveBar onSave={save} busy={busy} saved={saved} />
@@ -8383,7 +8394,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       accounts: <AdmAccounts />, cards: <AdmCards />, values: <AdmValues />, stats: <AdmStats />, rates: <AdmRates />, testimonials: <AdmTestimonials />, faq: <AdmFaq />,
     };
     return (
-      <div className="adm-overlay">
+      <div className="adm-overlay adm-overlay-full">
         <div className="adm-shell adm-shell-dash">
           {menuOpen && <div className="adm-side-backdrop" onClick={() => setMenuOpen(false)} />}
           <aside className={"adm-side" + (menuOpen ? " is-open" : "")}>
