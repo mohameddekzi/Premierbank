@@ -848,6 +848,9 @@ img { max-width: 100%; display: block; }
 .adm-side-nav button:hover .adm-nav-ico { background: rgba(108,190,70,.25); color: #fff; }
 .adm-side-nav button.is-active { background: var(--pb-secondary); color: #06340a; font-weight: 600; }
 .adm-side-nav button.is-active .adm-nav-ico { background: rgba(6,52,10,.18); color: #06340a; }
+.adm-nav-group { display: flex; flex-direction: column; gap: 2px; }
+.adm-nav-group + .adm-nav-group { margin-top: 10px; }
+.adm-nav-grouphead { font-size: 10.5px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; color: rgba(255,255,255,.38); padding: 6px 14px 4px; }
 .adm-side-foot { padding: 14px; border-top: 1px solid rgba(255,255,255,.1); }
 .adm-btn-ghost { background: transparent; color: #fff; border-color: rgba(255,255,255,.25); width: 100%; }
 .adm-btn-ghost:hover { background: rgba(255,255,255,.1); }
@@ -7172,10 +7175,10 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
           </div>
         )}
 
-        {/* 2FA — email OTP */}
+        {/* 2FA — Google Authenticator (TOTP) */}
         <div className="adm-set-card">
           <h3 className="adm-set-h">Two-factor authentication</h3>
-          <p className="adm-muted" style={{ marginTop: 0 }}>Email codes are enabled. After entering your password, a fresh 6-digit code is automatically emailed to <strong>{(session && session.user && session.user.email) || "your email"}</strong> — you enter it to finish signing in. No setup needed.</p>
+          <p className="adm-muted" style={{ marginTop: 0 }}>Protected with <strong>Google Authenticator</strong> (TOTP). After your password, you enter the current 6-digit code from your authenticator app to finish signing in. The first time, you scan a QR code to set it up — no emails, no codes to wait for.</p>
         </div>
 
         {/* Connection */}
@@ -7342,18 +7345,29 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
   /* ============================ DASHBOARD SHELL ============================ */
   const NAV = [
-    { id: "overview", label: "Dashboard",     icon: "invest" },
-    { id: "branding", label: "Branding",      icon: "star" },
-    { id: "logos",    label: "Logo",          icon: "shariah" },
-    { id: "hero",     label: "Hero slides",   icon: "gallery" },
-    { id: "pages",    label: "Page content",  icon: "news" },
-    { id: "services", label: "Services",      icon: "pos" },
-    { id: "team",     label: "Team",          icon: "team" },
-    { id: "posts",    label: "News & Press",  icon: "press" },
-    { id: "atms",     label: "ATM locations", icon: "atm" },
-    { id: "footer",   label: "Footer & social", icon: "globe" },
-    { id: "settings", label: "Settings",      icon: "shield" },
+    { id: "overview", label: "Dashboard",     icon: "invest", group: "General" },
+    { id: "branding", label: "Branding",      icon: "star",   group: "General" },
+    { id: "logos",    label: "Logo",          icon: "shariah", group: "General" },
+
+    { id: "hero",     label: "Hero slides",   icon: "gallery", group: "Homepage" },
+    { id: "services", label: "Services",      icon: "pos",    group: "Homepage" },
+    { id: "accounts", label: "Accounts",      icon: "personal", group: "Homepage" },
+    { id: "cards",    label: "Cards",         icon: "card",   group: "Homepage" },
+    { id: "values",   label: "Core values",   icon: "check",  group: "Homepage" },
+    { id: "stats",    label: "Key numbers",   icon: "invest", group: "Homepage" },
+    { id: "rates",    label: "Exchange rates",icon: "swift",  group: "Homepage" },
+    { id: "testimonials", label: "Testimonials", icon: "team", group: "Homepage" },
+    { id: "faq",      label: "FAQ",           icon: "news",   group: "Homepage" },
+
+    { id: "pages",    label: "Page content",  icon: "news",   group: "Content" },
+    { id: "team",     label: "Team",          icon: "team",   group: "Content" },
+    { id: "posts",    label: "News & Press",  icon: "press",  group: "Content" },
+    { id: "atms",     label: "ATM locations", icon: "atm",    group: "Content" },
+    { id: "footer",   label: "Footer & social", icon: "globe", group: "Content" },
+
+    { id: "settings", label: "Settings",      icon: "shield", group: "System" },
   ];
+  const NAV_GROUPS = ["General", "Homepage", "Content", "System"];
 
   /* ============================ SERVICES ============================ */
   function AdmServices() {
@@ -7396,6 +7410,289 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     );
   }
 
+  /* ============================ REUSABLE SECTION EDITOR ============================ */
+  /* Generic editor for a single array stored under a PB_CONTENT key. renderItem
+     receives (item, updater, index) where updater(patch) merges a partial. */
+  function AdmSectionEditor({ title, intro, contentKey, blank, renderItem, itemTitle, addLabel, reorder }) {
+    const [items, setItems] = uS(() => clone((window.PB_CONTENT && window.PB_CONTENT[contentKey]) || []));
+    const [busy, setBusy] = uS(false);
+    const [saved, setSaved] = uS(false);
+    const upd = (i, patch) => setItems((prev) => prev.map((it, j) => (j === i ? Object.assign({}, it, patch) : it)));
+    const add = () => setItems((prev) => prev.concat([clone(blank)]));
+    const rm = (i) => { if (!confirm("Remove this item?")) return; setItems((prev) => prev.filter((_, j) => j !== i)); };
+    const move = (i, dir) => setItems((prev) => {
+      const j = i + dir; if (j < 0 || j >= prev.length) return prev;
+      const cp = prev.slice(); const x = cp[i]; cp[i] = cp[j]; cp[j] = x; return cp;
+    });
+    const save = async () => {
+      setBusy(true);
+      const { error } = await saveContentKey(contentKey, items);
+      setBusy(false);
+      if (error) alert("Failed: " + error.message);
+      else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
+    };
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar">
+          <h2 className="adm-h2">{title}</h2>
+          {blank && <button className="adm-btn adm-btn-primary" onClick={add}>+ {addLabel || "Add"}</button>}
+        </div>
+        {intro && <p className="adm-muted" style={{ marginBottom: 18 }}>{intro}</p>}
+        {items.map((it, i) => (
+          <div key={i} className="adm-card" style={{ marginBottom: 14 }}>
+            <div className="adm-card-head">
+              <strong>{itemTitle ? itemTitle(it, i) : "Item " + (i + 1)}</strong>
+              <div className="adm-row">
+                {reorder && <button className="adm-btn adm-sm" disabled={i === 0} onClick={() => move(i, -1)} title="Move up">↑</button>}
+                {reorder && <button className="adm-btn adm-sm" disabled={i === items.length - 1} onClick={() => move(i, 1)} title="Move down">↓</button>}
+                {blank && <button className="adm-btn adm-sm adm-danger" onClick={() => rm(i)}>Remove</button>}
+              </div>
+            </div>
+            {renderItem(it, (patch) => upd(i, patch), i)}
+          </div>
+        ))}
+        <AdmSaveBar onSave={save} busy={busy} saved={saved} />
+      </div>
+    );
+  }
+
+  /* Bilingual paired editor: content stored as { en:[...], so:[...] } where the
+     two arrays run in parallel. mergeRow(itemEn, itemSo) → one row for editing;
+     splitRow(row) → { en, so } written back into the parallel arrays. */
+  function AdmPairEditor({ title, intro, contentKey, blankEn, blankSo, splitRow, renderItem, itemTitle, addLabel }) {
+    const src = (window.PB_CONTENT && window.PB_CONTENT[contentKey]) || { en: [], so: [] };
+    const [rows, setRows] = uS(() => {
+      const en = src.en || [], so = src.so || [];
+      const n = Math.max(en.length, so.length);
+      const out = [];
+      for (let i = 0; i < n; i++) out.push({ en: clone(en[i] || {}), so: clone(so[i] || {}) });
+      return out;
+    });
+    const [busy, setBusy] = uS(false);
+    const [saved, setSaved] = uS(false);
+    const upd = (i, patch) => setRows((prev) => prev.map((r, j) => (j === i ? Object.assign({}, r, patch) : r)));
+    const add = () => setRows((prev) => prev.concat([{ en: clone(blankEn), so: clone(blankSo) }]));
+    const rm = (i) => { if (!confirm("Remove this item?")) return; setRows((prev) => prev.filter((_, j) => j !== i)); };
+    const move = (i, dir) => setRows((prev) => { const j = i + dir; if (j < 0 || j >= prev.length) return prev; const cp = prev.slice(); const x = cp[i]; cp[i] = cp[j]; cp[j] = x; return cp; });
+    const save = async () => {
+      setBusy(true);
+      const en = [], so = [];
+      rows.forEach((r) => { const s = splitRow(r); en.push(s.en); so.push(s.so); });
+      const { error } = await saveContentKey(contentKey, { en, so });
+      setBusy(false);
+      if (error) alert("Failed: " + error.message);
+      else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
+    };
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar">
+          <h2 className="adm-h2">{title}</h2>
+          <button className="adm-btn adm-btn-primary" onClick={add}>+ {addLabel || "Add"}</button>
+        </div>
+        {intro && <p className="adm-muted" style={{ marginBottom: 18 }}>{intro}</p>}
+        {rows.map((r, i) => (
+          <div key={i} className="adm-card" style={{ marginBottom: 14 }}>
+            <div className="adm-card-head">
+              <strong>{itemTitle ? itemTitle(r, i) : "Item " + (i + 1)}</strong>
+              <div className="adm-row">
+                <button className="adm-btn adm-sm" disabled={i === 0} onClick={() => move(i, -1)} title="Move up">↑</button>
+                <button className="adm-btn adm-sm" disabled={i === rows.length - 1} onClick={() => move(i, 1)} title="Move down">↓</button>
+                <button className="adm-btn adm-sm adm-danger" onClick={() => rm(i)}>Remove</button>
+              </div>
+            </div>
+            {renderItem(r, (patch) => upd(i, patch), i)}
+          </div>
+        ))}
+        <AdmSaveBar onSave={save} busy={busy} saved={saved} />
+      </div>
+    );
+  }
+
+  /* ---- Exchange-rate ticker ---- */
+  function AdmRates() {
+    return (
+      <AdmSectionEditor
+        title="Exchange rates (ticker)"
+        intro="The live currency ticker that scrolls across the homepage. “Up” shows a green ▲, off shows a red ▼."
+        contentKey="ticker"
+        addLabel="Add currency"
+        reorder
+        blank={{ code: "USD/SOS", buy: "0", sell: "0", up: true }}
+        itemTitle={(it) => it.code || "Currency"}
+        renderItem={(it, u) => (
+          <>
+            <AdmField label="Pair / code"><input value={it.code || ""} onChange={(e) => u({ code: e.target.value })} placeholder="USD/SOS" /></AdmField>
+            <div className="adm-color-row">
+              <AdmField label="Buy"><input value={it.buy || ""} onChange={(e) => u({ buy: e.target.value })} /></AdmField>
+              <AdmField label="Sell"><input value={it.sell || ""} onChange={(e) => u({ sell: e.target.value })} /></AdmField>
+            </div>
+            <label className="adm-check"><input type="checkbox" checked={!!it.up} onChange={(e) => u({ up: e.target.checked })} /> Trending up (green ▲)</label>
+          </>
+        )}
+      />
+    );
+  }
+
+  /* ---- Stats / numbers strip ---- */
+  function AdmStats() {
+    return (
+      <AdmSectionEditor
+        title="Key numbers"
+        intro="The headline statistics shown across the homepage (licence year, countries, POS, ATMs, agents…)."
+        contentKey="stats"
+        addLabel="Add stat"
+        reorder
+        blank={{ value: "", label: { en: "", so: "" } }}
+        itemTitle={(it) => it.value || "Stat"}
+        renderItem={(it, u) => (
+          <>
+            <AdmField label="Big value"><input value={it.value || ""} onChange={(e) => u({ value: e.target.value })} placeholder="e.g. 12,000+" /></AdmField>
+            <AdmBi label="Label" value={it.label || { en: "", so: "" }} onChange={(v) => u({ label: v })} />
+          </>
+        )}
+      />
+    );
+  }
+
+  /* ---- Core values ---- */
+  const ICON_HINT = "Icon names: personal, shield, check, joint, star, saving, salary, student, hajj, women, business, corporate, ngo, card, atm, pos, swift, wallet, agency, gateway, wearable";
+  function AdmValues() {
+    return (
+      <AdmPairEditor
+        title="Core values"
+        intro="The values / principles grid. Each value shares one icon and has bilingual title + body."
+        contentKey="values"
+        addLabel="Add value"
+        blankEn={{ icon: "star", title: "", body: "" }}
+        blankSo={{ icon: "star", title: "", body: "" }}
+        splitRow={(r) => ({
+          en: { icon: r.en.icon || "star", title: r.en.title || "", body: r.en.body || "" },
+          so: { icon: r.en.icon || "star", title: r.so.title || "", body: r.so.body || "" },
+        })}
+        itemTitle={(r) => r.en.title || "Value"}
+        renderItem={(r, u) => (
+          <>
+            <AdmField label="Icon"><input value={r.en.icon || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { icon: e.target.value }) })} placeholder="star" /></AdmField>
+            <p className="adm-muted" style={{ fontSize: 11, marginTop: -6, marginBottom: 10 }}>{ICON_HINT}</p>
+            <div className="adm-color-row">
+              <AdmField label="Title (English)"><input value={r.en.title || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { title: e.target.value }) })} /></AdmField>
+              <AdmField label="Title (Somali)"><input value={r.so.title || ""} onChange={(e) => u({ so: Object.assign({}, r.so, { title: e.target.value }) })} /></AdmField>
+            </div>
+            <AdmField label="Body (English)"><textarea rows={2} value={r.en.body || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { body: e.target.value }) })} /></AdmField>
+            <AdmField label="Body (Somali)"><textarea rows={2} value={r.so.body || ""} onChange={(e) => u({ so: Object.assign({}, r.so, { body: e.target.value }) })} /></AdmField>
+          </>
+        )}
+      />
+    );
+  }
+
+  /* ---- Accounts grid ---- */
+  function AdmAccounts() {
+    return (
+      <AdmSectionEditor
+        title="Accounts"
+        intro="The account types grid. Each card shows a name and a short “best for” line, in both languages."
+        contentKey="accounts"
+        addLabel="Add account"
+        reorder
+        blank={{ id: "", icon: "personal", name: { en: "", so: "" }, for: { en: "", so: "" } }}
+        itemTitle={(it) => (it.name && it.name.en) || "Account"}
+        renderItem={(it, u) => (
+          <>
+            <div className="adm-color-row">
+              <AdmField label="ID (unique)"><input value={it.id || ""} onChange={(e) => u({ id: e.target.value })} placeholder="personal" /></AdmField>
+              <AdmField label="Icon"><input value={it.icon || ""} onChange={(e) => u({ icon: e.target.value })} placeholder="personal" /></AdmField>
+            </div>
+            <AdmBi label="Name" value={it.name || { en: "", so: "" }} onChange={(v) => u({ name: v })} />
+            <AdmBi label="Best for" value={it.for || { en: "", so: "" }} onChange={(v) => u({ for: v })} />
+          </>
+        )}
+      />
+    );
+  }
+
+  /* ---- Cards / Mastercard products ---- */
+  function AdmCards() {
+    return (
+      <AdmSectionEditor
+        title="Cards"
+        intro="The Mastercard product cards. Limit and name are shared; description is bilingual; colour sets the card background."
+        contentKey="cards"
+        addLabel="Add card"
+        reorder
+        blank={{ id: "", icon: "card", name: "", limit: "", desc: { en: "", so: "" }, color: "#0b2f4f" }}
+        itemTitle={(it) => it.name || "Card"}
+        renderItem={(it, u) => (
+          <>
+            <div className="adm-color-row">
+              <AdmField label="Name"><input value={it.name || ""} onChange={(e) => u({ name: e.target.value })} placeholder="Classic Mastercard" /></AdmField>
+              <AdmField label="Limit"><input value={it.limit || ""} onChange={(e) => u({ limit: e.target.value })} placeholder="$2,000" /></AdmField>
+            </div>
+            <AdmBi label="Description" value={it.desc || { en: "", so: "" }} onChange={(v) => u({ desc: v })} textarea rows={2} />
+            <div className="adm-color-row">
+              <AdmField label="ID / icon"><input value={it.icon || ""} onChange={(e) => u({ icon: e.target.value })} placeholder="card / cardPlatinum / cardElite" /></AdmField>
+              <AdmField label="Card colour"><input type="color" value={it.color || "#0b2f4f"} onChange={(e) => u({ color: e.target.value })} style={{ width: 60, height: 36, padding: 2, cursor: "pointer" }} /></AdmField>
+            </div>
+          </>
+        )}
+      />
+    );
+  }
+
+  /* ---- Testimonials ---- */
+  function AdmTestimonials() {
+    return (
+      <AdmPairEditor
+        title="Testimonials"
+        intro="Customer quotes. The person’s name and role are shared; the quote is bilingual."
+        contentKey="testimonials"
+        addLabel="Add testimonial"
+        blankEn={{ quote: "", who: "", role: "" }}
+        blankSo={{ quote: "", who: "", role: "" }}
+        splitRow={(r) => ({
+          en: { quote: r.en.quote || "", who: r.en.who || "", role: r.en.role || "" },
+          so: { quote: r.so.quote || "", who: r.en.who || "", role: r.so.role || r.en.role || "" },
+        })}
+        itemTitle={(r) => r.en.who || "Testimonial"}
+        renderItem={(r, u) => (
+          <>
+            <div className="adm-color-row">
+              <AdmField label="Name"><input value={r.en.who || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { who: e.target.value }) })} placeholder="Khadra A." /></AdmField>
+              <AdmField label="Role (English)"><input value={r.en.role || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { role: e.target.value }) })} placeholder="Shop owner, Mogadishu" /></AdmField>
+            </div>
+            <AdmField label="Role (Somali)"><input value={r.so.role || ""} onChange={(e) => u({ so: Object.assign({}, r.so, { role: e.target.value }) })} placeholder="Iibiye, Muqdisho" /></AdmField>
+            <AdmField label="Quote (English)"><textarea rows={3} value={r.en.quote || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { quote: e.target.value }) })} /></AdmField>
+            <AdmField label="Quote (Somali)"><textarea rows={3} value={r.so.quote || ""} onChange={(e) => u({ so: Object.assign({}, r.so, { quote: e.target.value }) })} /></AdmField>
+          </>
+        )}
+      />
+    );
+  }
+
+  /* ---- FAQ ---- */
+  function AdmFaq() {
+    return (
+      <AdmPairEditor
+        title="FAQ"
+        intro="Frequently-asked questions shown near the foot of the homepage. Each row is bilingual (question + answer)."
+        contentKey="faq"
+        addLabel="Add question"
+        blankEn={{ q: "", a: "" }}
+        blankSo={{ q: "", a: "" }}
+        splitRow={(r) => ({ en: { q: r.en.q || "", a: r.en.a || "" }, so: { q: r.so.q || "", a: r.so.a || "" } })}
+        itemTitle={(r) => r.en.q || "Question"}
+        renderItem={(r, u) => (
+          <>
+            <AdmField label="Question (English)"><input value={r.en.q || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { q: e.target.value }) })} /></AdmField>
+            <AdmField label="Question (Somali)"><input value={r.so.q || ""} onChange={(e) => u({ so: Object.assign({}, r.so, { q: e.target.value }) })} /></AdmField>
+            <AdmField label="Answer (English)"><textarea rows={3} value={r.en.a || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { a: e.target.value }) })} /></AdmField>
+            <AdmField label="Answer (Somali)"><textarea rows={3} value={r.so.a || ""} onChange={(e) => u({ so: Object.assign({}, r.so, { a: e.target.value }) })} /></AdmField>
+          </>
+        )}
+      />
+    );
+  }
+
   function AdminApp() {
     const [show, setShow] = uS(location.hash === "#admin");
     const [session, setSession] = uS(null);
@@ -7425,6 +7722,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     const VIEWS = {
       overview: <AdmOverview go={go} />, branding: <AdmBranding />, logos: <AdmLogos />, hero: <AdmHero />,
       pages: <AdmPages />, services: <AdmServices />, team: <AdmTeam />, posts: <AdmPosts />, atms: <AdmAtms />, footer: <AdmFooter />, settings: <AdmSettings session={session} />,
+      accounts: <AdmAccounts />, cards: <AdmCards />, values: <AdmValues />, stats: <AdmStats />, rates: <AdmRates />, testimonials: <AdmTestimonials />, faq: <AdmFaq />,
     };
     return (
       <div className="adm-overlay">
@@ -7433,10 +7731,15 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
           <aside className={"adm-side" + (menuOpen ? " is-open" : "")}>
             <div className="adm-side-brand"><PBLogo variant="white" size={26} /></div>
             <nav className="adm-side-nav">
-              {NAV.map((n) => (
-                <button key={n.id} className={view === n.id ? "is-active" : ""} onClick={() => go(n.id)}>
-                  <i className="adm-nav-ico"><Icon name={n.icon} size={17} /></i> {n.label}
-                </button>
+              {NAV_GROUPS.map((g) => (
+                <div key={g} className="adm-nav-group">
+                  <div className="adm-nav-grouphead">{g}</div>
+                  {NAV.filter((n) => n.group === g).map((n) => (
+                    <button key={n.id} className={view === n.id ? "is-active" : ""} onClick={() => go(n.id)}>
+                      <i className="adm-nav-ico"><Icon name={n.icon} size={17} /></i> {n.label}
+                    </button>
+                  ))}
+                </div>
               ))}
             </nav>
             <div className="adm-side-foot">
