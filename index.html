@@ -63,8 +63,8 @@ img { max-width: 100%; display: block; }
 
 .pb-container { max-width: 1280px; margin: 0 auto; padding: 0 32px; }
 
-.pb-section { padding: calc(120px * var(--pb-density)) 0; }
-.pb-section-head { max-width: 760px; margin: 0 auto calc(64px * var(--pb-density)); text-align: center; }
+.pb-section { padding: calc(80px * var(--pb-density)) 0; }
+.pb-section-head { max-width: 760px; margin: 0 auto calc(44px * var(--pb-density)); text-align: center; }
 .pb-section-head h2 { font-size: clamp(32px, 4vw, 56px); line-height: 1.05; letter-spacing: -1px; margin: 12px 0 16px; font-weight: 600; text-wrap: balance; }
 .pb-section-head h2 em { font-style: italic; color: var(--pb-secondary-700); font-weight: 500; }
 .pb-section-head p { color: var(--pb-muted); font-size: 18px; line-height: 1.55; max-width: 600px; margin: 0 auto; }
@@ -517,6 +517,9 @@ img { max-width: 100%; display: block; }
 .pb-trust-grid { display: flex; justify-content: space-between; gap: 24px; flex-wrap: wrap; align-items: center; }
 .pb-trust-grid span { font-size: 14px; font-weight: 700; letter-spacing: 1px; color: var(--pb-muted); opacity: .65; transition: opacity .2s ease; }
 .pb-trust-grid span:hover { opacity: 1; color: var(--pb-primary); }
+.pb-trust-logo { display: inline-flex; align-items: center; justify-content: center; height: 44px; padding: 4px 8px; cursor: default; }
+.pb-trust-logo img { max-height: 40px; max-width: 120px; object-fit: contain; filter: grayscale(100%) opacity(0.55); transition: filter .3s ease, transform .25s ease; }
+.pb-trust-logo:hover img { filter: grayscale(0%) opacity(1); transform: scale(1.07); }
 
 /* ========================================================================== */
 /*  Branch locator                                                            */
@@ -936,15 +939,20 @@ img { max-width: 100%; display: block; }
 .adm-size-input { width: 64px; font-family: 'Lexend', sans-serif; font-size: 13px; padding: 6px 8px; border: 1px solid var(--pb-line); border-radius: 8px; text-align: center; }
 .adm-size-px { font-size: 12px; color: var(--pb-muted); }
 .adm-btn-block { width: 100%; justify-content: center; }
+.adm-up-preview { width: 90px; height: 90px; border-radius: 10px; overflow: hidden; border: 2px solid var(--pb-line); margin-bottom: 10px; background: #f4f6f8; }
+.adm-up-preview img { width: 100%; height: 100%; object-fit: cover; }
 .adm-login-wrap { padding: 36px 30px; }
 .adm-login { display: flex; flex-direction: column; gap: 14px; }
 .adm-login-brand { display: flex; align-items: center; gap: 10px; font-size: 16px; color: var(--pb-ink); }
 .adm-login-close { position: absolute; top: 14px; right: 14px; z-index: 2; }
 @media (max-width: 760px) {
-  .adm-shell-dash { height: 92vh; }
-  .adm-side { position: absolute; left: 0; top: 0; bottom: 0; z-index: 5; transform: translateX(-100%); transition: transform .2s ease; }
+  .adm-overlay { padding: 0; }
+  .adm-shell-dash { height: 100vh; max-width: 100%; border-radius: 0; }
+  .adm-side { position: absolute; left: 0; top: 0; bottom: 0; width: 250px; z-index: 5; transform: translateX(-100%); transition: transform .2s ease; box-shadow: 0 0 40px rgba(0,0,0,.4); }
   .adm-side.is-open { transform: translateX(0); }
+  .adm-side-backdrop { position: absolute; inset: 0; z-index: 4; background: rgba(8,24,40,.4); }
   .adm-burger { display: block; }
+  .adm-main-body { padding: 18px; }
   .adm-stats { grid-template-columns: 1fr; }
   .adm-bi, .adm-color-row { grid-template-columns: 1fr; }
 }
@@ -2067,7 +2075,13 @@ window.PB_SUPABASE = {
 
   window.PBData = {
     cfg,
-    isConfigured() { return !!client; },
+    isConfigured() {
+      if (!client && ready && window.supabase) {
+        try { client = window.supabase.createClient(cfg.url, cfg.anonKey); }
+        catch (e) { console.warn("Supabase init retry failed:", e.message); }
+      }
+      return !!client;
+    },
     get client() { return client; },
 
     async loadTeam() {
@@ -2120,6 +2134,13 @@ window.PB_SUPABASE = {
     async getSession() { const { data } = await client.auth.getSession(); return data.session; },
     onAuth(cb) { return client.auth.onAuthStateChange((_e, s) => cb(s)); },
     async changePassword(newPassword) { return client.auth.updateUser({ password: newPassword }); },
+    /* TOTP 2FA (Google Authenticator / Authy etc.) via Supabase MFA */
+    async mfaListFactors() { return client.auth.mfa.listFactors(); },
+    async mfaEnroll() { return client.auth.mfa.enroll({ factorType: "totp" }); },
+    async mfaChallenge(factorId) { return client.auth.mfa.challenge({ factorId: factorId }); },
+    async mfaVerify(factorId, challengeId, code) { return client.auth.mfa.verify({ factorId: factorId, challengeId: challengeId, code: code }); },
+    async mfaUnenroll(factorId) { return client.auth.mfa.unenroll({ factorId: factorId }); },
+    async mfaAAL() { return client.auth.mfa.getAuthenticatorAssuranceLevel(); },
 
     /* team CRUD */
     async listMembers() { return client.from("team_members").select("*").order("category", { ascending: true }).order("sort", { ascending: true }); },
@@ -3797,7 +3818,7 @@ const { useState: useStateS, useEffect: useEffectS, useRef: useRefS } = React;
 /* -------------------------------------------------------------------------- */
 /*  HERO SLIDER — 5 slides, autoplay, dot nav, arrow nav                      */
 /* -------------------------------------------------------------------------- */
-function HeroSlider({ lang, customHeadline }) {
+function HeroSlider({ lang, customHeadline, _tick }) {
   const slides = window.PB_CONTENT.heroSlides;
   const [i, setI] = useStateS(0);
   const [paused, setPaused] = useStateS(false);
@@ -4070,6 +4091,7 @@ function ArtAgency() {
 /* -------------------------------------------------------------------------- */
 function TrustStrip({ lang }) {
   const logos = window.PB_CONTENT.trustLogos;
+  const imgs = (window.PB_OVERRIDES && window.PB_OVERRIDES.trustLogoImages) || {};
   return (
     <section className="pb-trust">
       <div className="pb-container">
@@ -4077,11 +4099,14 @@ function TrustStrip({ lang }) {
           {lang === "en" ? "Licensed by the Central Bank of Somalia · partners we work with" : "Shati ka leh CBS · macaamiisheenna caalami"}
         </p>
         <div className="pb-trust-grid">
-          {logos.map((l) => <span key={l}>{l}</span>)}
+          {logos.map((l) =>
+            imgs[l]
+              ? <span key={l} className="pb-trust-logo"><img src={imgs[l]} alt={l} title={l} /></span>
+              : <span key={l}>{l}</span>
+          )}
         </div>
       </div>
     </section>);
-
 }
 
 /* -------------------------------------------------------------------------- */
@@ -6127,106 +6152,6 @@ window.DetailPanel = DetailPanel;
 const { useState: useStateA, useEffect: useEffectA } = React;
 
 /* -------------------------------------------------------------------------- */
-/*  TeamSection — live team from Supabase (renders only when data exists)     */
-/* -------------------------------------------------------------------------- */
-function TeamSection({ lang, onOpenDetail }) {
-  const liveTeam = window.PB_LIVE_TEAM || {};
-  const board = (liveTeam.board || []).filter(m => !m.placeholder);
-  const leadership = (liveTeam.leadership || []).filter(m => !m.placeholder);
-  const all = [...board, ...leadership].slice(0, 8);
-  if (!all.length) return null;
-  return (
-    <section className="pb-section" style={{ background: "var(--pb-cream)" }}>
-      <div className="pb-container">
-        <div className="pb-section-head">
-          <span className="pb-eyebrow"><Icon name="team" size={14} /> {lang === "en" ? "Our people" : "Dadkeenna"}</span>
-          <h2>{lang === "en" ? "Leadership" : "Hoggaanka"}</h2>
-          <p>{lang === "en" ? "The people who lead Premier Bank." : "Dadka hoggaamiya Premier Bank."}</p>
-        </div>
-        <div className="pb-member-grid">
-          {all.map((m) => {
-            const initials = (m.name || "?").split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join("").toUpperCase();
-            return (
-              <div key={m.id} className="pb-member">
-                <div className="pb-member-photo">
-                  {m.photo
-                    ? <img src={m.photo} alt={m.name} />
-                    : <span className="pb-member-initials">{initials}</span>}
-                </div>
-                <div className="pb-member-body">
-                  <h3>{m.name}</h3>
-                  <p className="pb-member-role">{m.title}</p>
-                  {m.bio && <p className="pb-member-bio">{m.bio}</p>}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-        <div style={{ textAlign: "center", marginTop: 32 }}>
-          <button className="pb-btn pb-btn-outline" onClick={() => onOpenDetail && onOpenDetail("board")}>
-            {lang === "en" ? "Meet the full board →" : "La kulmow guddiga oo dhan →"}
-          </button>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/* -------------------------------------------------------------------------- */
-/*  NewsSection — live posts from Supabase (renders only when posts exist)    */
-/* -------------------------------------------------------------------------- */
-function NewsSection({ lang, onOpenDetail }) {
-  const posts = (window.PB_LIVE_POSTS || []).filter(p => p.published !== false);
-  if (!posts.length) return null;
-  const recent = posts.slice(0, 3);
-  const fmtDate = (s) => { try { return new Date(s).toLocaleDateString(lang === "so" ? "so-SO" : "en-GB", { year: "numeric", month: "short", day: "numeric" }); } catch (e) { return ""; } };
-  return (
-    <section className="pb-section">
-      <div className="pb-container">
-        <div className="pb-section-head">
-          <span className="pb-eyebrow"><Icon name="news" size={14} /> {lang === "en" ? "Latest news" : "Wararkii ugu dambeeyay"}</span>
-          <h2>{lang === "en" ? "Newsroom" : "Warfaafinta"}</h2>
-          <p>{lang === "en" ? "Updates from Premier Bank." : "Wararkii Premier Bank."}</p>
-        </div>
-        <div className="pb-post-grid">
-          {recent.map(p => (
-            <article key={p.id} className="pb-post">
-              {p.cover_url && (
-                <div className="pb-post-cover">
-                  <img src={p.cover_url} alt={p.title}
-                    style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
-                </div>
-              )}
-              <div className="pb-post-body">
-                <div className="pb-post-meta">
-                  {p.category === "press" && <span className="pb-post-tag">{lang === "en" ? "Press" : "Saxaafad"}</span>}
-                  <time>{fmtDate(p.created_at)}</time>
-                </div>
-                <h3>{p.title}</h3>
-                {p.summary && <p className="pb-post-summary">{p.summary}</p>}
-                {p.body && (
-                  <details className="pb-post-more">
-                    <summary>{lang === "en" ? "Read more" : "Dheeraad ka akhri"}</summary>
-                    <div className="pb-post-content">
-                      {p.body.split("\n").filter(Boolean).map((para, i) => <p key={i}>{para}</p>)}
-                    </div>
-                  </details>
-                )}
-              </div>
-            </article>
-          ))}
-        </div>
-        {posts.length > 3 && (
-          <div style={{ textAlign: "center", marginTop: 32 }}>
-            <button className="pb-btn pb-btn-outline" onClick={() => onOpenDetail && onOpenDetail("news")}>
-              {lang === "en" ? `View all ${posts.length} stories →` : `Dhammaan ${posts.length} wararkood →`}
-            </button>
-          </div>
-        )}
-      </div>
-    </section>
-  );
-}
 
 const PB_DEFAULTS = /*EDITMODE-BEGIN*/{
   "primary": "#0b2f4f",
@@ -6286,9 +6211,6 @@ function App() {
         <CardsShowcase lang={lang} onOpenDetail={openDetail} />
         <WalletSection lang={lang} />
         <MoreServices lang={lang} onOpenDetail={openDetail} />
-        <TeamSection lang={lang} onOpenDetail={openDetail} _tick={_tick} />
-        <NewsSection lang={lang} onOpenDetail={openDetail} _tick={_tick} />
-        <BranchLocator lang={lang} _tick={_tick} />
         <Testimonials lang={lang} />
         <SecurityBand lang={lang} />
         <TrustStrip lang={lang} />
@@ -6360,62 +6282,69 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     return window.PBData.saveContent("details", Object.assign({}, cur, { [pageKey]: partial }));
   }
 
-  /* ---- drag & drop image uploader ---- */
+  /* ---- image uploader (button only) ---- */
   function AdmDrop({ value, onUpload, folder, label }) {
     const [busy, setBusy] = uS(false);
-    const [over, setOver] = uS(false);
     const [err, setErr] = uS("");
     const [ok, setOk] = uS(false);
-    // localPreview lets the drop zone show the image immediately after upload,
-    // independent of when the parent state propagates the new value prop.
-    const [localPreview, setLocalPreview] = uS("");
+    const [preview, setPreview] = uS("");
     const inputRef = uR(null);
-    const displaySrc = localPreview || value || "";
+    const displaySrc = preview || value || "";
+
     const handle = async (file) => {
-      setErr(""); setOk(false);
       if (!file) return;
-      if (!window.PBData.isConfigured()) { setErr("Supabase is not connected — open Settings first."); return; }
-      if (!/^image\//.test(file.type)) { setErr("Please choose an image file (PNG, JPG, WEBP, SVG)."); return; }
-      if (file.size > 5 * 1024 * 1024) { setErr("Image is larger than 5 MB — please use a smaller file."); return; }
+      setErr(""); setOk(false);
+      if (!window.PBData.isConfigured()) { setErr("Supabase not connected - check Settings."); return; }
+      if (!/^image\//i.test(file.type) && !/\.(png|jpe?g|webp|svg|gif)$/i.test(file.name)) {
+        setErr("Please choose an image file (PNG, JPG, WEBP, SVG)."); return;
+      }
+      if (file.size > 8 * 1024 * 1024) { setErr("Image must be under 8 MB."); return; }
+      const blob = URL.createObjectURL(file);
+      setPreview(blob);
       setBusy(true);
       try {
-        // Show a local blob preview immediately while uploading
-        const blobUrl = URL.createObjectURL(file);
-        setLocalPreview(blobUrl);
-        const url = await window.PBData.uploadImage(file, folder);
-        // Verify the public URL loads
-        await new Promise((res, rej) => { const im = new Image(); im.onload = res; im.onerror = () => rej(new Error("Uploaded, but the image URL is not publicly viewable. Make the 'media' bucket public.")); im.src = url; });
-        URL.revokeObjectURL(blobUrl);
-        setLocalPreview(url);
-        onUpload(url); setOk(true); setTimeout(() => setOk(false), 3000);
+        const url = await window.PBData.uploadImage(file, folder || "misc");
+        URL.revokeObjectURL(blob);
+        setPreview(url);
+        onUpload(url);
+        setOk(true);
+        setTimeout(() => setOk(false), 4000);
       } catch (e) {
-        setLocalPreview("");
-        setErr("Upload failed: " + (e.message || e));
+        URL.revokeObjectURL(blob);
+        setPreview("");
+        setErr("Upload failed: " + (e.message || String(e)));
       }
       setBusy(false);
     };
-    // Sync localPreview when value is cleared externally
-    uE(() => { if (!value) setLocalPreview(""); }, [value]);
+
+    uE(() => { if (!value) setPreview(""); }, [value]);
+
+    const open = () => { if (!busy && inputRef.current) { inputRef.current.value = ""; inputRef.current.click(); } };
+
     return (
       <div className="adm-up">
-        <div className={"adm-drop" + (over ? " is-over" : "") + (busy ? " is-busy" : "")}
-          onDragOver={(e) => { e.preventDefault(); setOver(true); }}
-          onDragLeave={() => setOver(false)}
-          onDrop={(e) => { e.preventDefault(); setOver(false); handle(e.dataTransfer.files[0]); }}
-          onClick={() => !busy && inputRef.current && inputRef.current.click()}>
-          {displaySrc
-            ? <img src={displaySrc} alt="" className="adm-drop-img"
-                onError={(e) => { e.target.style.display = "none"; }} />
-            : <div className="adm-drop-ph"><Icon name="download" size={22} /></div>}
-          <div className="adm-drop-hint">
-            {busy ? "⏳ Uploading…" : (displaySrc ? "Drop a new image or click to replace" : (label || "Drag an image here, or click to browse"))}
+        {displaySrc && (
+          <div className="adm-up-preview">
+            <img src={displaySrc} alt="preview" onError={(e) => { e.target.style.opacity = 0; }} />
           </div>
-          {!busy && <div className="adm-drop-sub">PNG · JPG · WEBP · SVG — up to 5 MB</div>}
-          <input ref={inputRef} type="file" accept="image/*" hidden onChange={(e) => handle(e.target.files[0])} />
+        )}
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <button type="button" className="adm-btn adm-btn-primary" onClick={open} disabled={busy}
+            style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <Icon name="download" size={15} />
+            {busy ? "Uploading..." : (displaySrc ? "Replace photo" : "Choose photo")}
+          </button>
+          {displaySrc && !busy && (
+            <button type="button" className="adm-btn adm-sm adm-danger" onClick={() => { onUpload(""); setPreview(""); setErr(""); setOk(false); }}>
+              Remove
+            </button>
+          )}
+          <span style={{ fontSize: 12, color: "var(--pb-muted)" }}>PNG · JPG · WEBP · SVG · max 8 MB</span>
         </div>
-        {err && <div className="adm-up-err">⚠️ {err}</div>}
-        {ok && <div className="adm-up-ok">✓ Uploaded — image saved to Supabase storage</div>}
-        {displaySrc && !busy && <button type="button" className="adm-btn adm-sm adm-danger adm-up-rm" onClick={(e) => { e.stopPropagation(); onUpload(""); setLocalPreview(""); setOk(false); setErr(""); }}>Remove image</button>}
+        <input ref={inputRef} type="file" accept="image/*" hidden
+          onChange={(e) => { const f = e.target.files && e.target.files[0]; if (f) handle(f); }} />
+        {err && <div className="adm-up-err">&#9888; {err}</div>}
+        {ok  && <div className="adm-up-ok">&#10003; Saved</div>}
       </div>
     );
   }
@@ -6710,15 +6639,15 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     const [loading, setLoading] = uS(true);
     const [syncing, setSyncing] = uS(false);
 
-    const flat = (v) => (v && typeof v === “object” ? (v.en || v.so || “”) : (v || “”));
+    const flat = (v) => (v && typeof v === "object" ? (v.en || v.so || "") : (v || ""));
 
     // All seed members from PB_DETAILS across the three sections
     const getSeed = () => {
       const D = window.PB_DETAILS || {};
       const out = [];
-      [[“board”,”board”],[“leadership”,”leadership”],[“shariah”,”shariah”]].forEach(([key, cat]) => {
+      [["board","board"],["leadership","leadership"],["shariah","shariah"]].forEach(([key, cat]) => {
         const list = ((D[key] && D[key].members) || []).filter(m => !m.placeholder && flat(m.name).trim());
-        list.forEach((m, i) => out.push({ category: cat, name: flat(m.name).trim(), title: flat(m.title), bio: flat(m.bio) || “”, photo_url: “”, sort: i }));
+        list.forEach((m, i) => out.push({ category: cat, name: flat(m.name).trim(), title: flat(m.title), bio: flat(m.bio) || "", photo_url: "", sort: i }));
       });
       return out;
     };
@@ -6730,13 +6659,13 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       const seed = getSeed();
       if (!seed.length) return current;
       const byName = {};
-      (current || []).forEach(m => { byName[(m.name || “”).trim().toLowerCase()] = m; });
+      (current || []).forEach(m => { byName[(m.name || "").trim().toLowerCase()] = m; });
       const toSave = [];
       seed.forEach((s, i) => {
         const key = s.name.toLowerCase();
         const existing = byName[key];
         if (!existing) {
-          toSave.push({ category: s.category, name: s.name, title: s.title, bio: s.bio, photo_url: “”, sort: s.sort });
+          toSave.push({ category: s.category, name: s.name, title: s.title, bio: s.bio, photo_url: "", sort: s.sort });
         } else if (existing.category !== s.category) {
           // Fix wrong category (e.g. Chairman filed under Senior Management)
           toSave.push(Object.assign({}, existing, { category: s.category }));
@@ -6758,7 +6687,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     const load = async () => {
       setLoading(true);
       const { data, error } = await window.PBData.listMembers();
-      if (error) { alert(“Load failed: “ + error.message); setLoading(false); return; }
+      if (error) { alert("Load failed: " + error.message); setLoading(false); return; }
       const synced = await syncSeed(data || []);
       setItems(synced);
       setLoading(false);
@@ -6766,63 +6695,63 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
     uE(() => { load(); }, []);
 
-    const newMember = () => setEditing({ category: “board”, name: “”, title: “”, bio: “”, photo_url: “”, sort: items.length });
+    const newMember = () => setEditing({ category: "board", name: "", title: "", bio: "", photo_url: "", sort: items.length });
     const save = async () => {
       const m = Object.assign({}, editing);
       if (m.id == null) delete m.id;
-      if (!m.name) { alert(“Name is required.”); return; }
+      if (!m.name) { alert("Name is required."); return; }
       const { error } = await window.PBData.saveMember(m);
-      if (error) { alert(“Save failed: “ + error.message); return; }
+      if (error) { alert("Save failed: " + error.message); return; }
       setEditing(null); await load(); window.PBData.loadTeam();
     };
     const del = async (id) => {
-      if (!confirm(“Delete this member?”)) return;
+      if (!confirm("Delete this member?")) return;
       const { error } = await window.PBData.deleteMember(id);
-      if (error) { alert(“Delete failed: “ + error.message); return; }
+      if (error) { alert("Delete failed: " + error.message); return; }
       await load(); window.PBData.loadTeam();
     };
 
     if (editing) {
       return (
-        <div className=”adm-pane”>
-          <h2 className=”adm-h2”>{editing.id ? “Edit member” : “New member”}</h2>
-          <AdmField label=”Section”>
+        <div className="adm-pane">
+          <h2 className="adm-h2">{editing.id ? "Edit member" : "New member"}</h2>
+          <AdmField label="Section">
             <select value={editing.category} onChange={(e) => setEditing(Object.assign({}, editing, { category: e.target.value }))}>
               {ADM_CATS.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
             </select>
           </AdmField>
-          <AdmField label=”Photo”><AdmDrop value={editing.photo_url} folder=”team” onUpload={(url) => setEditing(Object.assign({}, editing, { photo_url: url }))} /></AdmField>
-          <AdmField label=”Full name”><input value={editing.name} onChange={(e) => setEditing(Object.assign({}, editing, { name: e.target.value }))} placeholder=”e.g. Jibril Hassan Mohamed” /></AdmField>
-          <AdmField label=”Title / role”><input value={editing.title || “”} onChange={(e) => setEditing(Object.assign({}, editing, { title: e.target.value }))} placeholder=”e.g. Chairman” /></AdmField>
-          <AdmField label=”Bio”><textarea rows={5} value={editing.bio || “”} onChange={(e) => setEditing(Object.assign({}, editing, { bio: e.target.value }))} /></AdmField>
-          <AdmField label=”Sort order”><input type=”number” value={editing.sort == null ? 0 : editing.sort} onChange={(e) => setEditing(Object.assign({}, editing, { sort: parseInt(e.target.value || “0”, 10) }))} /></AdmField>
-          <div className=”adm-row”><button className=”adm-btn adm-btn-primary” onClick={save}>Save</button><button className=”adm-btn” onClick={() => setEditing(null)}>Cancel</button></div>
+          <AdmField label="Photo"><AdmDrop value={editing.photo_url} folder="team" onUpload={(url) => setEditing(Object.assign({}, editing, { photo_url: url }))} /></AdmField>
+          <AdmField label="Full name"><input value={editing.name} onChange={(e) => setEditing(Object.assign({}, editing, { name: e.target.value }))} placeholder="e.g. Jibril Hassan Mohamed" /></AdmField>
+          <AdmField label="Title / role"><input value={editing.title || ""} onChange={(e) => setEditing(Object.assign({}, editing, { title: e.target.value }))} placeholder="e.g. Chairman" /></AdmField>
+          <AdmField label="Bio"><textarea rows={5} value={editing.bio || ""} onChange={(e) => setEditing(Object.assign({}, editing, { bio: e.target.value }))} /></AdmField>
+          <AdmField label="Sort order"><input type="number" value={editing.sort == null ? 0 : editing.sort} onChange={(e) => setEditing(Object.assign({}, editing, { sort: parseInt(e.target.value || "0", 10) }))} /></AdmField>
+          <div className="adm-row"><button className="adm-btn adm-btn-primary" onClick={save}>Save</button><button className="adm-btn" onClick={() => setEditing(null)}>Cancel</button></div>
         </div>
       );
     }
 
     return (
-      <div className=”adm-pane”>
-        <div className=”adm-toolbar”>
-          <h2 className=”adm-h2”>Team members</h2>
-          <button className=”adm-btn adm-btn-primary” onClick={newMember}>+ Add member</button>
+      <div className="adm-pane">
+        <div className="adm-toolbar">
+          <h2 className="adm-h2">Team members</h2>
+          <button className="adm-btn adm-btn-primary" onClick={newMember}>+ Add member</button>
         </div>
         {(loading || syncing) ? (
-          <p className=”adm-muted”>{syncing ? “⏳ Syncing website data…” : “Loading…”}</p>
+          <p className="adm-muted">{syncing ? "⏳ Syncing website data…" : "Loading…"}</p>
         ) : (
           items.length === 0
-            ? <p className=”adm-muted”>No members yet. Click “+ Add member”.</p>
+            ? <p className="adm-muted">No members yet. Click "+ Add member".</p>
             : ADM_CATS.map((c) => {
                 const group = items.filter((m) => m.category === c.value);
                 if (!group.length) return null;
                 return (
-                  <div key={c.value} className=”adm-group”>
-                    <h4>{c.label} <span style={{ fontWeight: 400, color: “var(--pb-muted)”, fontSize: 13 }}>({group.length})</span></h4>
+                  <div key={c.value} className="adm-group">
+                    <h4>{c.label} <span style={{ fontWeight: 400, color: "var(--pb-muted)", fontSize: 13 }}>({group.length})</span></h4>
                     {group.map((m) => (
-                      <div key={m.id} className=”adm-item”>
-                        <div className=”adm-item-av”>{m.photo_url ? <img src={m.photo_url} alt=”” /> : <span>{(m.name || “?”).slice(0, 1)}</span>}</div>
-                        <div className=”adm-item-main”><strong>{m.name}</strong><span>{m.title}</span></div>
-                        <div className=”adm-row”><button className=”adm-btn adm-sm” onClick={() => setEditing(m)}>Edit</button><button className=”adm-btn adm-sm adm-danger” onClick={() => del(m.id)}>Delete</button></div>
+                      <div key={m.id} className="adm-item">
+                        <div className="adm-item-av">{m.photo_url ? <img src={m.photo_url} alt="" /> : <span>{(m.name || "?").slice(0, 1)}</span>}</div>
+                        <div className="adm-item-main"><strong>{m.name}</strong><span>{m.title}</span></div>
+                        <div className="adm-row"><button className="adm-btn adm-sm" onClick={() => setEditing(m)}>Edit</button><button className="adm-btn adm-sm adm-danger" onClick={() => del(m.id)}>Delete</button></div>
                       </div>
                     ))}
                   </div>
@@ -6996,9 +6925,65 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
         <Row k="white" sk="footerSize" title="Footer / dark-background logo (white logo)" hint="Shown in the footer and the login modal." dark />
         <Row k="mark"  sk="markSize"   title="Logo mark only (icon, no text)" hint="Used in compact places like cards and the phone mockup." />
         <div className="adm-savebar">
-          <button className="adm-btn adm-btn-primary" onClick={save} disabled={busy || !dirty}>{busy ? "Publishing…" : (dirty ? "Publish logo" : "Nothing to publish")}</button>
+          <button className="adm-btn adm-btn-primary" onClick={save} disabled={busy || !dirty}>{busy ? "Publishing..." : (dirty ? "Publish logo" : "Nothing to publish")}</button>
           {saved && <span className="adm-saved">✓ Published & live</span>}
           {dirty && !saved && <span className="adm-muted">You have unpublished changes.</span>}
+        </div>
+
+        {/* ---- Partner / trust logos ---- */}
+        <AdmPartnerLogos />
+      </div>
+    );
+  }
+
+  function AdmPartnerLogos() {
+    const LABELS = window.PB_CONTENT.trustLogos || [];
+    const saved0 = (window.PBData.getOverride("trustLogoImages")) || {};
+    const [imgs, setImgs] = uS(Object.assign({}, saved0));
+    const [saving, setSaving] = uS(false);
+    const [ok, setOk] = uS(false);
+
+    const setImg = (label, url) => setImgs((prev) => Object.assign({}, prev, { [label]: url }));
+
+    const save = async () => {
+      setSaving(true);
+      const { error } = await window.PBData.saveContent("trustLogoImages", imgs);
+      setSaving(false);
+      if (error) { alert("Save failed: " + error.message); return; }
+      setOk(true); setTimeout(() => setOk(false), 3000);
+    };
+
+    return (
+      <div className="adm-card" style={{ marginTop: 28 }}>
+        <div className="adm-card-head">
+          <strong>Partner / trust-strip logos</strong>
+          <span className="adm-muted" style={{ fontSize: 12 }}>Shown at the bottom of the homepage. Black &amp; white by default, colour on hover.</span>
+        </div>
+        <p className="adm-muted" style={{ margin: "0 0 16px" }}>Upload a colour PNG for each partner. Leave blank to show the text label.</p>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 16 }}>
+          {LABELS.map((label) => (
+            <div key={label} style={{ border: "1px solid var(--pb-line)", borderRadius: 10, padding: 12 }}>
+              <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8 }}>{label}</div>
+              {imgs[label] && (
+                <div style={{ marginBottom: 8, background: "#f4f6f8", borderRadius: 6, padding: 8, textAlign: "center" }}>
+                  <img src={imgs[label]} alt={label} style={{ maxHeight: 36, maxWidth: 120, objectFit: "contain", filter: "grayscale(100%)", transition: "filter .3s" }}
+                    onMouseEnter={(e) => e.target.style.filter = "grayscale(0%)"}
+                    onMouseLeave={(e) => e.target.style.filter = "grayscale(100%)"} />
+                </div>
+              )}
+              <AdmDrop value={imgs[label] || ""} folder="logos" onUpload={(url) => setImg(label, url)} />
+              {imgs[label] && (
+                <button className="adm-btn adm-sm adm-danger" style={{ marginTop: 6, width: "100%" }}
+                  onClick={() => setImg(label, "")}>Remove</button>
+              )}
+            </div>
+          ))}
+        </div>
+        <div className="adm-savebar" style={{ marginTop: 20 }}>
+          <button className="adm-btn adm-btn-primary" onClick={save} disabled={saving}>
+            {saving ? "Saving..." : "Save partner logos"}
+          </button>
+          {ok && <span className="adm-saved">✓ Saved & live</span>}
         </div>
       </div>
     );
@@ -7187,6 +7172,12 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
           </div>
         )}
 
+        {/* 2FA — email OTP */}
+        <div className="adm-set-card">
+          <h3 className="adm-set-h">Two-factor authentication</h3>
+          <p className="adm-muted" style={{ marginTop: 0 }}>Email codes are enabled. After entering your password, a fresh 6-digit code is automatically emailed to <strong>{(session && session.user && session.user.email) || "your email"}</strong> — you enter it to finish signing in. No setup needed.</p>
+        </div>
+
         {/* Connection */}
         <div className="adm-set-card">
           <h3 className="adm-set-h">Backend connection</h3>
@@ -7201,17 +7192,150 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
   /* ---- login ---- */
   function AdmLogin() {
-    const [email, setEmail] = uS(""); const [pw, setPw] = uS(""); const [busy, setBusy] = uS(false);
-    const submit = async (e) => { e.preventDefault(); setBusy(true); const { error } = await window.PBData.signIn(email, pw); setBusy(false); if (error) alert("Login failed: " + error.message); };
+    const [email, setEmail] = uS("");
+    const [pw, setPw] = uS("");
+    const [showPw, setShowPw] = uS(false);
+    const [busy, setBusy] = uS(false);
+    const [loginErr, setLoginErr] = uS("");
+    const submit = async (e) => {
+      e.preventDefault();
+      setBusy(true); setLoginErr("");
+      const { error } = await window.PBData.signIn(email, pw);
+      setBusy(false);
+      if (error) setLoginErr("Login failed: " + error.message);
+    };
     return (
       <div className="adm-login-wrap">
-        <form className="adm-login" onSubmit={submit}>
-          <div className="adm-login-brand"><PBLogo variant="color" size={30} /></div>
-          <h3>Sign in to your dashboard</h3>
+        <form className="adm-login" onSubmit={submit} style={{ background: "#fff", borderRadius: 16, padding: 40, maxWidth: 400, width: "100%", boxShadow: "0 8px 32px rgba(0,0,0,0.18)" }}>
+          <div className="adm-login-brand" style={{ justifyContent: "center", marginBottom: 12 }}><PBLogo variant="color" size={36} /></div>
+          <h3 style={{ fontSize: 22, fontWeight: 700, textAlign: "center", margin: "0 0 4px" }}>Welcome back</h3>
+          <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 13, marginBottom: 24 }}>Sign in to your admin dashboard</p>
           <AdmField label="Email"><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoFocus /></AdmField>
-          <AdmField label="Password"><input type="password" value={pw} onChange={(e) => setPw(e.target.value)} /></AdmField>
-          <button className="adm-btn adm-btn-primary adm-btn-block" disabled={busy}>{busy ? "Signing in…" : "Sign in"}</button>
+          <AdmField label="Password">
+            <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+              <input type={showPw ? "text" : "password"} value={pw} onChange={(e) => setPw(e.target.value)} style={{ flex: 1, paddingRight: 36 }} />
+              <button type="button" onClick={() => setShowPw(!showPw)}
+                style={{ position: "absolute", right: 8, background: "none", border: "none", cursor: "pointer", fontSize: 16, color: "var(--pb-muted)", padding: 0 }}>
+                {showPw ? "🙈" : "👁"}
+              </button>
+            </div>
+          </AdmField>
+          <button className="adm-btn adm-btn-primary adm-btn-block" disabled={busy} style={{ marginTop: 8 }}>{busy ? "Signing in..." : "Sign in"}</button>
+          {loginErr && <div className="adm-up-err" style={{ marginTop: 10 }}>&#9888; {loginErr}</div>}
         </form>
+      </div>
+    );
+  }
+
+  /* ---- 2FA PIN ---- */
+  function AdmPin({ email, onVerified, onClose }) {
+    const [mode, setMode] = uS("loading");   // loading | enroll | challenge | error
+    const [code, setCode] = uS("");
+    const [err, setErr] = uS("");
+    const [verifying, setVerifying] = uS(false);
+    const [factorId, setFactorId] = uS("");
+    const [challengeId, setChallengeId] = uS("");
+    const [qr, setQr] = uS("");               // SVG data-URL for enrollment
+    const [secret, setSecret] = uS("");       // manual-entry secret
+
+    // Decide whether the admin already has Google Authenticator set up.
+    const init = async () => {
+      setErr("");
+      const { data, error } = await window.PBData.mfaListFactors();
+      if (error) { setErr(error.message); setMode("error"); return; }
+      const totp = (data && data.totp) || [];
+      const verified = totp.find((f) => f.status === "verified");
+      if (verified) {
+        // Returning user — challenge the existing factor.
+        setFactorId(verified.id);
+        const { data: ch, error: cErr } = await window.PBData.mfaChallenge(verified.id);
+        if (cErr) { setErr(cErr.message); setMode("error"); return; }
+        setChallengeId(ch.id);
+        setMode("challenge");
+      } else {
+        // First time — clean up any half-finished factors, then enroll.
+        for (const f of totp) { if (f.status === "unverified") { await window.PBData.mfaUnenroll(f.id); } }
+        const { data: en, error: eErr } = await window.PBData.mfaEnroll();
+        if (eErr) { setErr(eErr.message); setMode("error"); return; }
+        setFactorId(en.id);
+        setQr(en.totp.qr_code);
+        setSecret(en.totp.secret);
+        const { data: ch, error: cErr } = await window.PBData.mfaChallenge(en.id);
+        if (cErr) { setErr(cErr.message); setMode("error"); return; }
+        setChallengeId(ch.id);
+        setMode("enroll");
+      }
+    };
+    uE(() => { init(); }, []);
+
+    const verify = async () => {
+      if (code.length !== 6) { setErr("Enter the 6-digit code from your authenticator app."); return; }
+      setErr(""); setVerifying(true);
+      let chId = challengeId;
+      // Challenges are short-lived; for a returning user request a fresh one each attempt.
+      if (mode === "challenge") {
+        const { data: ch, error: cErr } = await window.PBData.mfaChallenge(factorId);
+        if (cErr) { setVerifying(false); setErr(cErr.message); return; }
+        chId = ch.id; setChallengeId(ch.id);
+      }
+      const { error } = await window.PBData.mfaVerify(factorId, chId, code);
+      setVerifying(false);
+      if (error) { setErr("Incorrect or expired code — try again."); setCode(""); return; }
+      onVerified();
+    };
+
+    return (
+      <div className="adm-overlay">
+        <div className="adm-shell adm-shell-login">
+          {onClose && <button className="adm-login-close adm-btn adm-sm" onClick={onClose}>Close ✕</button>}
+          <div className="adm-login-wrap">
+            <div className="adm-login-brand" style={{ justifyContent: "center", marginBottom: 8 }}><PBLogo variant="color" size={36} /></div>
+            <h3 style={{ textAlign: "center", marginBottom: 4 }}>Two-factor authentication</h3>
+
+            {mode === "loading" && (
+              <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 14, marginTop: 16 }}>Checking your security settings…</p>
+            )}
+
+            {mode === "error" && (
+              <div className="adm-up-err" style={{ marginTop: 16 }}>⚠️ {err || "Something went wrong."}</div>
+            )}
+
+            {mode === "enroll" && (
+              <>
+                <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 14, marginBottom: 14 }}>
+                  Set up <strong>Google Authenticator</strong>. Scan this QR code in the app, then enter the 6-digit code it shows.
+                </p>
+                {qr && <div style={{ textAlign: "center", marginBottom: 12 }}><img src={qr} alt="Authenticator QR code" style={{ width: 188, height: 188 }} /></div>}
+                {secret && (
+                  <p style={{ textAlign: "center", fontSize: 12, color: "var(--pb-muted)", marginBottom: 16, wordBreak: "break-all" }}>
+                    Can't scan? Enter this key manually:<br /><code style={{ fontSize: 13, letterSpacing: 1 }}>{secret}</code>
+                  </p>
+                )}
+              </>
+            )}
+
+            {mode === "challenge" && (
+              <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 14, marginBottom: 20 }}>
+                Open Google Authenticator and enter the current 6-digit code.
+              </p>
+            )}
+
+            {(mode === "enroll" || mode === "challenge") && (
+              <>
+                <AdmField label="Authenticator code">
+                  <input type="text" inputMode="numeric" maxLength={6} value={code}
+                    onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
+                    onKeyDown={(e) => e.key === "Enter" && verify()} autoFocus
+                    placeholder="------" style={{ letterSpacing: 10, fontSize: 22, textAlign: "center" }} />
+                </AdmField>
+                <button className="adm-btn adm-btn-primary adm-btn-block" onClick={verify} disabled={verifying} style={{ marginTop: 8 }}>
+                  {verifying ? "Verifying…" : (mode === "enroll" ? "Activate & sign in" : "Verify & sign in")}
+                </button>
+                {err && <div className="adm-up-err" style={{ marginTop: 10 }}>⚠️ {err}</div>}
+              </>
+            )}
+          </div>
+        </div>
       </div>
     );
   }
@@ -7223,6 +7347,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     { id: "logos",    label: "Logo",          icon: "shariah" },
     { id: "hero",     label: "Hero slides",   icon: "gallery" },
     { id: "pages",    label: "Page content",  icon: "news" },
+    { id: "services", label: "Services",      icon: "pos" },
     { id: "team",     label: "Team",          icon: "team" },
     { id: "posts",    label: "News & Press",  icon: "press" },
     { id: "atms",     label: "ATM locations", icon: "atm" },
@@ -7230,9 +7355,51 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     { id: "settings", label: "Settings",      icon: "shield" },
   ];
 
+  /* ============================ SERVICES ============================ */
+  function AdmServices() {
+    const [tiles, setTiles] = uS(() => clone(window.PB_CONTENT && window.PB_CONTENT.tiles || []));
+    const [busy, setBusy] = uS(false);
+    const [saved, setSaved] = uS(false);
+    const upd = (i, patch) => setTiles(tiles.map((t, j) => j === i ? Object.assign({}, t, patch) : t));
+    const updLabel = (i, lang, val) => upd(i, { label: Object.assign({}, tiles[i].label, { [lang]: val }) });
+    const updBlurb = (i, lang, val) => upd(i, { blurb: Object.assign({}, tiles[i].blurb, { [lang]: val }) });
+    const save = async () => {
+      setBusy(true);
+      const { error } = await saveContentKey("tiles", tiles);
+      setBusy(false);
+      if (error) alert("Failed: " + error.message);
+      else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
+    };
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar">
+          <h2 className="adm-h2">Services tiles</h2>
+        </div>
+        <p className="adm-muted" style={{ marginBottom: 20 }}>Edit the service cards shown on the homepage.</p>
+        {tiles.map((t, i) => (
+          <div key={t.id} className="adm-card" style={{ marginBottom: 14 }}>
+            <div className="adm-card-head">
+              <strong style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ width: 18, height: 18, borderRadius: 4, background: t.bg, display: "inline-block", border: "1px solid #ddd" }} />
+                {t.id}
+              </strong>
+            </div>
+            <AdmField label="Label (English)"><input value={(t.label && t.label.en) || ""} onChange={(e) => updLabel(i, "en", e.target.value)} /></AdmField>
+            <AdmField label="Label (Somali)"><input value={(t.label && t.label.so) || ""} onChange={(e) => updLabel(i, "so", e.target.value)} /></AdmField>
+            <AdmField label="Blurb (English)"><input value={(t.blurb && t.blurb.en) || ""} onChange={(e) => updBlurb(i, "en", e.target.value)} /></AdmField>
+            <AdmField label="Blurb (Somali)"><input value={(t.blurb && t.blurb.so) || ""} onChange={(e) => updBlurb(i, "so", e.target.value)} /></AdmField>
+            <AdmField label="Background colour"><input type="color" value={t.bg || "#0b2f4f"} onChange={(e) => upd(i, { bg: e.target.value })} style={{ width: 60, height: 36, padding: 2, cursor: "pointer" }} /></AdmField>
+          </div>
+        ))}
+        <AdmSaveBar onSave={save} busy={busy} saved={saved} />
+      </div>
+    );
+  }
+
   function AdminApp() {
     const [show, setShow] = uS(location.hash === "#admin");
     const [session, setSession] = uS(null);
+    const [pinVerified, setPinVerified] = uS(false);
     const [view, setView] = uS("overview");
     const [menuOpen, setMenuOpen] = uS(false);
     uE(() => {
@@ -7253,14 +7420,16 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
     if (!configured) return (<div className="adm-overlay"><div className="adm-shell"><header className="adm-head"><div className="adm-brand"><LogoMark size={26} variant="color" /> <span>Premier Admin</span></div><button className="adm-btn adm-sm" onClick={close}>Close ✕</button></header><div className="adm-body"><AdmSettings session={null} /></div></div></div>);
     if (!session) return (<div className="adm-overlay"><div className="adm-shell adm-shell-login"><button className="adm-login-close adm-btn adm-sm" onClick={close}>Close ✕</button><AdmLogin /></div></div>);
+    if (!pinVerified) return <AdmPin email={(session.user && session.user.email) || ""} onVerified={() => setPinVerified(true)} onClose={close} />;
 
     const VIEWS = {
       overview: <AdmOverview go={go} />, branding: <AdmBranding />, logos: <AdmLogos />, hero: <AdmHero />,
-      pages: <AdmPages />, team: <AdmTeam />, posts: <AdmPosts />, atms: <AdmAtms />, footer: <AdmFooter />, settings: <AdmSettings session={session} />,
+      pages: <AdmPages />, services: <AdmServices />, team: <AdmTeam />, posts: <AdmPosts />, atms: <AdmAtms />, footer: <AdmFooter />, settings: <AdmSettings session={session} />,
     };
     return (
       <div className="adm-overlay">
         <div className="adm-shell adm-shell-dash">
+          {menuOpen && <div className="adm-side-backdrop" onClick={() => setMenuOpen(false)} />}
           <aside className={"adm-side" + (menuOpen ? " is-open" : "")}>
             <div className="adm-side-brand"><PBLogo variant="white" size={26} /></div>
             <nav className="adm-side-nav">
