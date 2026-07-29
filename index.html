@@ -810,11 +810,13 @@ img { max-width: 100%; display: block; }
 .adm-group { margin-bottom: 22px; }
 .adm-group h4 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--pb-secondary-700); margin: 0 0 10px; }
 .adm-item { display: flex; align-items: center; gap: 14px; padding: 12px; border: 1px solid var(--pb-line); border-radius: 12px; margin-bottom: 10px; background: #fff; }
-/* Side-by-side list grid */
-.adm-list-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; margin-bottom: 4px; }
-.adm-list-grid .adm-item { margin-bottom: 0; flex-wrap: wrap; align-content: center; }
-.adm-list-grid .adm-item .adm-row { margin-left: auto; }
-.adm-list-grid .adm-item-main { min-width: 130px; }
+/* Side-by-side list grid — each item becomes a compact card */
+.adm-list-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 14px; margin-bottom: 4px; }
+.adm-list-grid .adm-item { margin-bottom: 0; flex-wrap: wrap; align-items: flex-start; }
+.adm-list-grid .adm-item-main { flex: 1 1 auto; min-width: 130px; gap: 4px; }
+/* action buttons drop to their own full-width row so status + all actions stay visible */
+.adm-list-grid .adm-item .adm-row { flex-basis: 100%; width: 100%; margin-top: 4px; padding-top: 10px; border-top: 1px solid var(--pb-line); flex-wrap: wrap; }
+.adm-list-grid .adm-item .adm-row .adm-btn { flex: 1 1 auto; justify-content: center; }
 .adm-item-av { width: 44px; height: 44px; border-radius: 10px; overflow: hidden; background: var(--pb-primary); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; flex-shrink: 0; }
 .adm-item-av-wide { width: 64px; }
 .adm-item-av img { width: 100%; height: 100%; object-fit: cover; }
@@ -900,6 +902,10 @@ img { max-width: 100%; display: block; }
 .adm-prev-frame { background: #f4f6f8; border: 1px solid var(--pb-line); border-radius: 14px; padding: 16px; margin: 0 auto; transition: max-width .25s ease; overflow: hidden; }
 .adm-news-editor-full { max-width: 880px; }
 .adm-news-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+.adm-statusbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 12px 16px; margin-bottom: 18px; background: #f7f9fb; border: 1px solid var(--pb-line); border-radius: 12px; }
+.adm-statusbar-lbl { font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--pb-muted); }
+.adm-statusbar-dt { font-family: 'Lexend', sans-serif; font-size: 13px; padding: 7px 10px; border: 1px solid var(--pb-line); border-radius: 8px; }
+.adm-statusbar-actions { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
 .adm-statusbtns { display: inline-flex; gap: 4px; background: #eef1f4; border-radius: 10px; padding: 4px; }
 .adm-statusbtn { border: 1px solid transparent; background: transparent; font-family: 'Lexend', sans-serif; font-size: 13px; font-weight: 600; color: var(--pb-muted); padding: 8px 18px; border-radius: 8px; cursor: pointer; transition: all .15s ease; }
 .adm-statusbtn:hover { color: var(--pb-ink); }
@@ -7213,9 +7219,25 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
           <h2 className="adm-h2">{initial && initial.id ? "Edit article" : "Create article"}</h2>
           <div className="adm-row">
             <button className="adm-btn adm-sm" onClick={onCancel}>← Back</button>
+            <button className="adm-btn adm-btn-primary adm-sm" disabled={busy} onClick={() => persist(p.status)}>{busy ? "Saving…" : "Save changes"}</button>
+          </div>
+        </div>
+
+        {/* Always-visible workflow bar: Draft · Preview · Published */}
+        <div className="adm-statusbar">
+          <span className="adm-statusbar-lbl">Status</span>
+          <div className="adm-statusbtns">
+            {[["draft", "Draft"], ["scheduled", "Scheduling"], ["published", "Published"]].map(([v, label]) => (
+              <button key={v} type="button" className={"adm-statusbtn " + (p.status === v ? "on " + newsStatusMeta(v).cls : "")} onClick={() => set({ status: v })}>{label}</button>
+            ))}
+          </div>
+          {p.status === "scheduled" && (
+            <input type="datetime-local" className="adm-statusbar-dt" value={p.publish_at ? String(p.publish_at).slice(0, 16) : ""} onChange={(e) => set({ publish_at: e.target.value ? new Date(e.target.value).toISOString() : null })} />
+          )}
+          <div className="adm-statusbar-actions">
             <button className="adm-btn adm-sm" onClick={openPreview}>👁 Preview</button>
             <button className="adm-btn adm-sm" disabled={busy} onClick={() => persist("draft")}>Save draft</button>
-            <button className="adm-btn adm-btn-primary adm-sm" disabled={busy} onClick={() => persist("published")}>{busy ? "Saving…" : "Publish"}</button>
+            <button className="adm-btn adm-btn-primary adm-sm" disabled={busy} onClick={() => persist("published")}>Publish</button>
           </div>
         </div>
 
@@ -7309,19 +7331,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
             {tab === "publish" && (
               <>
-                <div className="adm-field"><span>Status</span>
-                  <div className="adm-statusbtns">
-                    {[["draft", "Draft"], ["scheduled", "Scheduling"], ["published", "Published"]].map(([v, label]) => (
-                      <button key={v} type="button" className={"adm-statusbtn " + (p.status === v ? "on " + newsStatusMeta(v).cls : "")}
-                        onClick={() => set({ status: v })}>{label}</button>
-                    ))}
-                  </div>
-                </div>
-                {p.status === "scheduled" && (
-                  <AdmField label="Publish date & time">
-                    <input type="datetime-local" value={p.publish_at ? String(p.publish_at).slice(0, 16) : ""} onChange={(e) => set({ publish_at: e.target.value ? new Date(e.target.value).toISOString() : null })} />
-                  </AdmField>
-                )}
+                <p className="adm-muted" style={{ marginTop: 0 }}>Set the status (Draft · Scheduling · Published) from the bar at the top. These are the homepage placement options.</p>
                 <label className="adm-check"><input type="checkbox" checked={!!p.featured} onChange={(e) => set({ featured: e.target.checked })} /> Feature on homepage</label>
                 <AdmField label="Homepage priority (1 = Breaking, 2 = Featured, 3 = Latest)">
                   <input type="number" min="0" max="3" value={p.priority || 0} onChange={(e) => set({ priority: parseInt(e.target.value || "0", 10) })} />
