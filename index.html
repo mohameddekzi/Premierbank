@@ -884,7 +884,15 @@ img { max-width: 100%; display: block; }
 .adm-prev-devs button { border: 1px solid var(--pb-line); background: #fff; border-radius: 7px; padding: 3px 8px; margin-left: 4px; cursor: pointer; }
 .adm-prev-devs button.is-active { background: var(--pb-primary); color: #fff; border-color: var(--pb-primary); }
 .adm-prev-frame { background: #f4f6f8; border: 1px solid var(--pb-line); border-radius: 14px; padding: 16px; margin: 0 auto; transition: max-width .25s ease; overflow: hidden; }
-.adm-news-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.adm-news-editor-full { max-width: 880px; }
+.adm-news-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+.adm-statusbtns { display: inline-flex; gap: 4px; background: #eef1f4; border-radius: 10px; padding: 4px; }
+.adm-statusbtn { border: 1px solid transparent; background: transparent; font-family: 'Lexend', sans-serif; font-size: 13px; font-weight: 600; color: var(--pb-muted); padding: 8px 18px; border-radius: 8px; cursor: pointer; transition: all .15s ease; }
+.adm-statusbtn:hover { color: var(--pb-ink); }
+.adm-statusbtn.on { background: #fff; color: var(--pb-ink); box-shadow: 0 1px 3px rgba(11,47,79,.12); }
+.adm-statusbtn.on.is-pub { color: var(--pb-secondary-700); }
+.adm-statusbtn.on.is-sched { color: #2b5cad; }
+.adm-statusbtn.on.is-draft { color: #5b6b7b; }
 .adm-lang-block { border: 1px solid var(--pb-line); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
 .adm-lang-block h4 { margin: 0 0 10px; font-family: 'Lexend', sans-serif; font-size: 14px; }
 @media (max-width: 900px) {
@@ -7002,7 +7010,6 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       press: Object.assign({ org: "Premier Bank", location: "", contact: "", email: "", phone: "", pdf_url: "" }, (initial && initial.press) || {}),
     }));
     const [tab, setTab] = uS("content");
-    const [device, setDevice] = uS("desktop");
     const [busy, setBusy] = uS(false);
     const set = (patch) => setP((prev) => Object.assign({}, prev, patch));
     const setI18n = (l, patch) => set({ i18n: Object.assign({}, p.i18n, { [l]: Object.assign({}, p.i18n[l], patch) }) });
@@ -7028,8 +7035,56 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     };
 
     const TABS = [["content", "Content"], ["media", "Media"], ["seo", "SEO"], ["langs", "Languages"], ...(p.category === "press" ? [["press", "Press release"]] : []), ["publish", "Publish"]];
-    const dev = device === "mobile" ? 390 : device === "tablet" ? 768 : 1100;
-    const bodyHtml = /[<][a-z]/i.test(p.body || "") ? p.body : (p.body || "").split("\n").filter(Boolean).map((x) => "<p>" + x + "</p>").join("");
+
+    // Open a WordPress-style live preview in a NEW browser tab, with device toggles.
+    const openPreview = () => {
+      const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+      const bodyHtml = /[<][a-z]/i.test(p.body || "") ? (p.body || "") : (p.body || "").split("\n").filter(Boolean).map((x) => "<p>" + esc(x) + "</p>").join("");
+      const gal = (p.gallery || []).map((g) => '<figure><img src="' + esc(g.url) + '"/>' + (g.caption ? "<figcaption>" + esc(g.caption) + "</figcaption>" : "") + "</figure>").join("");
+      const tags = (p.tags || []).map((t) => "<span>#" + esc(t) + "</span>").join("");
+      const today = new Date().toLocaleDateString("en-GB", { year: "numeric", month: "short", day: "numeric" });
+      const doc =
+        '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+        "<title>Preview — " + esc(p.title || "Untitled") + "</title>" +
+        "<style>" +
+        ":root{--nv:#0b2f4f;--gr:#6cbe46;--mut:#5b6b7b;--ln:#e6e9ee}" +
+        "*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:#eef1f4;color:#12212f}" +
+        ".bar{position:sticky;top:0;display:flex;align-items:center;gap:10px;justify-content:center;background:var(--nv);color:#fff;padding:10px;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.15);z-index:5}" +
+        ".bar b{margin-right:auto;padding-left:8px;font-weight:600}" +
+        ".bar button{border:1px solid rgba(255,255,255,.3);background:transparent;color:#fff;border-radius:7px;padding:5px 12px;cursor:pointer;font-size:13px}" +
+        ".bar button.on{background:var(--gr);border-color:var(--gr);color:#06340a;font-weight:600}" +
+        ".stage{padding:26px 16px;display:flex;justify-content:center}" +
+        ".frame{width:100%;max-width:760px;background:#fff;border:1px solid var(--ln);border-radius:16px;overflow:hidden;transition:max-width .25s ease;box-shadow:0 18px 50px rgba(11,47,79,.10)}" +
+        ".cover img{width:100%;display:block;aspect-ratio:16/9;object-fit:cover}" +
+        ".pad{padding:30px 34px 40px}" +
+        ".meta{display:flex;gap:10px;align-items:center;font-size:13px;color:var(--mut);margin-bottom:12px}" +
+        ".pr{background:#e9f4e0;color:#3c6a1f;font-weight:600;padding:2px 8px;border-radius:6px;text-transform:uppercase;font-size:11px;letter-spacing:.04em}" +
+        "h1{font-size:30px;line-height:1.2;margin:0 0 12px}" +
+        ".sum{font-size:17px;color:var(--mut);line-height:1.5;margin:0 0 20px}" +
+        ".content{font-size:16px;line-height:1.7}.content h2{font-size:22px;margin:22px 0 8px}.content h3{font-size:18px;margin:18px 0 6px}" +
+        ".content img{max-width:100%;border-radius:10px;margin:10px 0}.content blockquote{border-left:3px solid var(--gr);margin:14px 0;padding:6px 16px;color:var(--mut)}" +
+        ".gal{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:18px}.gal figure{margin:0}.gal img{width:100%;border-radius:10px}.gal figcaption{font-size:13px;color:var(--mut);margin-top:5px}" +
+        ".tags{display:flex;flex-wrap:wrap;gap:7px;margin-top:20px}.tags span{font-size:13px;background:#e9f4e0;color:#3c6a1f;padding:3px 9px;border-radius:6px}" +
+        "</style></head><body>" +
+        '<div class="bar"><b>Live preview — not saved yet</b>' +
+        '<button data-w="1100" class="on" onclick="setW(this,1100)">🖥 Desktop</button>' +
+        '<button data-w="768" onclick="setW(this,768)">▭ Tablet</button>' +
+        '<button data-w="390" onclick="setW(this,390)">▯ Mobile</button></div>' +
+        '<div class="stage"><article class="frame" id="fr">' +
+        (p.cover_url ? '<div class="cover"><img src="' + esc(p.cover_url) + '"/></div>' : "") +
+        '<div class="pad"><div class="meta">' + (p.category === "press" ? '<span class="pr">Press</span>' : "") + "<time>" + today + "</time>" + (p.author ? "<span>· " + esc(p.author) + "</span>" : "") + "</div>" +
+        "<h1>" + esc(p.title || "Untitled article") + "</h1>" +
+        (p.summary ? '<p class="sum">' + esc(p.summary) + "</p>" : "") +
+        '<div class="content">' + bodyHtml + "</div>" +
+        (gal ? '<div class="gal">' + gal + "</div>" : "") +
+        (tags ? '<div class="tags">' + tags + "</div>" : "") +
+        "</div></article></div>" +
+        "<script>function setW(b,w){document.getElementById('fr').style.maxWidth=w+'px';document.querySelectorAll('.bar button').forEach(function(x){x.classList.remove('on')});b.classList.add('on')}<\/script>" +
+        "</body></html>";
+      const w = window.open("", "pb_news_preview");
+      if (!w) { alert("Please allow pop-ups to open the live preview."); return; }
+      w.document.open(); w.document.write(doc); w.document.close();
+    };
 
     return (
       <div className="adm-pane">
@@ -7037,14 +7092,13 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
           <h2 className="adm-h2">{initial && initial.id ? "Edit article" : "Create article"}</h2>
           <div className="adm-row">
             <button className="adm-btn adm-sm" onClick={onCancel}>← Back</button>
+            <button className="adm-btn adm-sm" onClick={openPreview}>👁 Preview</button>
             <button className="adm-btn adm-sm" disabled={busy} onClick={() => persist("draft")}>Save draft</button>
             <button className="adm-btn adm-btn-primary adm-sm" disabled={busy} onClick={() => persist("published")}>{busy ? "Saving…" : "Publish"}</button>
           </div>
         </div>
 
-        <div className="adm-news-split">
-          {/* EDITOR SIDE */}
-          <div className="adm-news-editor">
+        <div className="adm-news-editor-full">
             <div className="adm-edit-tabs">
               {TABS.map(([id, label]) => <button key={id} className={tab === id ? "is-active" : ""} onClick={() => setTab(id)}>{label}</button>)}
             </div>
@@ -7134,59 +7188,30 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
             {tab === "publish" && (
               <>
-                <AdmField label="Status">
-                  <select value={p.status} onChange={(e) => set({ status: e.target.value })}>
-                    {NEWS_STATUS.map((s) => <option key={s.v} value={s.v}>{s.label}</option>)}
-                  </select>
-                </AdmField>
-                <AdmField label="Schedule (publish date & time)">
-                  <input type="datetime-local" value={p.publish_at ? String(p.publish_at).slice(0, 16) : ""} onChange={(e) => set({ publish_at: e.target.value ? new Date(e.target.value).toISOString() : null, status: e.target.value ? "scheduled" : p.status })} />
-                </AdmField>
+                <div className="adm-field"><span>Status</span>
+                  <div className="adm-statusbtns">
+                    {[["draft", "Draft"], ["scheduled", "Scheduling"], ["published", "Published"]].map(([v, label]) => (
+                      <button key={v} type="button" className={"adm-statusbtn " + (p.status === v ? "on " + newsStatusMeta(v).cls : "")}
+                        onClick={() => set({ status: v })}>{label}</button>
+                    ))}
+                  </div>
+                </div>
+                {p.status === "scheduled" && (
+                  <AdmField label="Publish date & time">
+                    <input type="datetime-local" value={p.publish_at ? String(p.publish_at).slice(0, 16) : ""} onChange={(e) => set({ publish_at: e.target.value ? new Date(e.target.value).toISOString() : null })} />
+                  </AdmField>
+                )}
                 <label className="adm-check"><input type="checkbox" checked={!!p.featured} onChange={(e) => set({ featured: e.target.checked })} /> Feature on homepage</label>
                 <AdmField label="Homepage priority (1 = Breaking, 2 = Featured, 3 = Latest)">
                   <input type="number" min="0" max="3" value={p.priority || 0} onChange={(e) => set({ priority: parseInt(e.target.value || "0", 10) })} />
                 </AdmField>
                 <div className="adm-news-actions">
-                  <button className="adm-btn" disabled={busy} onClick={() => persist("draft")}>Save as draft</button>
-                  <button className="adm-btn" disabled={busy} onClick={() => persist("scheduled")}>Schedule</button>
-                  <button className="adm-btn adm-btn-primary" disabled={busy} onClick={() => persist("published")}>Publish now</button>
+                  <button className="adm-btn adm-btn-primary" disabled={busy} onClick={() => persist(p.status)}>
+                    {busy ? "Saving…" : (p.status === "published" ? "Publish now" : p.status === "scheduled" ? "Schedule" : "Save draft")}
+                  </button>
                 </div>
               </>
             )}
-          </div>
-
-          {/* LIVE PREVIEW SIDE */}
-          <div className="adm-news-preview">
-            <div className="adm-prev-head">
-              <span>Live preview</span>
-              <div className="adm-prev-devs">
-                {[["desktop", "🖥"], ["tablet", "▭"], ["mobile", "▯"]].map(([d, ic]) => (
-                  <button key={d} className={device === d ? "is-active" : ""} onClick={() => setDevice(d)} title={d}>{ic}</button>
-                ))}
-              </div>
-            </div>
-            <div className="adm-prev-frame" style={{ maxWidth: dev }}>
-              <article className="pb-post" style={{ margin: "0 auto" }}>
-                {p.cover_url && <div className="pb-post-cover"><img src={p.cover_url} alt="" /></div>}
-                <div className="pb-post-body">
-                  <div className="pb-post-meta">
-                    {p.category === "press" && <span className="pb-post-tag">Press</span>}
-                    <time>{new Date().toLocaleDateString("en-GB", { year: "numeric", month: "short", day: "numeric" })}</time>
-                    {p.author && <span>· {p.author}</span>}
-                  </div>
-                  <h3>{p.title || "Untitled article"}</h3>
-                  {p.summary && <p className="pb-post-summary">{p.summary}</p>}
-                  {p.body && <div className="pb-post-content" dangerouslySetInnerHTML={{ __html: bodyHtml }} />}
-                  {(p.gallery || []).length > 0 && (
-                    <div className="pb-post-gallery">
-                      {p.gallery.map((g, i) => (<figure key={i}><img src={g.url} alt={g.caption || ""} />{g.caption && <figcaption>{g.caption}</figcaption>}</figure>))}
-                    </div>
-                  )}
-                  {(p.tags || []).length > 0 && <div className="pb-post-tags">{p.tags.map((t, i) => <span key={i}>#{t}</span>)}</div>}
-                </div>
-              </article>
-            </div>
-          </div>
         </div>
       </div>
     );
