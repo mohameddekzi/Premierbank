@@ -809,7 +809,12 @@ img { max-width: 100%; display: block; }
 .adm-toolbar h3, .adm-editor h3, .adm-login h3 { font-size: 18px; font-weight: 600; color: var(--pb-ink); margin: 0; }
 .adm-group { margin-bottom: 22px; }
 .adm-group h4 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--pb-secondary-700); margin: 0 0 10px; }
-.adm-item { display: flex; align-items: center; gap: 14px; padding: 12px; border: 1px solid var(--pb-line); border-radius: 12px; margin-bottom: 10px; }
+.adm-item { display: flex; align-items: center; gap: 14px; padding: 12px; border: 1px solid var(--pb-line); border-radius: 12px; margin-bottom: 10px; background: #fff; }
+/* Side-by-side list grid */
+.adm-list-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; margin-bottom: 4px; }
+.adm-list-grid .adm-item { margin-bottom: 0; flex-wrap: wrap; align-content: center; }
+.adm-list-grid .adm-item .adm-row { margin-left: auto; }
+.adm-list-grid .adm-item-main { min-width: 130px; }
 .adm-item-av { width: 44px; height: 44px; border-radius: 10px; overflow: hidden; background: var(--pb-primary); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; flex-shrink: 0; }
 .adm-item-av-wide { width: 64px; }
 .adm-item-av img { width: 100%; height: 100%; object-fit: cover; }
@@ -6991,11 +6996,11 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
             return (
               <div key={c.value} className="adm-group">
                 <h4>{c.label} <span style={{ fontWeight: 400, color: "var(--pb-muted)", fontSize: 13 }}>({group.length})</span></h4>
-                {group.map((m) => renderMemberRow(m))}
+                <div className="adm-list-grid">{group.map((m) => renderMemberRow(m))}</div>
               </div>
             );
           })
-        ) : shown.map((m) => renderMemberRow(m))}
+        ) : <div className="adm-list-grid">{shown.map((m) => renderMemberRow(m))}</div>}
       </div>
     );
   }
@@ -7534,7 +7539,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
               </select>
             )}
           </div>
-          {loading ? <p className="adm-muted">Loading…</p> : rows.length === 0 ? <p className="adm-muted">{empty}</p> : rows.map((p) => renderRow(p))}
+          {loading ? <p className="adm-muted">Loading…</p> : rows.length === 0 ? <p className="adm-muted">{empty}</p> : <div className="adm-list-grid">{rows.map((p) => renderRow(p))}</div>}
         </div>
       );
     };
@@ -7561,7 +7566,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
             <div className="adm-set-card">
               <h3 className="adm-set-h">Recent articles</h3>
               {loading ? <p className="adm-muted">Loading…</p> : items.length === 0 ? <p className="adm-muted">No articles yet — click “Create news”.</p> :
-                items.slice(0, 6).map((p) => renderRow(p))}
+                <div className="adm-list-grid">{items.slice(0, 6).map((p) => renderRow(p))}</div>}
             </div>
           </div>
         )}
