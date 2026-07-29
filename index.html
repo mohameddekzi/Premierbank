@@ -854,6 +854,89 @@ img { max-width: 100%; display: block; }
 .adm-side-foot { padding: 14px; border-top: 1px solid rgba(255,255,255,.1); }
 .adm-btn-ghost { background: transparent; color: #fff; border-color: rgba(255,255,255,.25); width: 100%; }
 .adm-btn-ghost:hover { background: rgba(255,255,255,.1); }
+
+/* ===== News & Press module ===== */
+.adm-subnav { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0 16px; border-bottom: 1px solid var(--pb-line); margin-bottom: 18px; }
+.adm-subnav button { border: 1px solid var(--pb-line); background: #fff; color: var(--pb-muted); font-family: 'Lexend', sans-serif; font-size: 13px; font-weight: 500; padding: 7px 13px; border-radius: 999px; cursor: pointer; transition: all .15s ease; }
+.adm-subnav button:hover { border-color: var(--pb-secondary); color: var(--pb-ink); }
+.adm-subnav button.is-active { background: var(--pb-primary); border-color: var(--pb-primary); color: #fff; }
+
+.adm-kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 22px; }
+.adm-kpi { background: #fff; border: 1px solid var(--pb-line); border-radius: 14px; padding: 18px; display: flex; flex-direction: column; gap: 4px; }
+.adm-kpi span { font-family: 'Lexend', sans-serif; font-size: 30px; font-weight: 700; color: var(--pb-primary); line-height: 1; }
+.adm-kpi em { font-style: normal; font-size: 12.5px; color: var(--pb-muted); font-weight: 500; }
+.adm-kpi.is-ok span { color: var(--pb-secondary-700); }
+
+.adm-status { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 6px; text-transform: uppercase; letter-spacing: .03em; }
+.adm-status.is-draft { background: #eef1f4; color: #5b6b7b; }
+.adm-status.is-pending { background: #fff4e0; color: #a56a00; }
+.adm-status.is-sched { background: #e6efff; color: #2b5cad; }
+.adm-status.is-pub { background: var(--pb-secondary-100); color: var(--pb-secondary-700); }
+.adm-status.is-arch { background: #f3e6e6; color: #a33; }
+.adm-star { color: #f5a623; }
+
+.adm-news-split { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 22px; align-items: start; }
+.adm-news-editor { min-width: 0; }
+.adm-news-preview { position: sticky; top: 8px; }
+.adm-prev-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; font-size: 12px; font-weight: 600; color: var(--pb-muted); text-transform: uppercase; letter-spacing: .05em; }
+.adm-prev-devs button { border: 1px solid var(--pb-line); background: #fff; border-radius: 7px; padding: 3px 8px; margin-left: 4px; cursor: pointer; }
+.adm-prev-devs button.is-active { background: var(--pb-primary); color: #fff; border-color: var(--pb-primary); }
+.adm-prev-frame { background: #f4f6f8; border: 1px solid var(--pb-line); border-radius: 14px; padding: 16px; margin: 0 auto; transition: max-width .25s ease; overflow: hidden; }
+.adm-news-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.adm-lang-block { border: 1px solid var(--pb-line); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+.adm-lang-block h4 { margin: 0 0 10px; font-family: 'Lexend', sans-serif; font-size: 14px; }
+@media (max-width: 900px) { .adm-news-split { grid-template-columns: 1fr; } .adm-news-preview { position: static; } }
+
+/* Rich-text editor */
+.adm-rt { border: 1px solid var(--pb-line); border-radius: 10px; overflow: hidden; }
+.adm-rt-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; padding: 6px; background: #f7f9fb; border-bottom: 1px solid var(--pb-line); }
+.adm-rt-btn { border: 1px solid transparent; background: #fff; border-radius: 6px; min-width: 30px; height: 30px; padding: 0 7px; font-size: 13px; cursor: pointer; color: var(--pb-ink); }
+.adm-rt-btn:hover { border-color: var(--pb-line); background: var(--pb-secondary-100); }
+.adm-rt-div { width: 1px; height: 20px; background: var(--pb-line); margin: 0 4px; }
+.adm-rt-area { min-height: 220px; max-height: 460px; overflow-y: auto; padding: 14px 16px; font-size: 14px; line-height: 1.6; color: var(--pb-ink); outline: none; }
+.adm-rt-area:focus { box-shadow: inset 0 0 0 2px var(--pb-secondary-100); }
+.adm-rt-area h2 { font-size: 20px; margin: 12px 0 6px; }
+.adm-rt-area h3 { font-size: 16px; margin: 10px 0 6px; }
+.adm-rt-area blockquote { border-left: 3px solid var(--pb-secondary); margin: 10px 0; padding: 4px 14px; color: var(--pb-muted); }
+.adm-rt-area img { max-width: 100%; border-radius: 8px; margin: 8px 0; }
+
+/* Gallery editor */
+.adm-gal-add { display: inline-block; border: 1.5px dashed var(--pb-secondary); color: var(--pb-secondary-700); background: var(--pb-secondary-100); border-radius: 10px; padding: 10px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.adm-gal-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; margin-top: 12px; }
+.adm-gal-cell { border: 1px solid var(--pb-line); border-radius: 10px; overflow: hidden; background: #fff; }
+.adm-gal-cell img { width: 100%; aspect-ratio: 4/3; object-fit: cover; display: block; }
+.adm-gal-cell input { border: 0; border-top: 1px solid var(--pb-line); font-size: 12px; padding: 6px 8px; width: 100%; }
+.adm-gal-ops { display: flex; gap: 4px; padding: 6px; }
+.adm-gal-ops button { flex: 1; border: 1px solid var(--pb-line); background: #fff; border-radius: 6px; cursor: pointer; font-size: 12px; padding: 3px; }
+.adm-gal-ops button.adm-danger { color: #c0392b; }
+
+/* Media library */
+.adm-media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 14px; }
+.adm-media-cell { border: 1px solid var(--pb-line); border-radius: 12px; overflow: hidden; background: #fff; }
+.adm-media-thumb { aspect-ratio: 4/3; background: #f4f6f8; }
+.adm-media-thumb img, .adm-media-thumb video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.adm-media-name { font-size: 11.5px; padding: 8px 10px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--pb-muted); }
+.adm-media-ops { display: flex; align-items: center; gap: 4px; padding: 8px 10px; flex-wrap: wrap; }
+.adm-media-folder { font-size: 10px; text-transform: uppercase; background: var(--pb-secondary-100); color: var(--pb-secondary-700); padding: 2px 6px; border-radius: 5px; margin-right: auto; }
+
+/* Analytics bars */
+.adm-bars { display: flex; align-items: flex-end; gap: 14px; height: 160px; padding-top: 10px; }
+.adm-bar { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 4px; }
+.adm-bar-fill { width: 34px; background: linear-gradient(var(--pb-secondary), var(--pb-secondary-700)); border-radius: 6px 6px 0 0; min-height: 4px; }
+.adm-bar span { font-size: 12px; font-weight: 700; color: var(--pb-ink); }
+.adm-bar em { font-style: normal; font-size: 11px; color: var(--pb-muted); }
+
+/* Front-end article extras */
+.pb-post-gallery { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 12px; }
+.pb-post-gallery figure { margin: 0; }
+.pb-post-gallery img { width: 100%; border-radius: 10px; }
+.pb-post-gallery figcaption { font-size: 12px; color: var(--pb-muted); margin-top: 4px; }
+.pb-post-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.pb-post-tags span { font-size: 12px; background: var(--pb-secondary-100); color: var(--pb-secondary-700); padding: 2px 8px; border-radius: 6px; }
+.pb-post-content h2 { font-size: 18px; margin: 14px 0 6px; }
+.pb-post-content h3 { font-size: 15px; margin: 12px 0 6px; }
+.pb-post-content img { max-width: 100%; border-radius: 8px; margin: 8px 0; }
+.pb-post-content blockquote { border-left: 3px solid var(--pb-secondary); margin: 10px 0; padding: 4px 14px; color: var(--pb-muted); }
 .adm-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .adm-main-head { display: flex; align-items: center; gap: 14px; padding: 14px 22px; border-bottom: 1px solid var(--pb-line); }
 .adm-crumb { flex: 1; font-weight: 600; color: var(--pb-ink); }
@@ -2102,9 +2185,16 @@ window.PB_SUPABASE = {
     },
     async loadPosts() {
       if (!client) return;
-      const { data, error } = await client.from("posts").select("*").eq("published", true).order("created_at", { ascending: false });
-      if (error) { console.warn("posts load:", error.message); return; }
-      window.PB_LIVE_POSTS = data || [];
+      // Fetch published + scheduled; show scheduled only once their publish time has passed.
+      const { data, error } = await client.from("posts").select("*").in("status", ["published", "scheduled"]).order("created_at", { ascending: false });
+      if (error) {
+        // Fallback for older schema without a status column.
+        const legacy = await client.from("posts").select("*").eq("published", true).order("created_at", { ascending: false });
+        window.PB_LIVE_POSTS = legacy.data || [];
+        emit(); return;
+      }
+      const now = Date.now();
+      window.PB_LIVE_POSTS = (data || []).filter((p) => p.status === "published" || (p.status === "scheduled" && p.publish_at && new Date(p.publish_at).getTime() <= now));
       emit();
     },
     async loadAtms() {
@@ -6003,25 +6093,43 @@ function DetailPanel({ itemKey, lang, setLang, onClose, onJump, onOpenAccount, o
                 <h2>{lang === "en" ? "Latest" : "Kuwa cusub"}</h2>
               </div>
               <div className="pb-post-grid">
-                {livePosts.map((p) => (
+                {livePosts.map((p) => {
+                  const tr = (p.i18n && p.i18n[lang]) || {};
+                  const pTitle = tr.title || p.title;
+                  const pSummary = tr.summary || p.summary;
+                  const pBody = tr.body || p.body;
+                  const isHtml = /[<][a-z]/i.test(pBody || "");
+                  return (
                   <article key={p.id} className="pb-post">
-                    {p.cover_url && <div className="pb-post-cover"><img src={p.cover_url} alt={p.title} /></div>}
+                    {p.cover_url && <div className="pb-post-cover"><img src={p.cover_url} alt={pTitle} /></div>}
                     <div className="pb-post-body">
                       <div className="pb-post-meta">
                         {p.category === "press" && <span className="pb-post-tag">{lang === "en" ? "Press" : "Saxaafad"}</span>}
                         {p.created_at && <time>{fmtDate(p.created_at)}</time>}
+                        {p.author && <span>· {p.author}</span>}
                       </div>
-                      <h3>{p.title}</h3>
-                      {p.summary && <p className="pb-post-summary">{p.summary}</p>}
-                      {p.body && (
+                      <h3>{pTitle}</h3>
+                      {pSummary && <p className="pb-post-summary">{pSummary}</p>}
+                      {pBody && (
                         <details className="pb-post-more">
                           <summary>{lang === "en" ? "Read more" : "Akhri wax dheeraad ah"}</summary>
-                          <div className="pb-post-content">{p.body.split("\n").filter(Boolean).map((para, i) => <p key={i}>{para}</p>)}</div>
+                          {isHtml
+                            ? <div className="pb-post-content" dangerouslySetInnerHTML={{ __html: pBody }} />
+                            : <div className="pb-post-content">{pBody.split("\n").filter(Boolean).map((para, i) => <p key={i}>{para}</p>)}</div>}
+                          {(p.gallery || []).length > 0 && (
+                            <div className="pb-post-gallery">
+                              {p.gallery.map((g, i) => (<figure key={i}><img src={g.url} alt={g.caption || ""} />{g.caption && <figcaption>{g.caption}</figcaption>}</figure>))}
+                            </div>
+                          )}
+                          {p.category === "press" && p.press && p.press.pdf_url && (
+                            <a className="pb-btn pb-btn-secondary" href={p.press.pdf_url} target="_blank" rel="noopener" style={{ marginTop: 12, display: "inline-flex" }}>{lang === "en" ? "Download PDF" : "Soo dejiso PDF"} <Icon name="arrow" size={14} /></a>
+                          )}
                         </details>
                       )}
                     </div>
                   </article>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}
@@ -6766,11 +6874,445 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
   }
 
   /* ============================ POSTS ============================ */
-  function AdmPosts() {
+  /* ============================ NEWS & PRESS MODULE ============================ */
+  const NEWS_STATUS = [
+    { v: "draft",     label: "Draft",         cls: "is-draft" },
+    { v: "pending",   label: "Pending review", cls: "is-pending" },
+    { v: "scheduled", label: "Scheduled",     cls: "is-sched" },
+    { v: "published", label: "Published",     cls: "is-pub" },
+    { v: "archived",  label: "Archived",      cls: "is-arch" },
+  ];
+  const newsStatusMeta = (v) => NEWS_STATUS.find((s) => s.v === v) || NEWS_STATUS[0];
+  const slugify = (s) => (s || "").toLowerCase().trim().replace(/[^a-z0-9\s-]/g, "").replace(/\s+/g, "-").replace(/-+/g, "-").slice(0, 80);
+  const NEWS_SUBNAV = [
+    { id: "dash",      label: "Dashboard" },
+    { id: "all",       label: "All news" },
+    { id: "edit",      label: "Create news" },
+    { id: "drafts",    label: "Drafts" },
+    { id: "scheduled", label: "Scheduled" },
+    { id: "press",     label: "Press releases" },
+    { id: "media",     label: "Media library" },
+    { id: "tax",       label: "Categories & tags" },
+    { id: "seo",       label: "SEO" },
+    { id: "analytics", label: "Analytics" },
+  ];
+
+  /* ---- Rich-text (WYSIWYG) editor ---- */
+  function AdmRichEditor({ value, onChange }) {
+    const ref = uR(null);
+    uE(() => { if (ref.current && ref.current.innerHTML !== (value || "")) ref.current.innerHTML = value || ""; }, []);
+    const sync = () => { if (ref.current) onChange(ref.current.innerHTML); };
+    const exec = (cmd, arg) => { document.execCommand(cmd, false, arg); if (ref.current) ref.current.focus(); sync(); };
+    const addLink = () => { const url = prompt("Link URL:", "https://"); if (url) exec("createLink", url); };
+    const addImage = () => {
+      const inp = document.createElement("input"); inp.type = "file"; inp.accept = "image/*";
+      inp.onchange = async () => {
+        const f = inp.files && inp.files[0]; if (!f) return;
+        try { const url = await window.PBData.uploadImage(f, "posts"); exec("insertImage", url); }
+        catch (e) { alert("Image upload failed: " + e.message); }
+      };
+      inp.click();
+    };
+    const B = ({ on, arg, blk, children, title }) => (
+      <button type="button" className="adm-rt-btn" title={title} onMouseDown={(e) => e.preventDefault()}
+        onClick={() => (blk ? exec("formatBlock", blk) : exec(on, arg))}>{children}</button>
+    );
+    return (
+      <div className="adm-rt">
+        <div className="adm-rt-bar">
+          <B blk="H2" title="Heading 2">H2</B>
+          <B blk="H3" title="Heading 3">H3</B>
+          <B blk="P" title="Normal text">P</B>
+          <span className="adm-rt-div" />
+          <B on="bold" title="Bold"><b>B</b></B>
+          <B on="italic" title="Italic"><i>I</i></B>
+          <B on="underline" title="Underline"><u>U</u></B>
+          <B blk="BLOCKQUOTE" title="Quote">❝</B>
+          <span className="adm-rt-div" />
+          <B on="insertUnorderedList" title="Bullet list">• List</B>
+          <B on="insertOrderedList" title="Numbered list">1. List</B>
+          <span className="adm-rt-div" />
+          <button type="button" className="adm-rt-btn" onMouseDown={(e) => e.preventDefault()} onClick={addLink} title="Insert link">🔗</button>
+          <button type="button" className="adm-rt-btn" onMouseDown={(e) => e.preventDefault()} onClick={addImage} title="Insert image">🖼</button>
+        </div>
+        <div ref={ref} className="adm-rt-area" contentEditable suppressContentEditableWarning onInput={sync} onBlur={sync} />
+      </div>
+    );
+  }
+
+  /* ---- Multi-image gallery with reorder + captions ---- */
+  function AdmGallery({ items, onChange }) {
+    const list = items || [];
+    const [busy, setBusy] = uS(false);
+    const addFiles = async (files) => {
+      setBusy(true);
+      const next = list.slice();
+      for (const f of Array.from(files)) {
+        try { const url = await window.PBData.uploadImage(f, "posts"); next.push({ url: url, caption: "" }); }
+        catch (e) { alert("Upload failed: " + e.message); }
+      }
+      setBusy(false); onChange(next);
+    };
+    const upd = (i, patch) => onChange(list.map((g, j) => (j === i ? Object.assign({}, g, patch) : g)));
+    const rm = (i) => onChange(list.filter((_, j) => j !== i));
+    const move = (i, dir) => { const j = i + dir; if (j < 0 || j >= list.length) return; const cp = list.slice(); const x = cp[i]; cp[i] = cp[j]; cp[j] = x; onChange(cp); };
+    return (
+      <div className="adm-gal">
+        <label className="adm-gal-add">
+          <input type="file" accept="image/*" multiple style={{ display: "none" }} onChange={(e) => e.target.files.length && addFiles(e.target.files)} />
+          {busy ? "Uploading…" : "＋ Add images"}
+        </label>
+        {list.length > 0 && (
+          <div className="adm-gal-grid">
+            {list.map((g, i) => (
+              <div key={i} className="adm-gal-cell">
+                <img src={g.url} alt="" />
+                <input value={g.caption || ""} onChange={(e) => upd(i, { caption: e.target.value })} placeholder="Caption…" />
+                <div className="adm-gal-ops">
+                  <button type="button" onClick={() => move(i, -1)} disabled={i === 0}>↑</button>
+                  <button type="button" onClick={() => move(i, 1)} disabled={i === list.length - 1}>↓</button>
+                  <button type="button" className="adm-danger" onClick={() => rm(i)}>✕</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  const blankPost = () => ({
+    category: "news", title: "", slug: "", summary: "", body: "", cover_url: "", gallery: [], tags: [],
+    author: "", status: "draft", publish_at: null, featured: false, priority: 0,
+    seo_title: "", seo_desc: "", seo_keywords: "", og_image: "",
+    i18n: { so: { title: "", summary: "", body: "" }, ar: { title: "", summary: "", body: "" } },
+    press: { org: "Premier Bank", location: "", contact: "", email: "", phone: "", pdf_url: "" },
+  });
+
+  /* ---- The article editor ---- */
+  function AdmNewsEditor({ initial, onSaved, onCancel }) {
+    const [p, setP] = uS(() => Object.assign(blankPost(), initial || {}, {
+      gallery: (initial && initial.gallery) || [], tags: (initial && initial.tags) || [],
+      i18n: Object.assign({ so: { title: "", summary: "", body: "" }, ar: { title: "", summary: "", body: "" } }, (initial && initial.i18n) || {}),
+      press: Object.assign({ org: "Premier Bank", location: "", contact: "", email: "", phone: "", pdf_url: "" }, (initial && initial.press) || {}),
+    }));
+    const [tab, setTab] = uS("content");
+    const [device, setDevice] = uS("desktop");
+    const [busy, setBusy] = uS(false);
+    const set = (patch) => setP((prev) => Object.assign({}, prev, patch));
+    const setI18n = (l, patch) => set({ i18n: Object.assign({}, p.i18n, { [l]: Object.assign({}, p.i18n[l], patch) }) });
+    const setPress = (patch) => set({ press: Object.assign({}, p.press, patch) });
+    const slugAuto = p.slug || slugify(p.title);
+
+    const persist = async (status) => {
+      if (!p.title.trim()) { alert("Title is required."); return; }
+      if (status === "scheduled" && !p.publish_at) { alert("Pick a publish date & time to schedule."); setTab("publish"); return; }
+      setBusy(true);
+      const rec = Object.assign({}, p, {
+        status: status,
+        slug: p.slug || slugify(p.title),
+        published: status === "published",
+        updated_at: new Date().toISOString(),
+      });
+      if (rec.id == null) delete rec.id;
+      const { error } = await window.PBData.savePost(rec);
+      setBusy(false);
+      if (error) { alert("Save failed: " + error.message); return; }
+      window.PBData.loadPosts();
+      onSaved();
+    };
+
+    const TABS = [["content", "Content"], ["media", "Media"], ["seo", "SEO"], ["langs", "Languages"], ...(p.category === "press" ? [["press", "Press release"]] : []), ["publish", "Publish"]];
+    const dev = device === "mobile" ? 390 : device === "tablet" ? 768 : 1100;
+    const bodyHtml = /[<][a-z]/i.test(p.body || "") ? p.body : (p.body || "").split("\n").filter(Boolean).map((x) => "<p>" + x + "</p>").join("");
+
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar">
+          <h2 className="adm-h2">{initial && initial.id ? "Edit article" : "Create article"}</h2>
+          <div className="adm-row">
+            <button className="adm-btn adm-sm" onClick={onCancel}>← Back</button>
+            <button className="adm-btn adm-sm" disabled={busy} onClick={() => persist("draft")}>Save draft</button>
+            <button className="adm-btn adm-btn-primary adm-sm" disabled={busy} onClick={() => persist("published")}>{busy ? "Saving…" : "Publish"}</button>
+          </div>
+        </div>
+
+        <div className="adm-news-split">
+          {/* EDITOR SIDE */}
+          <div className="adm-news-editor">
+            <div className="adm-edit-tabs">
+              {TABS.map(([id, label]) => <button key={id} className={tab === id ? "is-active" : ""} onClick={() => setTab(id)}>{label}</button>)}
+            </div>
+
+            {tab === "content" && (
+              <>
+                <div className="adm-color-row">
+                  <AdmField label="Type">
+                    <select value={p.category} onChange={(e) => set({ category: e.target.value })}>
+                      <option value="news">News article</option>
+                      <option value="press">Press release</option>
+                    </select>
+                  </AdmField>
+                  <AdmField label="Author"><input value={p.author || ""} onChange={(e) => set({ author: e.target.value })} placeholder="e.g. Premier Bank Media" /></AdmField>
+                </div>
+                <AdmField label="Title"><input value={p.title} onChange={(e) => set({ title: e.target.value })} placeholder="Headline…" /></AdmField>
+                <AdmField label="Summary / standfirst"><textarea rows={2} value={p.summary || ""} onChange={(e) => set({ summary: e.target.value })} placeholder="One or two sentences shown in listings and social shares." /></AdmField>
+                <AdmField label="Full content">
+                  <AdmRichEditor value={p.body} onChange={(html) => set({ body: html })} />
+                </AdmField>
+                <AdmField label="Tags (comma-separated)">
+                  <input value={(p.tags || []).join(", ")} onChange={(e) => set({ tags: e.target.value.split(",").map((x) => x.trim()).filter(Boolean) })} placeholder="digital, wallet, announcement" />
+                </AdmField>
+              </>
+            )}
+
+            {tab === "media" && (
+              <>
+                <AdmField label="Featured image (cover)">
+                  <AdmDrop value={p.cover_url} folder="posts" onUpload={(url) => set({ cover_url: url })} />
+                </AdmField>
+                <div className="adm-field"><span>Article gallery</span>
+                  <AdmGallery items={p.gallery} onChange={(g) => set({ gallery: g })} />
+                </div>
+              </>
+            )}
+
+            {tab === "seo" && (
+              <>
+                <AdmField label="SEO title"><input value={p.seo_title || ""} onChange={(e) => set({ seo_title: e.target.value })} placeholder={p.title || "Defaults to the article title"} /></AdmField>
+                <AdmField label="Meta description"><textarea rows={2} value={p.seo_desc || ""} onChange={(e) => set({ seo_desc: e.target.value })} placeholder={p.summary || "150–160 characters for search results"} /></AdmField>
+                <AdmField label="Keywords"><input value={p.seo_keywords || ""} onChange={(e) => set({ seo_keywords: e.target.value })} placeholder="premier bank, somalia, banking" /></AdmField>
+                <AdmField label="URL slug">
+                  <input value={p.slug || ""} onChange={(e) => set({ slug: slugify(e.target.value) })} placeholder={slugAuto} />
+                </AdmField>
+                <p className="adm-muted" style={{ fontSize: 12 }}>Preview: <code>premierbank.so/news/{slugAuto || "your-article"}</code></p>
+                <AdmField label="Social sharing image">
+                  <AdmDrop value={p.og_image} folder="posts" onUpload={(url) => set({ og_image: url })} />
+                </AdmField>
+              </>
+            )}
+
+            {tab === "langs" && (
+              <>
+                <p className="adm-muted" style={{ marginTop: 0 }}>The English fields above are the default. Add Somali &amp; Arabic translations here — the site shows the visitor’s language automatically, falling back to English.</p>
+                <div className="adm-lang-block">
+                  <h4>Soomaali (SO)</h4>
+                  <AdmField label="Cinwaan"><input value={p.i18n.so.title || ""} onChange={(e) => setI18n("so", { title: e.target.value })} /></AdmField>
+                  <AdmField label="Kooban"><textarea rows={2} value={p.i18n.so.summary || ""} onChange={(e) => setI18n("so", { summary: e.target.value })} /></AdmField>
+                  <AdmField label="Qoraalka"><textarea rows={5} value={p.i18n.so.body || ""} onChange={(e) => setI18n("so", { body: e.target.value })} /></AdmField>
+                </div>
+                <div className="adm-lang-block" dir="rtl">
+                  <h4 style={{ direction: "ltr" }}>العربية (AR)</h4>
+                  <AdmField label="العنوان"><input value={p.i18n.ar.title || ""} onChange={(e) => setI18n("ar", { title: e.target.value })} /></AdmField>
+                  <AdmField label="الملخص"><textarea rows={2} value={p.i18n.ar.summary || ""} onChange={(e) => setI18n("ar", { summary: e.target.value })} /></AdmField>
+                  <AdmField label="المحتوى"><textarea rows={5} value={p.i18n.ar.body || ""} onChange={(e) => setI18n("ar", { body: e.target.value })} /></AdmField>
+                </div>
+              </>
+            )}
+
+            {tab === "press" && p.category === "press" && (
+              <>
+                <div className="adm-color-row">
+                  <AdmField label="Organization"><input value={p.press.org || ""} onChange={(e) => setPress({ org: e.target.value })} /></AdmField>
+                  <AdmField label="Location"><input value={p.press.location || ""} onChange={(e) => setPress({ location: e.target.value })} placeholder="Mogadishu, Somalia" /></AdmField>
+                </div>
+                <div className="adm-color-row">
+                  <AdmField label="Contact person"><input value={p.press.contact || ""} onChange={(e) => setPress({ contact: e.target.value })} /></AdmField>
+                  <AdmField label="Contact email"><input value={p.press.email || ""} onChange={(e) => setPress({ email: e.target.value })} /></AdmField>
+                </div>
+                <AdmField label="Contact phone"><input value={p.press.phone || ""} onChange={(e) => setPress({ phone: e.target.value })} /></AdmField>
+                <AdmField label="Downloadable PDF">
+                  <AdmDrop value={p.press.pdf_url} folder="press" onUpload={(url) => setPress({ pdf_url: url })} label="Upload PDF" />
+                </AdmField>
+              </>
+            )}
+
+            {tab === "publish" && (
+              <>
+                <AdmField label="Status">
+                  <select value={p.status} onChange={(e) => set({ status: e.target.value })}>
+                    {NEWS_STATUS.map((s) => <option key={s.v} value={s.v}>{s.label}</option>)}
+                  </select>
+                </AdmField>
+                <AdmField label="Schedule (publish date & time)">
+                  <input type="datetime-local" value={p.publish_at ? String(p.publish_at).slice(0, 16) : ""} onChange={(e) => set({ publish_at: e.target.value ? new Date(e.target.value).toISOString() : null, status: e.target.value ? "scheduled" : p.status })} />
+                </AdmField>
+                <label className="adm-check"><input type="checkbox" checked={!!p.featured} onChange={(e) => set({ featured: e.target.checked })} /> Feature on homepage</label>
+                <AdmField label="Homepage priority (1 = Breaking, 2 = Featured, 3 = Latest)">
+                  <input type="number" min="0" max="3" value={p.priority || 0} onChange={(e) => set({ priority: parseInt(e.target.value || "0", 10) })} />
+                </AdmField>
+                <div className="adm-news-actions">
+                  <button className="adm-btn" disabled={busy} onClick={() => persist("draft")}>Save as draft</button>
+                  <button className="adm-btn" disabled={busy} onClick={() => persist("scheduled")}>Schedule</button>
+                  <button className="adm-btn adm-btn-primary" disabled={busy} onClick={() => persist("published")}>Publish now</button>
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* LIVE PREVIEW SIDE */}
+          <div className="adm-news-preview">
+            <div className="adm-prev-head">
+              <span>Live preview</span>
+              <div className="adm-prev-devs">
+                {[["desktop", "🖥"], ["tablet", "▭"], ["mobile", "▯"]].map(([d, ic]) => (
+                  <button key={d} className={device === d ? "is-active" : ""} onClick={() => setDevice(d)} title={d}>{ic}</button>
+                ))}
+              </div>
+            </div>
+            <div className="adm-prev-frame" style={{ maxWidth: dev }}>
+              <article className="pb-post" style={{ margin: "0 auto" }}>
+                {p.cover_url && <div className="pb-post-cover"><img src={p.cover_url} alt="" /></div>}
+                <div className="pb-post-body">
+                  <div className="pb-post-meta">
+                    {p.category === "press" && <span className="pb-post-tag">Press</span>}
+                    <time>{new Date().toLocaleDateString("en-GB", { year: "numeric", month: "short", day: "numeric" })}</time>
+                    {p.author && <span>· {p.author}</span>}
+                  </div>
+                  <h3>{p.title || "Untitled article"}</h3>
+                  {p.summary && <p className="pb-post-summary">{p.summary}</p>}
+                  {p.body && <div className="pb-post-content" dangerouslySetInnerHTML={{ __html: bodyHtml }} />}
+                  {(p.gallery || []).length > 0 && (
+                    <div className="pb-post-gallery">
+                      {p.gallery.map((g, i) => (<figure key={i}><img src={g.url} alt={g.caption || ""} />{g.caption && <figcaption>{g.caption}</figcaption>}</figure>))}
+                    </div>
+                  )}
+                  {(p.tags || []).length > 0 && <div className="pb-post-tags">{p.tags.map((t, i) => <span key={i}>#{t}</span>)}</div>}
+                </div>
+              </article>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ---- Media library (Supabase storage) ---- */
+  function AdmMediaLibrary() {
+    const [files, setFiles] = uS(null);
+    const [q, setQ] = uS("");
+    const [msg, setMsg] = uS("");
+    const load = async () => {
+      const c = window.PBData.client; if (!c) return;
+      const out = [];
+      for (const folder of ["posts", "press", "team", "misc"]) {
+        const { data } = await c.storage.from("media").list(folder, { limit: 100, sortBy: { column: "created_at", order: "desc" } });
+        (data || []).forEach((f) => { if (f.name && f.id !== null) out.push({ folder: folder, name: f.name, path: folder + "/" + f.name, url: c.storage.from("media").getPublicUrl(folder + "/" + f.name).data.publicUrl }); });
+      }
+      setFiles(out);
+    };
+    uE(() => { load(); }, []);
+    const del = async (path) => {
+      if (!confirm("Delete this file permanently?")) return;
+      const { error } = await window.PBData.client.storage.from("media").remove([path]);
+      if (error) { alert("Delete failed: " + error.message); return; }
+      load();
+    };
+    const copy = (url) => { try { navigator.clipboard.writeText(url); setMsg("URL copied"); setTimeout(() => setMsg(""), 1500); } catch (e) {} };
+    const shown = (files || []).filter((f) => !q || f.name.toLowerCase().includes(q.toLowerCase()));
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar"><h2 className="adm-h2">Media library</h2>{msg && <span className="adm-preview-tag">{msg}</span>}</div>
+        <p className="adm-muted" style={{ marginTop: 0 }}>Every image uploaded across News, Team and ATMs. Supported: JPG, PNG, WEBP, SVG, MP4.</p>
+        <AdmField label="Search"><input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter by file name…" /></AdmField>
+        {files === null ? <p className="adm-muted">Loading…</p> : shown.length === 0 ? <p className="adm-muted">No media found.</p> : (
+          <div className="adm-media-grid">
+            {shown.map((f) => (
+              <div key={f.path} className="adm-media-cell">
+                <div className="adm-media-thumb">{/\.(mp4|webm)$/i.test(f.name) ? <video src={f.url} /> : <img src={f.url} alt="" />}</div>
+                <div className="adm-media-name" title={f.name}>{f.name}</div>
+                <div className="adm-media-ops">
+                  <span className="adm-media-folder">{f.folder}</span>
+                  <button className="adm-btn adm-sm" onClick={() => copy(f.url)}>Copy URL</button>
+                  <button className="adm-btn adm-sm adm-danger" onClick={() => del(f.path)}>Delete</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  /* ---- Categories & tags ---- */
+  function AdmNewsTaxonomy() {
+    const cur = window.PBData.getOverride("newsTaxonomy") || {};
+    const [cats, setCats] = uS(() => clone(cur.categories || ["News", "Press Release", "Announcement", "Event"]));
+    const [tags, setTags] = uS(() => clone(cur.tags || ["digital", "wallet", "cards", "swift", "community"]));
+    const [busy, setBusy] = uS(false); const [saved, setSaved] = uS(false);
+    const save = async () => {
+      setBusy(true);
+      const { error } = await window.PBData.saveContent("newsTaxonomy", { categories: cats.filter(Boolean), tags: tags.filter(Boolean) });
+      setBusy(false);
+      if (error) alert("Failed: " + error.message); else { setSaved(true); setTimeout(() => setSaved(false), 2000); }
+    };
+    const renderList = (label, list, setList, ph) => (
+      <div className="adm-set-card">
+        <h3 className="adm-set-h">{label}</h3>
+        {list.map((v, i) => (
+          <div className="adm-row" key={i} style={{ marginBottom: 6 }}>
+            <input value={v} onChange={(e) => setList(list.map((x, j) => j === i ? e.target.value : x))} placeholder={ph} />
+            <button className="adm-btn adm-sm adm-danger" onClick={() => setList(list.filter((_, j) => j !== i))}>✕</button>
+          </div>
+        ))}
+        <button className="adm-btn adm-sm" onClick={() => setList(list.concat([""]))}>+ Add</button>
+      </div>
+    );
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar"><h2 className="adm-h2">Categories &amp; tags</h2></div>
+        {renderList("Categories", cats, setCats, "Category name")}
+        {renderList("Tags", tags, setTags, "Tag")}
+        <AdmSaveBar onSave={save} busy={busy} saved={saved} />
+      </div>
+    );
+  }
+
+  /* ---- Analytics (computed honestly from your own data) ---- */
+  function AdmNewsAnalytics({ items }) {
+    const byStatus = {};
+    NEWS_STATUS.forEach((s) => (byStatus[s.v] = 0));
+    items.forEach((p) => { byStatus[p.status || (p.published ? "published" : "draft")] = (byStatus[p.status || (p.published ? "published" : "draft")] || 0) + 1; });
+    const months = {};
+    items.forEach((p) => { const d = new Date(p.created_at || Date.now()); const k = d.toLocaleDateString("en-GB", { month: "short", year: "2-digit" }); months[k] = (months[k] || 0) + 1; });
+    const mKeys = Object.keys(months).slice(-6);
+    const maxM = Math.max(1, ...mKeys.map((k) => months[k]));
+    const totalViews = items.reduce((s, p) => s + (p.views || 0), 0);
+    const top = items.slice().sort((a, b) => (b.views || 0) - (a.views || 0)).slice(0, 5);
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar"><h2 className="adm-h2">Analytics</h2></div>
+        <div className="adm-kpi-row">
+          <div className="adm-kpi"><span>{items.length}</span><em>Total articles</em></div>
+          <div className="adm-kpi"><span>{byStatus.published || 0}</span><em>Published</em></div>
+          <div className="adm-kpi"><span>{totalViews.toLocaleString()}</span><em>Total views</em></div>
+        </div>
+        <div className="adm-set-card">
+          <h3 className="adm-set-h">Articles published per month</h3>
+          <div className="adm-bars">
+            {mKeys.length === 0 ? <p className="adm-muted">No data yet.</p> : mKeys.map((k) => (
+              <div key={k} className="adm-bar"><div className="adm-bar-fill" style={{ height: Math.round((months[k] / maxM) * 120) + "px" }} /><span>{months[k]}</span><em>{k}</em></div>
+            ))}
+          </div>
+        </div>
+        <div className="adm-set-card">
+          <h3 className="adm-set-h">Most viewed</h3>
+          {top.length === 0 ? <p className="adm-muted">No articles yet.</p> : top.map((p) => (
+            <div key={p.id} className="adm-set-kv"><span>{p.title}</span><strong>{(p.views || 0).toLocaleString()} views</strong></div>
+          ))}
+          <p className="adm-muted" style={{ fontSize: 12, marginTop: 10 }}>View counts increment when the article opens on the live site. Traffic-source and visitor analytics require a dedicated analytics backend (e.g. Plausible / GA) — not included in this static build.</p>
+        </div>
+      </div>
+    );
+  }
+
+  function AdmNews() {
     const [items, setItems] = uS([]);
-    const [editing, setEditing] = uS(null);
     const [loading, setLoading] = uS(true);
-    const [preview, setPreview] = uS(false);
+    const [sub, setSub] = uS("dash");
+    const [editing, setEditing] = uS(null);
+    const [q, setQ] = uS("");
+    const [fStatus, setFStatus] = uS("all");
     const load = async () => {
       setLoading(true);
       const { data, error } = await window.PBData.listPosts();
@@ -6778,76 +7320,121 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       setLoading(false);
     };
     uE(() => { load(); }, []);
-    const newPost = () => { setPreview(false); setEditing({ category: "news", title: "", summary: "", body: "", cover_url: "", published: true }); };
-    const save = async () => {
-      const p = Object.assign({}, editing);
-      if (p.id == null) delete p.id;
-      if (!p.title) { alert("Title is required."); return; }
-      const { error } = await window.PBData.savePost(p);
-      if (error) { alert("Save failed: " + error.message); return; }
-      setEditing(null); await load(); window.PBData.loadPosts();
-    };
+    const goEdit = (p) => { setEditing(p || blankPost()); setSub("edit"); };
     const del = async (id) => {
-      if (!confirm("Delete this post?")) return;
+      if (!confirm("Delete this article?")) return;
       const { error } = await window.PBData.deletePost(id);
       if (error) { alert("Delete failed: " + error.message); return; }
-      await load(); window.PBData.loadPosts();
+      load(); window.PBData.loadPosts();
     };
-    if (editing) {
+    const dup = async (p) => {
+      const copy2 = Object.assign({}, p, { title: p.title + " (copy)", status: "draft", published: false });
+      delete copy2.id;
+      const { error } = await window.PBData.savePost(copy2);
+      if (error) { alert("Duplicate failed: " + error.message); return; }
+      load();
+    };
+    const statusOf = (p) => p.status || (p.published ? "published" : "draft");
+
+    // KPI counts
+    const kpi = {
+      total: items.length,
+      published: items.filter((p) => statusOf(p) === "published").length,
+      drafts: items.filter((p) => statusOf(p) === "draft").length,
+      scheduled: items.filter((p) => statusOf(p) === "scheduled").length,
+      press: items.filter((p) => p.category === "press").length,
+      views: items.reduce((s, p) => s + (p.views || 0), 0),
+    };
+
+    const listFor = (mode) => items.filter((p) => {
+      if (mode === "drafts" && statusOf(p) !== "draft") return false;
+      if (mode === "scheduled" && statusOf(p) !== "scheduled") return false;
+      if (mode === "press" && p.category !== "press") return false;
+      if (mode === "all" && fStatus !== "all" && statusOf(p) !== fStatus) return false;
+      if (q && !(p.title || "").toLowerCase().includes(q.toLowerCase())) return false;
+      return true;
+    });
+
+    const renderRow = (p) => {
+      const sm = newsStatusMeta(statusOf(p));
       return (
-        <div className="adm-pane">
-          <h2 className="adm-h2">{editing.id ? "Edit post" : "New post / press release"}</h2>
-          <div className="adm-edit-tabs">
-            <button className={!preview ? "is-active" : ""} onClick={() => setPreview(false)}>✎ Edit</button>
-            <button className={preview ? "is-active" : ""} onClick={() => setPreview(true)}>👁 Preview</button>
+        <div key={p.id} className="adm-item">
+          <div className="adm-item-av adm-item-av-wide">{p.cover_url ? <img src={p.cover_url} alt="" /> : <span>{p.category === "press" ? "PR" : "N"}</span>}</div>
+          <div className="adm-item-main">
+            <strong>{p.title} {p.featured && <span className="adm-star" title="Featured">★</span>}</strong>
+            <span><span className={"adm-status " + sm.cls}>{sm.label}</span> · {p.category === "press" ? "Press" : "News"}{p.author ? " · " + p.author : ""}</span>
           </div>
-          {preview ? (
-            <div className="adm-post-preview">
-              <span className="adm-preview-tag is-dirty" style={{ marginBottom: 12, display: "inline-block" }}>Preview — {editing.published ? "will be published" : "draft (not visible yet)"}</span>
-              <article className="pb-post" style={{ maxWidth: 460 }}>
-                {editing.cover_url && <div className="pb-post-cover"><img src={editing.cover_url} alt="" /></div>}
-                <div className="pb-post-body">
-                  <div className="pb-post-meta">
-                    {editing.category === "press" && <span className="pb-post-tag">Press</span>}
-                    <time>{new Date().toLocaleDateString("en-GB", { year: "numeric", month: "short", day: "numeric" })}</time>
-                  </div>
-                  <h3>{editing.title || "Untitled post"}</h3>
-                  {editing.summary && <p className="pb-post-summary">{editing.summary}</p>}
-                  {editing.body && <div className="pb-post-content">{editing.body.split("\n").filter(Boolean).map((para, i) => <p key={i}>{para}</p>)}</div>}
-                </div>
-              </article>
-            </div>
-          ) : (
-          <>
-          <AdmField label="Type">
-            <select value={editing.category} onChange={(e) => setEditing(Object.assign({}, editing, { category: e.target.value }))}>
-              <option value="news">News</option><option value="press">Press Release</option>
-            </select>
-          </AdmField>
-          <AdmField label="Cover image"><AdmDrop value={editing.cover_url} folder="posts" onUpload={(url) => setEditing(Object.assign({}, editing, { cover_url: url }))} /></AdmField>
-          <AdmField label="Title"><input value={editing.title} onChange={(e) => setEditing(Object.assign({}, editing, { title: e.target.value }))} placeholder="Headline…" /></AdmField>
-          <AdmField label="Summary"><textarea rows={2} value={editing.summary || ""} onChange={(e) => setEditing(Object.assign({}, editing, { summary: e.target.value }))} /></AdmField>
-          <AdmField label="Body"><textarea rows={8} value={editing.body || ""} onChange={(e) => setEditing(Object.assign({}, editing, { body: e.target.value }))} placeholder="Separate paragraphs with a blank line." /></AdmField>
-          <label className="adm-check"><input type="checkbox" checked={!!editing.published} onChange={(e) => setEditing(Object.assign({}, editing, { published: e.target.checked }))} /> Published (visible on the site)</label>
-          </>
-          )}
-          <div className="adm-row"><button className="adm-btn adm-btn-primary" onClick={save}>Save</button><button className="adm-btn" onClick={() => setEditing(null)}>Cancel</button></div>
+          <div className="adm-row">
+            <button className="adm-btn adm-sm" onClick={() => goEdit(p)}>Edit</button>
+            <button className="adm-btn adm-sm" onClick={() => dup(p)}>Duplicate</button>
+            <button className="adm-btn adm-sm adm-danger" onClick={() => del(p.id)}>Delete</button>
+          </div>
         </div>
       );
-    }
+    };
+
+    const renderListView = (mode, title, empty) => {
+      const rows = listFor(mode);
+      return (
+        <div className="adm-pane">
+          <div className="adm-toolbar"><h2 className="adm-h2">{title}</h2><button className="adm-btn adm-btn-primary" onClick={() => goEdit(null)}>+ Create news</button></div>
+          <div className="adm-row" style={{ marginBottom: 14, flexWrap: "wrap" }}>
+            <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search title…" style={{ maxWidth: 260 }} />
+            {mode === "all" && (
+              <select value={fStatus} onChange={(e) => setFStatus(e.target.value)} style={{ maxWidth: 180 }}>
+                <option value="all">All statuses</option>
+                {NEWS_STATUS.map((s) => <option key={s.v} value={s.v}>{s.label}</option>)}
+              </select>
+            )}
+          </div>
+          {loading ? <p className="adm-muted">Loading…</p> : rows.length === 0 ? <p className="adm-muted">{empty}</p> : rows.map((p) => renderRow(p))}
+        </div>
+      );
+    };
+
+    if (sub === "edit") return <AdmNewsEditor initial={editing} onSaved={() => { setSub("all"); load(); }} onCancel={() => setSub(editing && editing.id ? "all" : "dash")} />;
+
     return (
-      <div className="adm-pane">
-        <div className="adm-toolbar"><h2 className="adm-h2">Posts & press releases</h2><button className="adm-btn adm-btn-primary" onClick={newPost}>+ New post</button></div>
-        {loading ? <p className="adm-muted">Loading…</p> : (
-          items.length === 0 ? <p className="adm-muted">No posts yet. Click “New post”.</p> :
-          items.map((p) => (
-            <div key={p.id} className="adm-item">
-              <div className="adm-item-av adm-item-av-wide">{p.cover_url ? <img src={p.cover_url} alt="" /> : <span>{p.category === "press" ? "PR" : "N"}</span>}</div>
-              <div className="adm-item-main"><strong>{p.title}{p.published ? "" : " (draft)"}</strong><span>{p.category === "press" ? "Press Release" : "News"} · {p.summary || ""}</span></div>
-              <div className="adm-row"><button className="adm-btn adm-sm" onClick={() => { setPreview(false); setEditing(p); }}>Edit</button><button className="adm-btn adm-sm adm-danger" onClick={() => del(p.id)}>Delete</button></div>
+      <div>
+        <div className="adm-subnav">
+          {NEWS_SUBNAV.map((n) => <button key={n.id} className={sub === n.id ? "is-active" : ""} onClick={() => { if (n.id === "edit") goEdit(null); else setSub(n.id); }}>{n.label}</button>)}
+        </div>
+
+        {sub === "dash" && (
+          <div className="adm-pane">
+            <div className="adm-toolbar"><h2 className="adm-h2">News &amp; Press — overview</h2><button className="adm-btn adm-btn-primary" onClick={() => goEdit(null)}>+ Create news</button></div>
+            <div className="adm-kpi-row">
+              <div className="adm-kpi"><span>{kpi.total}</span><em>Total news</em></div>
+              <div className="adm-kpi is-ok"><span>{kpi.published}</span><em>Published</em></div>
+              <div className="adm-kpi"><span>{kpi.drafts}</span><em>Drafts</em></div>
+              <div className="adm-kpi"><span>{kpi.scheduled}</span><em>Scheduled</em></div>
+              <div className="adm-kpi"><span>{kpi.press}</span><em>Press releases</em></div>
+              <div className="adm-kpi"><span>{kpi.views.toLocaleString()}</span><em>Total views</em></div>
             </div>
-          ))
+            <div className="adm-set-card">
+              <h3 className="adm-set-h">Recent articles</h3>
+              {loading ? <p className="adm-muted">Loading…</p> : items.length === 0 ? <p className="adm-muted">No articles yet — click “Create news”.</p> :
+                items.slice(0, 6).map((p) => renderRow(p))}
+            </div>
+          </div>
         )}
+        {sub === "all" && renderListView("all", "All news", "No articles match.")}
+        {sub === "drafts" && renderListView("drafts", "Drafts", "No drafts.")}
+        {sub === "scheduled" && renderListView("scheduled", "Scheduled posts", "Nothing scheduled.")}
+        {sub === "press" && renderListView("press", "Press releases", "No press releases.")}
+        {sub === "media" && <AdmMediaLibrary />}
+        {sub === "tax" && <AdmNewsTaxonomy />}
+        {sub === "seo" && (
+          <div className="adm-pane">
+            <div className="adm-toolbar"><h2 className="adm-h2">SEO overview</h2></div>
+            <p className="adm-muted" style={{ marginTop: 0 }}>Each article has its own SEO title, meta description, keywords, slug and social image (open an article → SEO tab). Rows below flag articles still missing SEO basics.</p>
+            {items.map((p) => {
+              const ok = (p.seo_title || p.title) && p.seo_desc;
+              return <div key={p.id} className="adm-set-kv"><span>{p.title}</span><strong style={{ color: ok ? "var(--pb-secondary-700)" : "#c0392b" }}>{ok ? "✓ SEO set" : "⚠ Needs meta description"}</strong></div>;
+            })}
+          </div>
+        )}
+        {sub === "analytics" && <AdmNewsAnalytics items={items} />}
       </div>
     );
   }
@@ -7721,7 +8308,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
     const VIEWS = {
       overview: <AdmOverview go={go} />, branding: <AdmBranding />, logos: <AdmLogos />, hero: <AdmHero />,
-      pages: <AdmPages />, services: <AdmServices />, team: <AdmTeam />, posts: <AdmPosts />, atms: <AdmAtms />, footer: <AdmFooter />, settings: <AdmSettings session={session} />,
+      pages: <AdmPages />, services: <AdmServices />, team: <AdmTeam />, posts: <AdmNews />, atms: <AdmAtms />, footer: <AdmFooter />, settings: <AdmSettings session={session} />,
       accounts: <AdmAccounts />, cards: <AdmCards />, values: <AdmValues />, stats: <AdmStats />, rates: <AdmRates />, testimonials: <AdmTestimonials />, faq: <AdmFaq />,
     };
     return (
