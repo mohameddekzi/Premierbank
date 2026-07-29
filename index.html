@@ -7002,6 +7002,56 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
     press: { org: "Premier Bank", location: "", contact: "", email: "", phone: "", pdf_url: "" },
   });
 
+  /* Open a WordPress-style live preview of a post in a NEW browser tab, with device toggles. */
+  function openNewsPreview(p) {
+    const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    const bodyHtml = /[<][a-z]/i.test(p.body || "") ? (p.body || "") : (p.body || "").split("\n").filter(Boolean).map((x) => "<p>" + esc(x) + "</p>").join("");
+    const gal = (p.gallery || []).map((g) => '<figure><img src="' + esc(g.url) + '"/>' + (g.caption ? "<figcaption>" + esc(g.caption) + "</figcaption>" : "") + "</figure>").join("");
+    const tags = (p.tags || []).map((t) => "<span>#" + esc(t) + "</span>").join("");
+    const today = new Date().toLocaleDateString("en-GB", { year: "numeric", month: "short", day: "numeric" });
+    const doc =
+      '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+      "<title>Preview — " + esc(p.title || "Untitled") + "</title>" +
+      "<style>" +
+      ":root{--nv:#0b2f4f;--gr:#6cbe46;--mut:#5b6b7b;--ln:#e6e9ee}" +
+      "*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:#eef1f4;color:#12212f}" +
+      ".bar{position:sticky;top:0;display:flex;align-items:center;gap:10px;justify-content:center;background:var(--nv);color:#fff;padding:10px;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.15);z-index:5}" +
+      ".bar b{margin-right:auto;padding-left:8px;font-weight:600}" +
+      ".bar button{border:1px solid rgba(255,255,255,.3);background:transparent;color:#fff;border-radius:7px;padding:5px 12px;cursor:pointer;font-size:13px}" +
+      ".bar button.on{background:var(--gr);border-color:var(--gr);color:#06340a;font-weight:600}" +
+      ".stage{padding:26px 16px;display:flex;justify-content:center}" +
+      ".frame{width:100%;max-width:760px;background:#fff;border:1px solid var(--ln);border-radius:16px;overflow:hidden;transition:max-width .25s ease;box-shadow:0 18px 50px rgba(11,47,79,.10)}" +
+      ".cover img{width:100%;display:block;aspect-ratio:16/9;object-fit:cover}" +
+      ".pad{padding:30px 34px 40px}" +
+      ".meta{display:flex;gap:10px;align-items:center;font-size:13px;color:var(--mut);margin-bottom:12px}" +
+      ".pr{background:#e9f4e0;color:#3c6a1f;font-weight:600;padding:2px 8px;border-radius:6px;text-transform:uppercase;font-size:11px;letter-spacing:.04em}" +
+      "h1{font-size:30px;line-height:1.2;margin:0 0 12px}" +
+      ".sum{font-size:17px;color:var(--mut);line-height:1.5;margin:0 0 20px}" +
+      ".content{font-size:16px;line-height:1.7}.content h2{font-size:22px;margin:22px 0 8px}.content h3{font-size:18px;margin:18px 0 6px}" +
+      ".content img{max-width:100%;border-radius:10px;margin:10px 0}.content blockquote{border-left:3px solid var(--gr);margin:14px 0;padding:6px 16px;color:var(--mut)}" +
+      ".gal{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:18px}.gal figure{margin:0}.gal img{width:100%;border-radius:10px}.gal figcaption{font-size:13px;color:var(--mut);margin-top:5px}" +
+      ".tags{display:flex;flex-wrap:wrap;gap:7px;margin-top:20px}.tags span{font-size:13px;background:#e9f4e0;color:#3c6a1f;padding:3px 9px;border-radius:6px}" +
+      "</style></head><body>" +
+      '<div class="bar"><b>Live preview' + (p.status ? " — " + esc((newsStatusMeta(p.status).label)) : "") + '</b>' +
+      '<button data-w="1100" class="on" onclick="setW(this,1100)">🖥 Desktop</button>' +
+      '<button data-w="768" onclick="setW(this,768)">▭ Tablet</button>' +
+      '<button data-w="390" onclick="setW(this,390)">▯ Mobile</button></div>' +
+      '<div class="stage"><article class="frame" id="fr">' +
+      (p.cover_url ? '<div class="cover"><img src="' + esc(p.cover_url) + '"/></div>' : "") +
+      '<div class="pad"><div class="meta">' + (p.category === "press" ? '<span class="pr">Press</span>' : "") + "<time>" + today + "</time>" + (p.author ? "<span>· " + esc(p.author) + "</span>" : "") + "</div>" +
+      "<h1>" + esc(p.title || "Untitled article") + "</h1>" +
+      (p.summary ? '<p class="sum">' + esc(p.summary) + "</p>" : "") +
+      '<div class="content">' + bodyHtml + "</div>" +
+      (gal ? '<div class="gal">' + gal + "</div>" : "") +
+      (tags ? '<div class="tags">' + tags + "</div>" : "") +
+      "</div></article></div>" +
+      "<script>function setW(b,w){document.getElementById('fr').style.maxWidth=w+'px';document.querySelectorAll('.bar button').forEach(function(x){x.classList.remove('on')});b.classList.add('on')}<\/script>" +
+      "</body></html>";
+    const w = window.open("", "pb_news_preview");
+    if (!w) { alert("Please allow pop-ups to open the live preview."); return; }
+    w.document.open(); w.document.write(doc); w.document.close();
+  }
+
   /* ---- The article editor ---- */
   function AdmNewsEditor({ initial, onSaved, onCancel }) {
     const [p, setP] = uS(() => Object.assign(blankPost(), initial || {}, {
@@ -7036,55 +7086,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 
     const TABS = [["content", "Content"], ["media", "Media"], ["seo", "SEO"], ["langs", "Languages"], ...(p.category === "press" ? [["press", "Press release"]] : []), ["publish", "Publish"]];
 
-    // Open a WordPress-style live preview in a NEW browser tab, with device toggles.
-    const openPreview = () => {
-      const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-      const bodyHtml = /[<][a-z]/i.test(p.body || "") ? (p.body || "") : (p.body || "").split("\n").filter(Boolean).map((x) => "<p>" + esc(x) + "</p>").join("");
-      const gal = (p.gallery || []).map((g) => '<figure><img src="' + esc(g.url) + '"/>' + (g.caption ? "<figcaption>" + esc(g.caption) + "</figcaption>" : "") + "</figure>").join("");
-      const tags = (p.tags || []).map((t) => "<span>#" + esc(t) + "</span>").join("");
-      const today = new Date().toLocaleDateString("en-GB", { year: "numeric", month: "short", day: "numeric" });
-      const doc =
-        '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
-        "<title>Preview — " + esc(p.title || "Untitled") + "</title>" +
-        "<style>" +
-        ":root{--nv:#0b2f4f;--gr:#6cbe46;--mut:#5b6b7b;--ln:#e6e9ee}" +
-        "*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:#eef1f4;color:#12212f}" +
-        ".bar{position:sticky;top:0;display:flex;align-items:center;gap:10px;justify-content:center;background:var(--nv);color:#fff;padding:10px;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.15);z-index:5}" +
-        ".bar b{margin-right:auto;padding-left:8px;font-weight:600}" +
-        ".bar button{border:1px solid rgba(255,255,255,.3);background:transparent;color:#fff;border-radius:7px;padding:5px 12px;cursor:pointer;font-size:13px}" +
-        ".bar button.on{background:var(--gr);border-color:var(--gr);color:#06340a;font-weight:600}" +
-        ".stage{padding:26px 16px;display:flex;justify-content:center}" +
-        ".frame{width:100%;max-width:760px;background:#fff;border:1px solid var(--ln);border-radius:16px;overflow:hidden;transition:max-width .25s ease;box-shadow:0 18px 50px rgba(11,47,79,.10)}" +
-        ".cover img{width:100%;display:block;aspect-ratio:16/9;object-fit:cover}" +
-        ".pad{padding:30px 34px 40px}" +
-        ".meta{display:flex;gap:10px;align-items:center;font-size:13px;color:var(--mut);margin-bottom:12px}" +
-        ".pr{background:#e9f4e0;color:#3c6a1f;font-weight:600;padding:2px 8px;border-radius:6px;text-transform:uppercase;font-size:11px;letter-spacing:.04em}" +
-        "h1{font-size:30px;line-height:1.2;margin:0 0 12px}" +
-        ".sum{font-size:17px;color:var(--mut);line-height:1.5;margin:0 0 20px}" +
-        ".content{font-size:16px;line-height:1.7}.content h2{font-size:22px;margin:22px 0 8px}.content h3{font-size:18px;margin:18px 0 6px}" +
-        ".content img{max-width:100%;border-radius:10px;margin:10px 0}.content blockquote{border-left:3px solid var(--gr);margin:14px 0;padding:6px 16px;color:var(--mut)}" +
-        ".gal{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:18px}.gal figure{margin:0}.gal img{width:100%;border-radius:10px}.gal figcaption{font-size:13px;color:var(--mut);margin-top:5px}" +
-        ".tags{display:flex;flex-wrap:wrap;gap:7px;margin-top:20px}.tags span{font-size:13px;background:#e9f4e0;color:#3c6a1f;padding:3px 9px;border-radius:6px}" +
-        "</style></head><body>" +
-        '<div class="bar"><b>Live preview — not saved yet</b>' +
-        '<button data-w="1100" class="on" onclick="setW(this,1100)">🖥 Desktop</button>' +
-        '<button data-w="768" onclick="setW(this,768)">▭ Tablet</button>' +
-        '<button data-w="390" onclick="setW(this,390)">▯ Mobile</button></div>' +
-        '<div class="stage"><article class="frame" id="fr">' +
-        (p.cover_url ? '<div class="cover"><img src="' + esc(p.cover_url) + '"/></div>' : "") +
-        '<div class="pad"><div class="meta">' + (p.category === "press" ? '<span class="pr">Press</span>' : "") + "<time>" + today + "</time>" + (p.author ? "<span>· " + esc(p.author) + "</span>" : "") + "</div>" +
-        "<h1>" + esc(p.title || "Untitled article") + "</h1>" +
-        (p.summary ? '<p class="sum">' + esc(p.summary) + "</p>" : "") +
-        '<div class="content">' + bodyHtml + "</div>" +
-        (gal ? '<div class="gal">' + gal + "</div>" : "") +
-        (tags ? '<div class="tags">' + tags + "</div>" : "") +
-        "</div></article></div>" +
-        "<script>function setW(b,w){document.getElementById('fr').style.maxWidth=w+'px';document.querySelectorAll('.bar button').forEach(function(x){x.classList.remove('on')});b.classList.add('on')}<\/script>" +
-        "</body></html>";
-      const w = window.open("", "pb_news_preview");
-      if (!w) { alert("Please allow pop-ups to open the live preview."); return; }
-      w.document.open(); w.document.write(doc); w.document.close();
-    };
+    const openPreview = () => openNewsPreview(p);
 
     return (
       <div className="adm-pane">
@@ -7397,6 +7399,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
           <div className="adm-row">
             <button className="adm-btn adm-sm" onClick={() => goEdit(p)}>Edit</button>
             <button className="adm-btn adm-sm" onClick={() => dup(p)}>Duplicate</button>
+            <button className="adm-btn adm-sm" onClick={() => openNewsPreview(p)}>Preview</button>
             <button className="adm-btn adm-sm adm-danger" onClick={() => del(p.id)}>Delete</button>
           </div>
         </div>
