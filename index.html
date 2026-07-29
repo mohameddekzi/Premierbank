@@ -2830,6 +2830,48 @@ const ICON_PATHS = {
       <circle cx="12" cy="9" r="2.5" />
     </g>
   ),
+  eye: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" />
+      <circle cx="12" cy="12" r="3" />
+    </g>
+  ),
+  eyeOff: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9.9 5.2A9.5 9.5 0 0112 5c6.5 0 10 7 10 7a17 17 0 01-3 3.8M6.1 6.1A17 17 0 002 12s3.5 7 10 7a9.3 9.3 0 004.1-.9" />
+      <path d="M9.9 9.9a3 3 0 004.2 4.2" />
+      <path d="M3 3l18 18" />
+    </g>
+  ),
+  link: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M10 13a5 5 0 007.1 0l2-2a5 5 0 00-7.1-7.1l-1.2 1.2" />
+      <path d="M14 11a5 5 0 00-7.1 0l-2 2a5 5 0 007.1 7.1l1.2-1.2" />
+    </g>
+  ),
+  image: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <circle cx="8.5" cy="9" r="1.6" />
+      <path d="M21 16l-5-5-9 9" />
+    </g>
+  ),
+  warn: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 3l9.5 16.5H2.5L12 3z" />
+      <path d="M12 10v4M12 17.5v.5" />
+    </g>
+  ),
+  quote: (
+    <g fill="currentColor" stroke="none">
+      <path d="M7 7c-2 0-3.5 1.6-3.5 3.6S5 14 6.7 14c.3 0 .6 0 .8-.1-.3 1.3-1.4 2.4-2.7 2.8l.7 1.3c2.4-.8 4-3 4-5.6V10.5C9.2 8.5 8.3 7 7 7zM16 7c-2 0-3.5 1.6-3.5 3.6S14 14 15.7 14c.3 0 .6 0 .8-.1-.3 1.3-1.4 2.4-2.7 2.8l.7 1.3c2.4-.8 4-3 4-5.6V10.5C18.2 8.5 17.3 7 16 7z" />
+    </g>
+  ),
+  bold: (
+    <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M7 5h6a3.5 3.5 0 010 7H7zM7 12h7a3.5 3.5 0 010 7H7z" />
+    </g>
+  ),
 };
 
 /* -------------------------------------------------------------------------- */
@@ -6046,7 +6088,7 @@ function AtmDirectory({ atms, lang }) {
               {a.region && <span className="pb-atm-region">{a.region}</span>}
               <h3>{a.location}</h3>
               {a.number && <p className="pb-atm-num">{lang === "en" ? "ATM #" : "ATM #"}{a.number}</p>}
-              {(a.lat && a.lng) && <p className="pb-atm-coords">📍 {a.lat}, {a.lng}</p>}
+              {(a.lat && a.lng) && <p className="pb-atm-coords"><Icon name="pin" size={13} /> {a.lat}, {a.lng}</p>}
               <a className="pb-atm-link" href={mapsHref(a)} target="_blank" rel="noopener">{lang === "en" ? "Open in Maps →" : "Fur Maps →"}</a>
             </div>
           </div>
@@ -6965,7 +7007,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
               ))}
             </div>
             <div className="adm-statusbar-actions">
-              <button className="adm-btn adm-sm" onClick={previewMember}>👁 Preview</button>
+              <button className="adm-btn adm-sm" onClick={previewMember}><Icon name="eye" size={15} /> Preview</button>
               <button className="adm-btn adm-sm" disabled={busy} onClick={() => save("draft")}>Save draft</button>
               <button className="adm-btn adm-btn-primary adm-sm" disabled={busy} onClick={() => save("published")}>Publish</button>
             </div>
@@ -7053,7 +7095,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
         </div>
 
         {(loading || syncing) ? (
-          <p className="adm-muted">{syncing ? "⏳ Syncing website data…" : "Loading…"}</p>
+          <p className="adm-muted">{syncing ? "Syncing website data…" : "Loading…"}</p>
         ) : shown.length === 0 ? (
           <p className="adm-muted">{items.length === 0 ? 'No members yet. Click "+ Add member".' : "No members match."}</p>
         ) : sub === "all" ? (
@@ -7126,13 +7168,13 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
           <B on="bold" title="Bold"><b>B</b></B>
           <B on="italic" title="Italic"><i>I</i></B>
           <B on="underline" title="Underline"><u>U</u></B>
-          <B blk="BLOCKQUOTE" title="Quote">❝</B>
+          <B blk="BLOCKQUOTE" title="Quote"><Icon name="quote" size={16} /></B>
           <span className="adm-rt-div" />
           <B on="insertUnorderedList" title="Bullet list">• List</B>
           <B on="insertOrderedList" title="Numbered list">1. List</B>
           <span className="adm-rt-div" />
-          <button type="button" className="adm-rt-btn" onMouseDown={(e) => e.preventDefault()} onClick={addLink} title="Insert link">🔗</button>
-          <button type="button" className="adm-rt-btn" onMouseDown={(e) => e.preventDefault()} onClick={addImage} title="Insert image">🖼</button>
+          <button type="button" className="adm-rt-btn" onMouseDown={(e) => e.preventDefault()} onClick={addLink} title="Insert link"><Icon name="link" size={16} /></button>
+          <button type="button" className="adm-rt-btn" onMouseDown={(e) => e.preventDefault()} onClick={addImage} title="Insert image"><Icon name="image" size={16} /></button>
         </div>
         <div ref={ref} className="adm-rt-area" contentEditable suppressContentEditableWarning onInput={sync} onBlur={sync} />
       </div>
@@ -7219,9 +7261,9 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
       ".tags{display:flex;flex-wrap:wrap;gap:7px;margin-top:20px}.tags span{font-size:13px;background:#e9f4e0;color:#3c6a1f;padding:3px 9px;border-radius:6px}" +
       "</style></head><body>" +
       '<div class="bar"><b>Live preview' + (p.status ? " — " + esc((newsStatusMeta(p.status).label)) : "") + '</b>' +
-      '<button data-w="1100" class="on" onclick="setW(this,1100)">🖥 Desktop</button>' +
-      '<button data-w="768" onclick="setW(this,768)">▭ Tablet</button>' +
-      '<button data-w="390" onclick="setW(this,390)">▯ Mobile</button></div>' +
+      '<button data-w="1100" class="on" onclick="setW(this,1100)">Desktop</button>' +
+      '<button data-w="768" onclick="setW(this,768)">Tablet</button>' +
+      '<button data-w="390" onclick="setW(this,390)">Mobile</button></div>' +
       '<div class="stage"><article class="frame" id="fr">' +
       (p.cover_url ? '<div class="cover"><img src="' + esc(p.cover_url) + '"/></div>' : "") +
       '<div class="pad"><div class="meta">' + (p.category === "press" ? '<span class="pr">Press</span>' : "") + "<time>" + today + "</time>" + (p.author ? "<span>· " + esc(p.author) + "</span>" : "") + "</div>" +
@@ -7296,7 +7338,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
             <input type="datetime-local" className="adm-statusbar-dt" value={p.publish_at ? String(p.publish_at).slice(0, 16) : ""} onChange={(e) => set({ publish_at: e.target.value ? new Date(e.target.value).toISOString() : null })} />
           )}
           <div className="adm-statusbar-actions">
-            <button className="adm-btn adm-sm" onClick={openPreview}>👁 Preview</button>
+            <button className="adm-btn adm-sm" onClick={openPreview}><Icon name="eye" size={15} /> Preview</button>
             <button className="adm-btn adm-sm" disabled={busy} onClick={() => persist("draft")}>Save draft</button>
             <button className="adm-btn adm-btn-primary adm-sm" disabled={busy} onClick={() => persist("published")}>Publish</button>
           </div>
@@ -7583,7 +7625,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
         <div key={p.id} className="adm-item">
           <div className="adm-item-av adm-item-av-wide">{p.cover_url ? <img src={p.cover_url} alt="" /> : <span>{p.category === "press" ? "PR" : "N"}</span>}</div>
           <div className="adm-item-main">
-            <strong>{p.title} {p.featured && <span className="adm-star" title="Featured">★</span>}</strong>
+            <strong>{p.title} {p.featured && <span className="adm-star" title="Featured"><Icon name="star" size={13} /></span>}</strong>
             <span><span className={"adm-status " + sm.cls}>{sm.label}</span> · {p.category === "press" ? "Press" : "News"}{p.author ? " · " + p.author : ""}</span>
           </div>
           <div className="adm-row">
@@ -7951,7 +7993,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
           <button className="adm-btn adm-btn-primary" onClick={runStorageTest} disabled={testing}>{testing ? "Testing…" : "Run storage test"}</button>
           {diag && (
             <div className={"adm-diag " + (diag.ok ? "ok" : "bad")}>
-              {diag.ok ? "✅ " : "❌ "}{diag.msg}
+              {diag.ok ? <Icon name="check" size={15} /> : <Icon name="close" size={15} />} {diag.msg}
               {!diag.ok && diag.step === "upload" && /bucket/i.test(diag.msg) && (
                 <div className="adm-diag-fix">Fix: Supabase → Storage → create a bucket named <code>media</code> and turn ON “Public bucket”. Or run in SQL editor:<br /><code>insert into storage.buckets (id,name,public) values ('media','media',true) on conflict (id) do update set public=true;</code></div>
               )}
@@ -8029,7 +8071,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
               <input type={showPw ? "text" : "password"} value={pw} onChange={(e) => setPw(e.target.value)} style={{ flex: 1, paddingRight: 36 }} />
               <button type="button" onClick={() => setShowPw(!showPw)}
                 style={{ position: "absolute", right: 8, background: "none", border: "none", cursor: "pointer", fontSize: 16, color: "var(--pb-muted)", padding: 0 }}>
-                {showPw ? "🙈" : "👁"}
+                {showPw ? <Icon name="eyeOff" size={16} /> : <Icon name="eye" size={16} />}
               </button>
             </div>
           </AdmField>
@@ -8110,7 +8152,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
             )}
 
             {mode === "error" && (
-              <div className="adm-up-err" style={{ marginTop: 16 }}>⚠️ {err || "Something went wrong."}</div>
+              <div className="adm-up-err" style={{ marginTop: 16 }}><Icon name="warn" size={15} /> {err || "Something went wrong."}</div>
             )}
 
             {mode === "enroll" && (
@@ -8144,7 +8186,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
                 <button className="adm-btn adm-btn-primary adm-btn-block" onClick={verify} disabled={verifying} style={{ marginTop: 8 }}>
                   {verifying ? "Verifying…" : (mode === "enroll" ? "Activate & sign in" : "Verify & sign in")}
                 </button>
-                {err && <div className="adm-up-err" style={{ marginTop: 10 }}>⚠️ {err}</div>}
+                {err && <div className="adm-up-err" style={{ marginTop: 10 }}><Icon name="warn" size={15} /> {err}</div>}
               </>
             )}
           </div>
@@ -8564,7 +8606,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
           </aside>
           <main className="adm-main">
             <header className="adm-main-head">
-              <button className="adm-burger" onClick={() => setMenuOpen(!menuOpen)}>☰</button>
+              <button className="adm-burger" onClick={() => setMenuOpen(!menuOpen)}><Icon name="menu" size={20} /></button>
               <span className="adm-crumb">{(NAV.find((n) => n.id === view) || {}).label}</span>
               <button className="adm-btn adm-sm" onClick={close}>Close ✕</button>
             </header>
