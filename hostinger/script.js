@@ -1,0 +1,7452 @@
+/**
+ * <image-slot> — user-fillable image placeholder.
+ *
+ * Drop this into a deck, mockup, or page wherever you want the user to
+ * supply an image. You control the slot's shape and size; the user fills it
+ * by dragging an image file onto it (or clicking to browse). The dropped
+ * image persists across reloads via a .image-slots.state.json sidecar —
+ * same read-via-fetch / write-via-window.omelette pattern as
+ * design_canvas.jsx, so the filled slot shows on share links, downloaded
+ * zips, and PPTX export. Outside the omelette runtime the slot is read-only.
+ *
+ * The host bridge only allows sidecar writes at the project root, so the
+ * HTML that uses this component is assumed to live at the project root too
+ * (same constraint as design_canvas.jsx).
+ *
+ * Attributes:
+ *   id           Persistence key. REQUIRED for the drop to survive reload —
+ *                every slot on the page needs a distinct id.
+ *   shape        'rect' | 'rounded' | 'circle' | 'pill'   (default 'rounded')
+ *                'circle' applies 50% border-radius; on a non-square slot
+ *                that's an ellipse — set equal width and height for a true
+ *                circle.
+ *   radius       Corner radius in px for 'rounded'.       (default 12)
+ *   mask         Any CSS clip-path value. Overrides `shape` — use this for
+ *                hexagons, blobs, arbitrary polygons.
+ *   fit          object-fit: cover | contain | fill.       (default 'cover')
+ *                With cover (the default) double-clicking the filled slot
+ *                enters a reframe mode: the whole image spills past the mask
+ *                (translucent outside, opaque inside), drag to reposition,
+ *                corner-drag to scale. The crop persists alongside the image
+ *                in the sidecar. contain/fill stay static.
+ *   position     object-position for fit=contain|fill.     (default '50% 50%')
+ *   placeholder  Empty-state caption.                      (default 'Drop an image')
+ *   src          Optional initial/fallback image URL. A user drop overrides
+ *                it; clearing the drop reveals src again.
+ *
+ * Size and layout come from ordinary CSS on the element — width/height
+ * inline or from a parent grid — so it composes with any layout.
+ *
+ * Usage:
+ *   <script src="image-slot.js"><\/script>
+ *   <image-slot id="hero"   style="width:800px;height:450px" shape="rounded" radius="20"
+ *               placeholder="Drop a hero image"></image-slot>
+ *   <image-slot id="avatar" style="width:120px;height:120px" shape="circle"></image-slot>
+ *   <image-slot id="kite"   style="width:300px;height:300px"
+ *               mask="polygon(50% 0, 100% 50%, 50% 100%, 0 50%)"></image-slot>
+ */
+
+(() => {
+  const STATE_FILE = '.image-slots.state.json';
+  // 2× a ~600px slot in a 1920-wide deck — retina-sharp without making the
+  // sidecar enormous. A 1200px WebP at q=0.85 is ~150-300KB.
+  const MAX_DIM = 1200;
+  // Raster formats only. SVG is excluded (can carry script; createImageBitmap
+  // on SVG blobs is inconsistent). GIF is excluded because the canvas
+  // re-encode keeps only the first frame, so an animated GIF would silently
+  // go still — better to reject than surprise.
+  const ACCEPT = ['image/png', 'image/jpeg', 'image/webp', 'image/avif'];
+
+  // ── Shared sidecar store ────────────────────────────────────────────────
+  // One fetch + immediate write-on-change for every <image-slot> on the
+  // page. Reads via fetch() so viewing works anywhere the HTML and sidecar
+  // are served together; writes go through window.omelette.writeFile, which
+  // the host allowlists to *.state.json basenames only.
+  const subs = new Set();
+  let slots = {};
+  // ids explicitly cleared before the sidecar fetch resolved — otherwise
+  // the merge below can't tell "never set" from "just deleted" and would
+  // resurrect the sidecar's stale value.
+  const tombstones = new Set();
+  let loaded = false;
+  let loadP = null;
+
+  function load() {
+    if (loadP) return loadP;
+    loadP = fetch(STATE_FILE)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        // Merge: sidecar loses to any in-memory change that raced ahead of
+        // the fetch (drop or clear) so neither is clobbered by hydration.
+        if (j && typeof j === 'object') {
+          const merged = Object.assign({}, j, slots);
+          // A framing-only write that raced ahead of hydration must not
+          // drop a user image that's only on disk — inherit u from the
+          // sidecar for any in-memory entry that lacks one.
+          for (const k in slots) {
+            if (merged[k] && !merged[k].u && j[k]) {
+              merged[k].u = typeof j[k] === 'string' ? j[k] : j[k].u;
+            }
+          }
+          for (const id of tombstones) delete merged[id];
+          slots = merged;
+        }
+        tombstones.clear();
+      })
+      .catch(() => {})
+      .then(() => { loaded = true; subs.forEach((fn) => fn()); });
+    return loadP;
+  }
+
+  // Serialize writes so two near-simultaneous drops on different slots
+  // can't reorder at the backend and leave the sidecar with only the
+  // first. A save requested mid-flight just marks dirty and re-fires on
+  // completion with the then-current slots.
+  let saving = false;
+  let saveDirty = false;
+  function save() {
+    if (saving) { saveDirty = true; return; }
+    const w = window.omelette && window.omelette.writeFile;
+    if (!w) return;
+    saving = true;
+    Promise.resolve(w(STATE_FILE, JSON.stringify(slots)))
+      .catch(() => {})
+      .then(() => { saving = false; if (saveDirty) { saveDirty = false; save(); } });
+  }
+
+  const S_MAX = 5;
+  const clampS = (s) => Math.max(1, Math.min(S_MAX, s));
+
+  // Normalize a stored slot value. Pre-reframe sidecars stored a bare
+  // data-URL string; newer ones store {u, s, x, y}. Either shape is valid.
+  function getSlot(id) {
+    const v = slots[id];
+    if (!v) return null;
+    return typeof v === 'string' ? { u: v, s: 1, x: 0, y: 0 } : v;
+  }
+
+  function setSlot(id, val) {
+    if (!id) return;
+    if (val) { slots[id] = val; tombstones.delete(id); }
+    else { delete slots[id]; if (!loaded) tombstones.add(id); }
+    subs.forEach((fn) => fn());
+    // A drop is rare + high-value — write immediately so nav-away can't lose
+    // it. Gate on the initial read so we don't overwrite a sidecar we haven't
+    // merged yet; the merge in load() keeps this change once the read lands.
+    if (loaded) save(); else load().then(save);
+  }
+
+  // ── Image downscale ─────────────────────────────────────────────────────
+  // Encode through a canvas so the sidecar carries resized bytes, not the
+  // raw upload. Longest side is capped at 2× the slot's rendered width
+  // (retina) and at MAX_DIM. WebP keeps alpha and is ~10× smaller than PNG
+  // for photos, so there's no need for per-image format picking.
+  async function toDataUrl(file, targetW) {
+    const bitmap = await createImageBitmap(file);
+    try {
+      const cap = Math.min(MAX_DIM, Math.max(1, Math.round(targetW * 2)) || MAX_DIM);
+      const scale = Math.min(1, cap / Math.max(bitmap.width, bitmap.height));
+      const w = Math.max(1, Math.round(bitmap.width * scale));
+      const h = Math.max(1, Math.round(bitmap.height * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
+      return canvas.toDataURL('image/webp', 0.85);
+    } finally {
+      bitmap.close && bitmap.close();
+    }
+  }
+
+  // ── Custom element ──────────────────────────────────────────────────────
+  const stylesheet =
+    ':host{display:inline-block;position:relative;vertical-align:top;' +
+    '  font:13px/1.3 system-ui,-apple-system,sans-serif;color:rgba(0,0,0,.55);width:240px;height:160px}' +
+    '.frame{position:absolute;inset:0;overflow:hidden;background:rgba(0,0,0,.04)}' +
+    // .frame img (clipped) and .spill (unclipped ghost + handles) share the
+    // same left/top/width/height in frame-%, computed by _applyView(), so the
+    // inside-mask crop and the outside-mask spill stay pixel-aligned.
+    '.frame img{position:absolute;max-width:none;transform:translate(-50%,-50%);' +
+    '  -webkit-user-drag:none;user-select:none;touch-action:none}' +
+    // Reframe mode (double-click): the full image spills past the mask. The
+    // spill layer is sized to the IMAGE bounds so its corners are where the
+    // resize handles belong. The ghost <img> inside is translucent; the real
+    // clipped <img> underneath shows the opaque in-mask crop.
+    '.spill{position:absolute;transform:translate(-50%,-50%);display:none;z-index:1;' +
+    '  cursor:grab;touch-action:none}' +
+    ':host([data-panning]) .spill{cursor:grabbing}' +
+    '.spill .ghost{position:absolute;inset:0;width:100%;height:100%;opacity:.35;' +
+    '  pointer-events:none;-webkit-user-drag:none;user-select:none;' +
+    '  box-shadow:0 0 0 1px rgba(0,0,0,.2),0 12px 32px rgba(0,0,0,.2)}' +
+    '.spill .handle{position:absolute;width:12px;height:12px;border-radius:50%;' +
+    '  background:#fff;box-shadow:0 0 0 1.5px #c96442,0 1px 3px rgba(0,0,0,.3);' +
+    '  transform:translate(-50%,-50%)}' +
+    '.spill .handle[data-c=nw]{left:0;top:0;cursor:nwse-resize}' +
+    '.spill .handle[data-c=ne]{left:100%;top:0;cursor:nesw-resize}' +
+    '.spill .handle[data-c=sw]{left:0;top:100%;cursor:nesw-resize}' +
+    '.spill .handle[data-c=se]{left:100%;top:100%;cursor:nwse-resize}' +
+    ':host([data-reframe]){z-index:10}' +
+    ':host([data-reframe]) .spill{display:block}' +
+    ':host([data-reframe]) .frame{box-shadow:0 0 0 2px #c96442}' +
+    '.empty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;' +
+    '  justify-content:center;gap:6px;text-align:center;padding:12px;box-sizing:border-box;' +
+    '  cursor:pointer;user-select:none}' +
+    '.empty svg{opacity:.45}' +
+    '.empty .cap{max-width:90%;font-weight:500;letter-spacing:.01em}' +
+    '.empty .sub{font-size:11px}' +
+    '.empty .sub u{text-underline-offset:2px;text-decoration-color:rgba(0,0,0,.25)}' +
+    '.empty:hover .sub u{color:rgba(0,0,0,.75);text-decoration-color:currentColor}' +
+    ':host([data-over]) .frame{outline:2px solid #c96442;outline-offset:-2px;' +
+    '  background:rgba(201,100,66,.10)}' +
+    '.ring{position:absolute;inset:0;pointer-events:none;border:1.5px dashed rgba(0,0,0,.25);' +
+    '  transition:border-color .12s}' +
+    ':host([data-over]) .ring{border-color:#c96442}' +
+    ':host([data-filled]) .ring{display:none}' +
+    // Controls sit BELOW the mask (top:100%), absolutely positioned so the
+    // author-declared slot height is unaffected. The gap is padding, not a
+    // top offset, so the hover target stays contiguous with the frame.
+    '.ctl{position:absolute;top:100%;left:50%;transform:translateX(-50%);padding-top:8px;' +
+    '  display:flex;gap:6px;opacity:0;pointer-events:none;transition:opacity .12s;z-index:2;' +
+    '  white-space:nowrap}' +
+    ':host([data-filled][data-editable]:hover) .ctl,:host([data-reframe]) .ctl' +
+    '  {opacity:1;pointer-events:auto}' +
+    '.ctl button{appearance:none;border:0;border-radius:6px;padding:5px 10px;cursor:pointer;' +
+    '  background:rgba(0,0,0,.65);color:#fff;font:11px/1 system-ui,-apple-system,sans-serif;' +
+    '  backdrop-filter:blur(6px)}' +
+    '.ctl button:hover{background:rgba(0,0,0,.8)}' +
+    '.err{position:absolute;left:8px;bottom:8px;right:8px;color:#b3261e;font-size:11px;' +
+    '  background:rgba(255,255,255,.85);padding:4px 6px;border-radius:5px;pointer-events:none}';
+
+  const icon =
+    '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">' +
+    '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/>' +
+    '<path d="m21 15-5-5L5 21"/></svg>';
+
+  class ImageSlot extends HTMLElement {
+    static get observedAttributes() {
+      return ['shape', 'radius', 'mask', 'fit', 'position', 'placeholder', 'src', 'id'];
+    }
+
+    constructor() {
+      super();
+      const root = this.attachShadow({ mode: 'open' });
+      // .spill and .ctl sit OUTSIDE .frame so overflow:hidden + border-radius
+      // on the frame (circle, pill, rounded) can't clip them.
+      root.innerHTML =
+        '<style>' + stylesheet + '</style>' +
+        '<div class="frame" part="frame">' +
+        '  <img part="image" alt="" draggable="false" style="display:none">' +
+        '  <div class="empty" part="empty">' + icon +
+        '    <div class="cap"></div>' +
+        '    <div class="sub">or <u>browse files</u></div></div>' +
+        '  <div class="ring" part="ring"></div>' +
+        '</div>' +
+        '<div class="spill">' +
+        '  <img class="ghost" alt="" draggable="false">' +
+        '  <div class="handle" data-c="nw"></div><div class="handle" data-c="ne"></div>' +
+        '  <div class="handle" data-c="sw"></div><div class="handle" data-c="se"></div>' +
+        '</div>' +
+        '<div class="ctl"><button data-act="replace" title="Replace image">Replace</button>' +
+        '  <button data-act="clear" title="Remove image">Remove</button></div>' +
+        '<input type="file" accept="' + ACCEPT.join(',') + '" hidden>';
+      this._frame = root.querySelector('.frame');
+      this._ring = root.querySelector('.ring');
+      this._img = root.querySelector('.frame img');
+      this._empty = root.querySelector('.empty');
+      this._cap = root.querySelector('.cap');
+      this._sub = root.querySelector('.sub');
+      this._spill = root.querySelector('.spill');
+      this._ghost = root.querySelector('.ghost');
+      this._err = null;
+      this._input = root.querySelector('input');
+      this._depth = 0;
+      this._gen = 0;
+      this._view = { s: 1, x: 0, y: 0 };
+      this._subFn = () => this._render();
+      // Shadow-DOM listeners live with the shadow DOM — bound once here so
+      // disconnect/reconnect (e.g. React remount) doesn't stack handlers.
+      this._empty.addEventListener('click', () => this._input.click());
+      root.addEventListener('click', (e) => {
+        const act = e.target && e.target.getAttribute && e.target.getAttribute('data-act');
+        if (act === 'replace') { this._exitReframe(true); this._input.click(); }
+        if (act === 'clear') {
+          this._exitReframe(false);
+          this._gen++;
+          this._local = null;
+          if (this.id) setSlot(this.id, null); else this._render();
+        }
+      });
+      this._input.addEventListener('change', () => {
+        const f = this._input.files && this._input.files[0];
+        if (f) this._ingest(f);
+        this._input.value = '';
+      });
+      // naturalWidth/Height aren't known until load — re-apply so the cover
+      // baseline is computed from real dimensions, not the 100%×100% fallback.
+      this._img.addEventListener('load', () => this._applyView());
+      // Gated on editable + fit=cover so share links and contain/fill slots
+      // stay static.
+      this.addEventListener('dblclick', (e) => {
+        if (!this.hasAttribute('data-editable') || !this._reframes()) return;
+        e.preventDefault();
+        if (this.hasAttribute('data-reframe')) this._exitReframe(true);
+        else this._enterReframe();
+      });
+      // Pan + resize both originate on the spill layer. A handle pointerdown
+      // drives an aspect-locked resize anchored at the opposite corner; any
+      // other pointerdown on the spill pans. Offsets are frame-% so a
+      // reframed slot survives responsive resize / PPTX export.
+      this._spill.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0 || !this.hasAttribute('data-reframe')) return;
+        e.preventDefault();
+        e.stopPropagation();
+        this._spill.setPointerCapture(e.pointerId);
+        const rect = this.getBoundingClientRect();
+        const fw = rect.width || 1, fh = rect.height || 1;
+        const corner = e.target.getAttribute && e.target.getAttribute('data-c');
+        let move;
+        if (corner) {
+          // Resize about the OPPOSITE corner. Viewport-px throughout (rect
+          // fw/fh, not clientWidth) so the math survives a transform:scale()
+          // ancestor — deck_stage renders slides scaled-to-fit.
+          const iw = this._img.naturalWidth || 1, ih = this._img.naturalHeight || 1;
+          const base = Math.max(fw / iw, fh / ih);
+          const sx = corner.includes('e') ? 1 : -1;
+          const sy = corner.includes('s') ? 1 : -1;
+          const s0 = this._view.s;
+          const w0 = iw * base * s0, h0 = ih * base * s0;
+          const cx0 = (50 + this._view.x) / 100 * fw;
+          const cy0 = (50 + this._view.y) / 100 * fh;
+          const ox = cx0 - sx * w0 / 2, oy = cy0 - sy * h0 / 2;
+          const diag0 = Math.hypot(w0, h0);
+          const ux = sx * w0 / diag0, uy = sy * h0 / diag0;
+          move = (ev) => {
+            const proj = (ev.clientX - rect.left - ox) * ux +
+                         (ev.clientY - rect.top - oy) * uy;
+            const s = clampS(s0 * proj / diag0);
+            const d = diag0 * s / s0;
+            this._view.s = s;
+            this._view.x = (ox + ux * d / 2) / fw * 100 - 50;
+            this._view.y = (oy + uy * d / 2) / fh * 100 - 50;
+            this._clampView();
+            this._applyView();
+          };
+        } else {
+          this.setAttribute('data-panning', '');
+          const start = { px: e.clientX, py: e.clientY, x: this._view.x, y: this._view.y };
+          move = (ev) => {
+            this._view.x = start.x + (ev.clientX - start.px) / fw * 100;
+            this._view.y = start.y + (ev.clientY - start.py) / fh * 100;
+            this._clampView();
+            this._applyView();
+          };
+        }
+        const up = () => {
+          try { this._spill.releasePointerCapture(e.pointerId); } catch {}
+          this._spill.removeEventListener('pointermove', move);
+          this._spill.removeEventListener('pointerup', up);
+          this._spill.removeEventListener('pointercancel', up);
+          this.removeAttribute('data-panning');
+          this._dragUp = null;
+        };
+        // Stashed so _exitReframe (Escape / outside-click mid-drag) can
+        // tear the capture + listeners down synchronously.
+        this._dragUp = up;
+        this._spill.addEventListener('pointermove', move);
+        this._spill.addEventListener('pointerup', up);
+        this._spill.addEventListener('pointercancel', up);
+      });
+      // Wheel zoom stays available inside reframe mode as a trackpad nicety —
+      // zooms toward the cursor (offset' = cursor·(1-k) + offset·k).
+      this.addEventListener('wheel', (e) => {
+        if (!this.hasAttribute('data-reframe')) return;
+        e.preventDefault();
+        const r = this.getBoundingClientRect();
+        const cx = (e.clientX - r.left) / r.width * 100 - 50;
+        const cy = (e.clientY - r.top) / r.height * 100 - 50;
+        const prev = this._view.s;
+        const next = clampS(prev * Math.pow(1.0015, -e.deltaY));
+        if (next === prev) return;
+        const k = next / prev;
+        this._view.s = next;
+        this._view.x = cx * (1 - k) + this._view.x * k;
+        this._view.y = cy * (1 - k) + this._view.y * k;
+        this._clampView();
+        this._applyView();
+      }, { passive: false });
+    }
+
+    connectedCallback() {
+      // Warn once per page — an id-less slot works for the session but
+      // cannot persist, and two id-less slots would share nothing.
+      if (!this.id && !ImageSlot._warned) {
+        ImageSlot._warned = true;
+        console.warn('<image-slot> without an id will not persist its dropped image.');
+      }
+      this.addEventListener('dragenter', this);
+      this.addEventListener('dragover', this);
+      this.addEventListener('dragleave', this);
+      this.addEventListener('drop', this);
+      subs.add(this._subFn);
+      // width%/height% in _applyView encode the frame aspect at call time —
+      // a host resize (responsive grid, pane divider) would stretch the
+      // image until the next _render. Re-render on size change: _render()
+      // re-seeds _view from stored before clamp/apply, so a shrink→grow
+      // cycle round-trips instead of ratcheting x/y toward the narrower
+      // frame's clamp range.
+      this._ro = new ResizeObserver(() => this._render());
+      this._ro.observe(this);
+      load();
+      this._render();
+    }
+
+    disconnectedCallback() {
+      subs.delete(this._subFn);
+      this.removeEventListener('dragenter', this);
+      this.removeEventListener('dragover', this);
+      this.removeEventListener('dragleave', this);
+      this.removeEventListener('drop', this);
+      if (this._ro) { this._ro.disconnect(); this._ro = null; }
+      this._exitReframe(false);
+    }
+
+    _enterReframe() {
+      if (this.hasAttribute('data-reframe')) return;
+      this.setAttribute('data-reframe', '');
+      this._applyView();
+      // Close on click outside (the spill handler stopPropagation()s so
+      // in-image drags don't reach this) and on Escape. Listeners are held
+      // on the instance so _exitReframe / disconnectedCallback can detach
+      // exactly what was attached.
+      this._outside = (e) => {
+        if (e.composedPath && e.composedPath().includes(this)) return;
+        this._exitReframe(true);
+      };
+      this._esc = (e) => { if (e.key === 'Escape') this._exitReframe(true); };
+      document.addEventListener('pointerdown', this._outside, true);
+      document.addEventListener('keydown', this._esc, true);
+    }
+
+    _exitReframe(commit) {
+      if (!this.hasAttribute('data-reframe')) return;
+      if (this._dragUp) this._dragUp();
+      this.removeAttribute('data-reframe');
+      this.removeAttribute('data-panning');
+      if (this._outside) document.removeEventListener('pointerdown', this._outside, true);
+      if (this._esc) document.removeEventListener('keydown', this._esc, true);
+      this._outside = this._esc = null;
+      if (commit) this._commitView();
+    }
+
+    attributeChangedCallback() { if (this.shadowRoot) this._render(); }
+
+    // handleEvent — one listener object for all four drag events keeps the
+    // add/remove symmetric and the depth counter correct.
+    handleEvent(e) {
+      if (e.type === 'dragenter' || e.type === 'dragover') {
+        // Without preventDefault the browser never fires 'drop'.
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+        if (e.type === 'dragenter') this._depth++;
+        this.setAttribute('data-over', '');
+      } else if (e.type === 'dragleave') {
+        // dragenter/leave fire for every descendant crossing — count depth
+        // so hovering the icon inside the empty state doesn't flicker.
+        if (--this._depth <= 0) { this._depth = 0; this.removeAttribute('data-over'); }
+      } else if (e.type === 'drop') {
+        e.preventDefault();
+        e.stopPropagation();
+        this._depth = 0;
+        this.removeAttribute('data-over');
+        const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+        if (f) this._ingest(f);
+      }
+    }
+
+    async _ingest(file) {
+      this._setError(null);
+      if (!file || ACCEPT.indexOf(file.type) < 0) {
+        this._setError('Drop a PNG, JPEG, WebP, or AVIF image.');
+        return;
+      }
+      // toDataUrl can take hundreds of ms on a large photo. A Clear or a
+      // newer drop during that window would be clobbered when this await
+      // resumes — bump + capture a generation so stale encodes bail.
+      const gen = ++this._gen;
+      try {
+        const w = this.clientWidth || this.offsetWidth || MAX_DIM;
+        const url = await toDataUrl(file, w);
+        if (gen !== this._gen) return;
+        // Only exit reframe once the new image is in hand — a rejected type
+        // or decode failure leaves the in-progress crop untouched.
+        this._exitReframe(false);
+        const val = { u: url, s: 1, x: 0, y: 0 };
+        setSlot(this.id || '', val);
+        // Keep a session-local copy for id-less slots so the drop still
+        // shows, even though it cannot persist.
+        if (!this.id) { this._local = val; this._render(); }
+      } catch (err) {
+        if (gen !== this._gen) return;
+        this._setError('Could not read that image.');
+        console.warn('<image-slot> ingest failed:', err);
+      }
+    }
+
+    _setError(msg) {
+      if (this._err) { this._err.remove(); this._err = null; }
+      if (!msg) return;
+      const d = document.createElement('div');
+      d.className = 'err'; d.textContent = msg;
+      this.shadowRoot.appendChild(d);
+      this._err = d;
+      setTimeout(() => { if (this._err === d) { d.remove(); this._err = null; } }, 3000);
+    }
+
+    // Reframing (pan/resize) is only meaningful for fit=cover — contain/fill
+    // keep the old object-fit path and double-click is a no-op.
+    _reframes() {
+      return this.hasAttribute('data-filled') &&
+        (this.getAttribute('fit') || 'cover') === 'cover';
+    }
+
+    // Cover-baseline geometry, shared by clamp/apply/resize. Null until the
+    // img has loaded (naturalWidth is 0 before that) or when the slot has no
+    // layout box — ResizeObserver fires with a 0×0 rect under display:none,
+    // and clamping against a degenerate 1×1 frame would silently pull the
+    // stored pan toward zero.
+    _geom() {
+      const iw = this._img.naturalWidth, ih = this._img.naturalHeight;
+      const fw = this.clientWidth, fh = this.clientHeight;
+      if (!iw || !ih || !fw || !fh) return null;
+      return { iw, ih, fw, fh, base: Math.max(fw / iw, fh / ih) };
+    }
+
+    _clampView() {
+      // Pan range on each axis is half the overflow past the frame edge.
+      const g = this._geom();
+      if (!g) return;
+      const mx = Math.max(0, (g.iw * g.base * this._view.s / g.fw - 1) * 50);
+      const my = Math.max(0, (g.ih * g.base * this._view.s / g.fh - 1) * 50);
+      this._view.x = Math.max(-mx, Math.min(mx, this._view.x));
+      this._view.y = Math.max(-my, Math.min(my, this._view.y));
+    }
+
+    _applyView() {
+      const g = this._geom();
+      const fit = this.getAttribute('fit') || 'cover';
+      if (fit !== 'cover' || !g) {
+        // Non-cover, or dimensions not known yet (before img load).
+        this._img.style.width = '100%';
+        this._img.style.height = '100%';
+        this._img.style.left = '50%';
+        this._img.style.top = '50%';
+        this._img.style.objectFit = fit;
+        this._img.style.objectPosition = this.getAttribute('position') || '50% 50%';
+        return;
+      }
+      // Cover baseline: img fills the frame on its tighter axis at s=1, so
+      // pan works immediately on the overflowing axis without zooming first.
+      // Width/height and left/top are all frame-% — depends only on the
+      // frame aspect ratio, so a responsive resize keeps the same crop. The
+      // spill layer mirrors the same box so its corners = image corners.
+      const k = g.base * this._view.s;
+      const w = (g.iw * k / g.fw * 100) + '%';
+      const h = (g.ih * k / g.fh * 100) + '%';
+      const l = (50 + this._view.x) + '%';
+      const t = (50 + this._view.y) + '%';
+      this._img.style.width = w; this._img.style.height = h;
+      this._img.style.left = l; this._img.style.top = t;
+      this._img.style.objectFit = '';
+      this._spill.style.width = w; this._spill.style.height = h;
+      this._spill.style.left = l; this._spill.style.top = t;
+    }
+
+    _commitView() {
+      const v = { s: this._view.s, x: this._view.x, y: this._view.y };
+      if (this._userUrl) v.u = this._userUrl;
+      // Framing-only (no u) persists too so an author-src slot remembers its
+      // crop; clearing the sidecar still falls through to src=.
+      if (this.id) setSlot(this.id, v);
+      else { this._local = v; }
+    }
+
+    _render() {
+      // Shape / mask. Presets use border-radius so the dashed ring can
+      // follow the rounded outline; clip-path is only applied for an
+      // explicit `mask` (the ring is hidden there since a rectangle
+      // dashed border chopped by an arbitrary polygon looks broken).
+      const mask = this.getAttribute('mask');
+      const shape = (this.getAttribute('shape') || 'rounded').toLowerCase();
+      let radius = '';
+      if (shape === 'circle') radius = '50%';
+      else if (shape === 'pill') radius = '9999px';
+      else if (shape === 'rounded') {
+        const n = parseFloat(this.getAttribute('radius'));
+        radius = (Number.isFinite(n) ? n : 12) + 'px';
+      }
+      this._frame.style.borderRadius = mask ? '' : radius;
+      this._frame.style.clipPath = mask || '';
+      this._ring.style.borderRadius = mask ? '' : radius;
+      this._ring.style.display = mask ? 'none' : '';
+
+      // Controls and reframe entry gate on this so share links stay read-only.
+      const editable = !!(window.omelette && window.omelette.writeFile);
+      this.toggleAttribute('data-editable', editable);
+      this._sub.style.display = editable ? '' : 'none';
+
+      // Content. The sidecar is also writable by the agent's write_file
+      // tool, so its value isn't guaranteed canvas-originated — only accept
+      // data:image/ URLs from it. The `src` attribute is author-controlled
+      // (Claude wrote it into the HTML) so it passes through unchanged.
+      let stored = this.id ? getSlot(this.id) : this._local;
+      if (stored && stored.u && !/^data:image\//i.test(stored.u)) stored = null;
+      const srcAttr = this.getAttribute('src') || '';
+      this._userUrl = (stored && stored.u) || null;
+      const url = this._userUrl || srcAttr;
+      // Don't clobber an in-flight reframe with a store-triggered re-render.
+      if (!this.hasAttribute('data-reframe')) {
+        this._view = {
+          s: stored && Number.isFinite(stored.s) ? clampS(stored.s) : 1,
+          x: stored && Number.isFinite(stored.x) ? stored.x : 0,
+          y: stored && Number.isFinite(stored.y) ? stored.y : 0,
+        };
+      }
+      this._cap.textContent = this.getAttribute('placeholder') || 'Drop an image';
+      // Toggle via style.display — the [hidden] attribute alone loses to
+      // the display:flex / display:block rules in the stylesheet above.
+      if (url) {
+        if (this._img.getAttribute('src') !== url) {
+          this._img.src = url;
+          this._ghost.src = url;
+        }
+        this._img.style.display = 'block';
+        this._empty.style.display = 'none';
+        this.setAttribute('data-filled', '');
+        this._clampView();
+        this._applyView();
+      } else {
+        this._img.style.display = 'none';
+        this._img.removeAttribute('src');
+        this._ghost.removeAttribute('src');
+        this._empty.style.display = 'flex';
+        this.removeAttribute('data-filled');
+      }
+    }
+  }
+
+  if (!customElements.get('image-slot')) {
+    customElements.define('image-slot', ImageSlot);
+  }
+})();
+
+
+/* ============================================================ */
+
+// Premier Bank — content + bilingual strings (EN / SO)
+// Sourced from "Bank products and services Update 2025.pptx"
+window.PB_CONTENT = {
+  /* ────────────────────────────────────────────────────────────────────── */
+  /*  NAV                                                                    */
+  /* ────────────────────────────────────────────────────────────────────── */
+  nav: {
+    en: [
+      { label: "About",     items: ["Who We Are", "Mission & Values", "Board Members", "Shari'ah Board", "Senior Management"] },
+      { label: "Accounts",  items: ["Personal Current", "Saving Account", "Salary Account", "Student Account", "Joint Account", "Hajj & Umra", "Maandeeq (Women)", "Business Current", "Sole-Proprietor", "Umma (NGO)", "Corporate Account"] },
+      { label: "Cards",     items: ["Premier Classic", "Premier Platinum", "Corporate Card", "World Elite"] },
+      { label: "Financing", items: ["Auto Finance", "Land & Construction", "Business Trade Financing"] },
+      { label: "Services",  items: ["Premier Wallet", "Internet Banking", "SWIFT", "ATM Network", "Premier POS", "Agency Banking", "Payroll", "Wearables (Tap2Pay)", "Payment Gateway"] },
+      { label: "News",      items: ["Newsroom", "Press Release", "Gallery"] },
+    ],
+    so: [
+      { label: "Ku Saabsan",   items: ["Yaan Nahay", "Hadafka & Qiimaha", "Guddiga Maamulka", "Guddiga Shareecada", "Maamulka Sare"] },
+      { label: "Akoonada",     items: ["Akoon Shakhsi", "Akoon Kayd", "Akoon Mushahar", "Akoon Arday", "Akoon Wadaag", "Hajj & Cumra", "Maandeeq (Haween)", "Akoon Ganacsi", "Mulkiile Keli", "Umma (NGO)", "Akoon Shirkadeed"] },
+      { label: "Kaararka",     items: ["Premier Classic", "Premier Platinum", "Kaarka Shirkadda", "World Elite"] },
+      { label: "Maalgelin",    items: ["Maalgelin Baabuur", "Dhul & Dhismo", "Maalgelin Ganacsi"] },
+      { label: "Adeegyada",    items: ["Premier Wallet", "Internet Banking", "SWIFT", "Shabakadda ATM", "Premier POS", "Adeega Wakiilka", "Mushahar", "Wearables (Tap2Pay)", "Albaab Lacageed"] },
+      { label: "Wararka",      items: ["Qolka Wararka", "Saxaafadda", "Sawirada"] },
+    ],
+  },
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /*  HERO SLIDER — 5 slides                                                */
+  /* ────────────────────────────────────────────────────────────────────── */
+  heroSlides: [
+    {
+      id: "wallet",
+      icon: "wallet",
+      eyebrow: { en: "Premier Wallet", so: "Premier Wallet" },
+      title: {
+        en: "Your bank, in the palm of your hand.",
+        so: "Bangigaaga, gacantaada ku jira.",
+      },
+      sub: {
+        en: "Top up, send money, pay bills and bank on the go. The most-loved mobile money service in Somalia.",
+        so: "Top-up, lacag dir, biil bixi oo bangiyada mobile-ka. Adeega lacagta mobile-ka ee ugu jecel Soomaaliya.",
+      },
+      cta: { en: "Download the app", so: "Soo dejiso app-ka" },
+      tint: "navy",
+      art: "wallet",
+    },
+    {
+      id: "cards",
+      icon: "card",
+      eyebrow: { en: "Premier Mastercard", so: "Premier Mastercard" },
+      title: {
+        en: "Pay anywhere Mastercard is accepted.",
+        so: "Bixi meel kasta oo Mastercard la aqbalo.",
+      },
+      sub: {
+        en: "Classic, Platinum, Corporate and World Elite — secure cards for payments and ATM withdrawals worldwide.",
+        so: "Classic, Platinum, Corporate iyo World Elite — ammaan, dunida oo dhan.",
+      },
+      cta: { en: "Compare cards", so: "Isbarbar dhig kaararka" },
+      tint: "green",
+      art: "card",
+    },
+    {
+      id: "swift",
+      icon: "swift",
+      eyebrow: { en: "SWIFT · Code PBSMSOSM", so: "SWIFT · PBSMSOSM" },
+      title: {
+        en: "Move money to and from 101+ countries.",
+        so: "Lacag u dir oo ka hel 101+ dal.",
+      },
+      sub: {
+        en: "Premier Bank's SWIFT service is safe, fast and guaranteed — capable of receiving and sending from all nations.",
+        so: "Adeega SWIFT ee Premier Bank waa amaan, degdeg, oo lagu kalsoon yahay.",
+      },
+      cta: { en: "Send a wire", so: "Dir lacag" },
+      tint: "navy",
+      art: "swift",
+    },
+    {
+      id: "finance",
+      icon: "auto",
+      eyebrow: { en: "Investment & Financing", so: "Maalgelin" },
+      title: {
+        en: "Drive your dream. Build your future.",
+        so: "Wado riyadaada. Dhis mustaqbalkaaga.",
+      },
+      sub: {
+        en: "Auto Finance from USD 3,000, Land & Construction up to 36 months, and Business Trade Financing — all Shari'ah-compliant.",
+        so: "Maalgelin baabuur, dhulka & dhismaha, iyo ganacsiga — dhammaan waafaqsan Shareecada.",
+      },
+      cta: { en: "Apply for finance", so: "Codso maalgelin" },
+      tint: "green",
+      art: "finance",
+    },
+    {
+      id: "agency",
+      icon: "agency",
+      eyebrow: { en: "Agency Banking · 12,000+ Agents", so: "Adeega Wakiilka" },
+      title: {
+        en: "A Premier branch wherever you are.",
+        so: "Laanta Premier meel kasta oo aad joogto.",
+      },
+      sub: {
+        en: "Open accounts, deposit, withdraw and transfer at an Authorized Premier Agent — even in remote areas.",
+        so: "Akoon fur, lacag soo gali oo soo bixi wakiil Premier kasta — xitaa baadiyaha.",
+      },
+      cta: { en: "Find an agent", so: "Hel wakiil" },
+      tint: "navy",
+      art: "agency",
+    },
+  ],
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /*  FX TICKER                                                              */
+  /* ────────────────────────────────────────────────────────────────────── */
+  ticker: [
+    { code: "USD/SOS", buy: "27,150", sell: "27,420", up: true },
+    { code: "EUR/USD", buy: "1.0842", sell: "1.0867", up: true },
+    { code: "AED/USD", buy: "0.2723", sell: "0.2731", up: false },
+    { code: "GBP/USD", buy: "1.2614", sell: "1.2641", up: true },
+    { code: "SAR/USD", buy: "0.2666", sell: "0.2674", up: false },
+    { code: "TRY/USD", buy: "0.0291", sell: "0.0298", up: true },
+    { code: "KES/SOS", buy: "182.40", sell: "184.10", up: true },
+    { code: "ETB/USD", buy: "0.0173", sell: "0.0178", up: false },
+  ],
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /*  VALUES (from PPT slide 4)                                              */
+  /* ────────────────────────────────────────────────────────────────────── */
+  values: {
+    en: [
+      { icon: "personal",  title: "People First",        body: "We build relationships. We are professional. We offer excellent service." },
+      { icon: "shield",    title: "Integrity",           body: "We are trustworthy and behave in an open, honest and ethical manner — considering the impact of every decision." },
+      { icon: "check",     title: "Accountability",      body: "We take responsibility for our decisions, action and performance — adhering to Shari'ah principles and international banking standards." },
+      { icon: "joint",     title: "Partnership",         body: "We partner with stakeholders to find new, innovative and efficient ways of meeting needs." },
+      { icon: "star",      title: "Customer Centricity", body: "We deliver high-quality services that meet and exceed every customer's expectation." },
+    ],
+    so: [
+      { icon: "personal",  title: "Dadka Marka Hore",   body: "Xidhiidh baan dhisanaa, xirfad leh, oo adeeg fiican bixinaa." },
+      { icon: "shield",    title: "Daacadnimo",         body: "Waxaan nahay kuwa la aamini karo, si furan oo akhlaaq leh ayaanu u dhaqannaa." },
+      { icon: "check",     title: "Iskaa-mas'uul ahaan",body: "Waxaan mas'uul ka nahay go'aamadayada — Shareecada iyo heerarka caalamiga ayaan raacnaa." },
+      { icon: "joint",     title: "Iskaashi",           body: "Iskaashi waxaan la galnaa dhammaan dadka xidhiidhka leh." },
+      { icon: "star",      title: "Macaamiil Marka Hore",body: "Adeeg tayo sare leh ayaan siinaa macaamiisha, oo aan filashadooda dhaafino." },
+    ],
+  },
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /*  MORE SERVICES TILES — Blinq-style image-led tiles                      */
+  /* ────────────────────────────────────────────────────────────────────── */
+  tiles: [
+    {
+      id: "wallet",
+      label: { en: "Premier Wallet", so: "Premier Wallet" },
+      blurb: { en: "Top-up, transfer, withdraw, pay bills — all in one app.", so: "Top-up, wareejin, bixin biil — hal app." },
+      icon: "wallet",
+      bg: "#0b2f4f",
+      art: "wallet-phone",
+    },
+    {
+      id: "mastercard",
+      label: { en: "Premier Mastercard", so: "Premier Mastercard" },
+      blurb: { en: "Classic · Platinum · Corporate · World Elite.", so: "Classic · Platinum · Corporate · World Elite." },
+      icon: "card",
+      bg: "#e9efe2",
+      art: "mastercard",
+    },
+    {
+      id: "atm",
+      label: { en: "ATM Network", so: "Shabakadda ATM" },
+      blurb: { en: "30 ATMs across Mogadishu and the regions, 24/7.", so: "30 ATM oo Muqdisho iyo gobollada, 24/7." },
+      icon: "atm",
+      bg: "#0b2f4f",
+      art: "atm",
+    },
+    {
+      id: "pos",
+      label: { en: "Premier POS", so: "Premier POS" },
+      blurb: { en: "319 POS terminals at supermarkets, hotels, airports & more.", so: "319 POS oo supermaketo, hudheelo, airports & wax kale." },
+      icon: "pos",
+      bg: "#f3edde",
+      art: "pos",
+    },
+    {
+      id: "swift",
+      label: { en: "SWIFT International", so: "SWIFT Caalami" },
+      blurb: { en: "Code PBSMSOSM. Send and receive in 101+ countries.", so: "PBSMSOSM · 101+ dal." },
+      icon: "swift",
+      bg: "#6cbe46",
+      art: "swift",
+    },
+    {
+      id: "wearable",
+      label: { en: "Tap2Pay Wearables", so: "Tap2Pay" },
+      blurb: { en: "NFC payment rings, watches and bands — tap to pay.", so: "NFC giraan, saac iyo xidhmo — taabasho keliya." },
+      icon: "wearable",
+      bg: "#1a4a73",
+      art: "wearable",
+    },
+    {
+      id: "agency",
+      label: { en: "Agency Banking", so: "Adeega Wakiilka" },
+      blurb: { en: "Authorized Premier Agents nationwide — even in remote areas.", so: "Wakiillada Premier dalka oo dhan." },
+      icon: "agency",
+      bg: "#f7f4ee",
+      art: "agency",
+    },
+    {
+      id: "gateway",
+      label: { en: "Payment Gateway", so: "Albaab Lacageed" },
+      blurb: { en: "Mastercard Payment Gateway Services — for online merchants.", so: "MPGS — ganacsato online." },
+      icon: "gateway",
+      bg: "#6cbe46",
+      art: "gateway",
+    },
+  ],
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /*  ACCOUNT GRID                                                           */
+  /* ────────────────────────────────────────────────────────────────────── */
+  accounts: [
+    { id: "personal",    icon: "personal",  name: { en: "Personal Current",   so: "Akoon Shakhsi" },     for: { en: "Everyday banking",       so: "Maalmaha caadiga" } },
+    { id: "saving",      icon: "saving",    name: { en: "Saving Account",     so: "Akoon Kayd" },        for: { en: "Profit-sharing savings", so: "Kayd faa'iido leh" } },
+    { id: "salary",      icon: "salary",    name: { en: "Salary Account",     so: "Akoon Mushahar" },    for: { en: "Salaried professionals", so: "Shaqaale mushahar" } },
+    { id: "student",     icon: "student",   name: { en: "Student Account",    so: "Akoon Arday" },       for: { en: "Students aged 13+",      so: "Arday 13+" } },
+    { id: "joint",       icon: "joint",     name: { en: "Joint Account",      so: "Akoon Wadaag" },      for: { en: "2–5 individuals",        so: "2–5 qof" } },
+    { id: "hajj",        icon: "hajj",      name: { en: "Hajj & Umra",        so: "Hajj & Cumra" },      for: { en: "Goal-based savings",     so: "Kayd hadaf leh" } },
+    { id: "women",       icon: "women",     name: { en: "Maandeeq (Women)",   so: "Maandeeq" },          for: { en: "Women-only account",     so: "Haween kaliya" } },
+    { id: "business",    icon: "business",  name: { en: "Business Current",   so: "Akoon Ganacsi" },     for: { en: "Companies & traders",    so: "Shirkado" } },
+    { id: "sole",        icon: "corporate", name: { en: "Sole-Proprietor",    so: "Mulkiile Keli" },     for: { en: "Single-owner businesses",so: "Mulkiile keli ah" } },
+    { id: "ngo",         icon: "ngo",       name: { en: "Umma (NGO)",         so: "Umma (NGO)" },        for: { en: "NGOs, charities, trusts",so: "NGO & samafal" } },
+    { id: "corporate",   icon: "corporate", name: { en: "Corporate Account",  so: "Akoon Shirkadeed" },  for: { en: "Large corporates",       so: "Shirkado waaweyn" } },
+  ],
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /*  CARDS (from PPT slides 9-14)                                           */
+  /* ────────────────────────────────────────────────────────────────────── */
+  cards: [
+    { id: "classic",  icon: "card",         name: "Classic Mastercard",   limit: "$2,000", desc: { en: "Secure payments via POS and ATM withdrawal worldwide.",              so: "Bixinta POS iyo ATM, dunida oo dhan." }, color: "#0b2f4f" },
+    { id: "platinum", icon: "cardPlatinum", name: "Platinum Mastercard",  limit: "$2,000", desc: { en: "Premium debit card with worldwide acceptance.",                       so: "Kaarka tayo sare, dunida oo dhan loo aqbalo." },                       color: "#6cbe46" },
+    { id: "corporate",icon: "card",         name: "Corporate Mastercard", limit: "$3,000", desc: { en: "For medium-sized and large companies with complex expenses.",         so: "Shirkadaha dhexe iyo waaweyn ee leh kharashyo isku dhafan." },          color: "#1a4a73" },
+    { id: "elite",    icon: "cardElite",    name: "World Elite Mastercard",limit: "$5,000",desc: { en: "Gateway to unique experiences — lounge access, VIP privileges.",     so: "Albaab madadaalo gaar ah — qolal sare iyo VIP." },                     color: "#0a2540" },
+  ],
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /*  BRANCHES (locator map)                                                */
+  /* ────────────────────────────────────────────────────────────────────── */
+  branches: [
+    { city: "Mogadishu HQ",   addr: "KM4, Wadnaha Street",       x: 56, y: 64, count: 18 },
+    { city: "Hargeisa",       addr: "26 June Street",            x: 38, y: 22, count: 7 },
+    { city: "Garowe",         addr: "Main Boulevard",            x: 60, y: 36, count: 3 },
+    { city: "Bosaso",         addr: "Port Road",                 x: 68, y: 18, count: 4 },
+    { city: "Kismayo",        addr: "Central Market",            x: 50, y: 78, count: 2 },
+    { city: "Baidoa",         addr: "Towfiiq District",          x: 44, y: 58, count: 2 },
+    { city: "Beledweyne",     addr: "Hawl-Wadaag",               x: 52, y: 48, count: 1 },
+    { city: "Burco",          addr: "Main Square",               x: 46, y: 26, count: 2 },
+    { city: "Berbera",        addr: "Port Free Zone",            x: 44, y: 16, count: 1 },
+    { city: "Dubai DIFC",     addr: "Gate Village 7",            x: 76, y: 40, count: 1, intl: true },
+    { city: "Nairobi",        addr: "Westlands",                 x: 60, y: 88, count: 1, intl: true },
+    { city: "London",         addr: "Canary Wharf",              x: 14, y: 8,  count: 1, intl: true },
+  ],
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /*  TESTIMONIALS                                                          */
+  /* ────────────────────────────────────────────────────────────────────── */
+  testimonials: {
+    en: [
+      { quote: "Premier Wallet changed my shop. I take payments, pay suppliers and run payroll without leaving the counter.", who: "Khadra A.", role: "Shop owner, Mogadishu" },
+      { quote: "Sending money home from Dubai used to take three days. Now my mother gets it before I close the app.",        who: "Yusuf I.",  role: "Diaspora customer, UAE" },
+      { quote: "The Shari'ah board is the real deal — every product was reviewed transparently. That's why we moved our business here.", who: "Ahmed M.", role: "CEO, importer/exporter" },
+      { quote: "I opened my first salary account at 19 with Premier. Five years later they financed my first car.",          who: "Faduma O.", role: "Engineer, Hargeisa" },
+      { quote: "The relationship manager actually knows our business. Trade finance approvals in days, not months.",          who: "Mohamed K.", role: "CFO, logistics SME" },
+    ],
+    so: [
+      { quote: "Premier Wallet wuu beddelay dukaankayga. Lacag baan ka qaadaa macaamiisha, oo soo iibiyayaasha ayaan bixiyaa.", who: "Khadra A.", role: "Iibiye, Muqdisho" },
+      { quote: "Lacag Dubai uga soo dirka saddex maalmood ayey qaadan jirtay. Hadda hooyaday way heshaa kahor inta aanan xidhin app-ka.", who: "Yusuf I.", role: "Macmiil diaspora, UAE" },
+      { quote: "Guddiga Shareecada runtii waa madax-banaan. Sidaas darteed ayaanu ganacsigayaga halkaan u soo wareejinay.",    who: "Ahmed M.", role: "Madaxa shirkad" },
+      { quote: "19 jir ahaan baan akoon mushahar furtay Premier. Shanta sano ee la soo dhaafay, hadda gaarigayga way maalgeliyeen.", who: "Faduma O.", role: "Injineer, Hargeysa" },
+      { quote: "Maamulayasha runtii way fahmaan ganacsigayaga. Ogolaansho maalmo, ee aan bilo ahayn.",                          who: "Mohamed K.", role: "CFO, ganacsi" },
+    ],
+  },
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /*  STATS                                                                 */
+  /* ────────────────────────────────────────────────────────────────────── */
+  stats: [
+    { value: "2014",   label: { en: "CBS licensed",       so: "Shati CBS" } },
+    { value: "101+",   label: { en: "Remittance countries", so: "Dalal remittance" } },
+    { value: "319",    label: { en: "POS terminals",      so: "POS terminals" } },
+    { value: "30",     label: { en: "ATMs across Somalia",so: "ATM Soomaaliya" } },
+    { value: "12,000+",label: { en: "Authorized Agents",  so: "Wakiillo" } },
+  ],
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /*  Trust partner labels                                                  */
+  /* ────────────────────────────────────────────────────────────────────── */
+  trustLogos: ["MASTERCARD", "VISA", "SWIFT", "MPGS", "AAOIFI", "CBS", "ISO 27001", "PCI-DSS"],
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /*  FAQ (general, from PPT and product knowledge)                          */
+  /* ────────────────────────────────────────────────────────────────────── */
+  faq: {
+    en: [
+      { q: "How do I open a Premier Bank account?",
+        a: "Walk into any Premier branch with your national ID, passport or driving licence — or start in the Premier Wallet app and complete KYC remotely. Personal accounts can be opened the same day." },
+      { q: "Is Premier Bank Shari'ah-compliant?",
+        a: "Yes. Premier Bank is a privately-owned Shari'ah-compliant commercial bank, incorporated in Somalia in 2013 and licensed by the Central Bank of Somalia in 2014. Every product is certified by our independent Shari'ah Supervisory Board." },
+      { q: "What is the Premier Bank SWIFT code?",
+        a: "PBSMSOSM. Premier Bank is capable of receiving and sending funds from all nations safely, fast and guaranteed." },
+      { q: "What does Premier Wallet cost?",
+        a: "Premier Wallet is free to download and free to register. It offers financial services to non-banked populations or people with limited access to banks." },
+      { q: "How many countries does the Wallet send to?",
+        a: "Premier Wallet supports remittance to more than 101 countries via Mobile Money, Cash Pickup and Bank Transfer." },
+      { q: "How many ATMs and POS terminals does Premier operate?",
+        a: "30 ATMs (21 in Mogadishu, 9 across regions) and 319 POS terminals (287 in Mogadishu, 32 across regions) — including airports, hotels, supermarkets and retailers." },
+    ],
+    so: [
+      { q: "Sideen u furtaa akoon Premier Bank?",
+        a: "Gal laan kasta oo Premier oo wadata kaarka aqoonsiga, baasaboor, ama shatiga gaariga — ama ka bilow Premier Wallet oo dhameystir KYC. Akoon shakhsi maalin la furi karaa." },
+      { q: "Ma waafaqsan tahay Shareecada?",
+        a: "Haa. Premier Bank waa bangi gaar loo leeyahay, waafaqsan Shareecada, oo Soomaaliya laga aasaasay 2013, shati ka qaatay CBS 2014." },
+      { q: "Waa maxay SWIFT code-ka Premier Bank?",
+        a: "PBSMSOSM. Premier wuxuu ka heli karaa oo u diri karaa dalal kasta — si amaan, degdeg ah, oo lagu kalsoon yahay." },
+      { q: "Premier Wallet imisa qaadan?",
+        a: "Bilaash baad ku soo dejisaa oo ku diiwaangelisaa. Wuxuu adeeg siiyaa dadka aan akoon bangi haysan." },
+      { q: "Wallet-ka imisa dal ayuu u diri karaa?",
+        a: "In ka badan 101 dal — Mobile Money, Cash Pickup iyo Bank Transfer." },
+      { q: "Imisa ATM iyo POS ayaad leedahay?",
+        a: "30 ATM (21 Muqdisho, 9 gobolada) iyo 319 POS (287 Muqdisho, 32 gobolada)." },
+    ],
+  },
+};
+
+
+/* ============================================================ */
+
+/* ==========================================================================
+   Premier Bank — Supabase data layer (PBData)
+   --------------------------------------------------------------------------
+   1. Create a free project at https://supabase.com
+   2. Paste your Project URL + anon (public) key below, OR configure them
+      live from the admin panel (#admin → Settings) — stored in localStorage.
+   3. Run the SQL in SUPABASE_SETUP.md to create tables, policies & storage.
+   The anon key is safe to expose publicly; security is enforced by the
+   database's Row-Level Security policies (public read, authenticated write).
+   ========================================================================== */
+window.PB_SUPABASE = {
+  url:     "https://mmnavtwjwxlevqrqwazf.supabase.co",
+  anonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1tbmF2dHdqd3hsZXZxcnF3YXpmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAxMzczMTcsImV4cCI6MjA5NTcxMzMxN30.fmDvGgjurm24BHM-2Qdckr1siIHOHbas3dhHpvLeFpA",
+};
+
+(function () {
+  const cfg = {
+    url:     localStorage.getItem("pb_sb_url") || window.PB_SUPABASE.url,
+    anonKey: localStorage.getItem("pb_sb_key") || window.PB_SUPABASE.anonKey,
+  };
+  const ready = cfg.url && cfg.anonKey && !cfg.url.includes("YOUR-PROJECT") && !cfg.anonKey.includes("YOUR-ANON");
+  let client = null;
+  if (ready && window.supabase) {
+    try { client = window.supabase.createClient(cfg.url, cfg.anonKey); }
+    catch (e) { console.warn("Supabase init failed:", e.message); }
+  }
+  const emit = () => window.dispatchEvent(new CustomEvent("pb:data"));
+
+  /* Apply brand colours from an override object to the live CSS variables. */
+  function applyBrand(brand) {
+    if (!brand) return;
+    const root = document.documentElement;
+    const hexToRgb = (h) => { const x = (h || "").replace("#", ""); return [0, 2, 4].map(i => parseInt(x.substr(i, 2), 16)); };
+    const toHex = (r, g, b) => "#" + [r, g, b].map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0")).join("");
+    const shade = (hex, amt) => { const [r, g, b] = hexToRgb(hex); const f = amt > 0 ? 255 : 0; const m = Math.abs(amt); return toHex(r + (f - r) * m, g + (f - g) * m, b + (f - b) * m); };
+    if (brand.primary) {
+      root.style.setProperty("--pb-primary", brand.primary);
+      root.style.setProperty("--pb-primary-700", shade(brand.primary, -0.18));
+      root.style.setProperty("--pb-primary-300", shade(brand.primary, 0.30));
+    }
+    if (brand.secondary) {
+      root.style.setProperty("--pb-secondary", brand.secondary);
+      root.style.setProperty("--pb-secondary-700", shade(brand.secondary, -0.20));
+      root.style.setProperty("--pb-secondary-100", shade(brand.secondary, 0.85));
+    }
+  }
+
+  /* Merge stored overrides over the in-memory site content + detail pages. */
+  function applyOverrides() {
+    const o = window.PB_OVERRIDES || {};
+    if (window.PB_CONTENT && o.content) {
+      Object.keys(o.content).forEach(k => { window.PB_CONTENT[k] = o.content[k]; });
+    }
+    if (window.PB_DETAILS && o.details) {
+      if (!window.PB_DETAILS_BASE) { try { window.PB_DETAILS_BASE = structuredClone(window.PB_DETAILS); } catch (e) { window.PB_DETAILS_BASE = JSON.parse(JSON.stringify(window.PB_DETAILS)); } }
+      Object.keys(o.details).forEach(k => {
+        const base = window.PB_DETAILS_BASE[k] || window.PB_DETAILS[k] || {};
+        window.PB_DETAILS[k] = Object.assign({}, base, o.details[k]);
+      });
+    }
+    if (o.brand) applyBrand(o.brand);
+  }
+  window.PB_applyOverrides = applyOverrides;
+
+  /* Open a professional team-member profile in a NEW browser tab.
+     m = { name, role, bio, photo, section }. Shared by the public site and admin preview. */
+  window.PB_openMemberProfile = function (m, lang) {
+    lang = lang || "en";
+    var esc = function (s) { return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) { return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]; }); };
+    var initials = (m.name || "?").split(/\s+/).filter(Boolean).slice(0, 2).map(function (w) { return w[0]; }).join("").toUpperCase();
+    var bioHtml = (m.bio || "").split(/\n\s*\n|\n/).filter(Boolean).map(function (para) { return "<p>" + esc(para) + "</p>"; }).join("");
+    if (!bioHtml) bioHtml = '<p class="muted">No biography added yet.</p>';
+    var photo = m.photo ? '<img src="' + esc(m.photo) + '" alt="' + esc(m.name) + '"/>' : '<span class="ini">' + esc(initials) + "</span>";
+    var doc =
+      '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+      "<title>" + esc(m.name || "Profile") + (m.role ? " — " + esc(m.role) : "") + "</title>" +
+      "<style>" +
+      ":root{--nv:#0b2f4f;--gr:#6cbe46;--mut:#5b6b7b;--ln:#e6e9ee}" +
+      "*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:#eef1f4;color:#12212f}" +
+      ".wrap{max-width:820px;margin:0 auto;padding:32px 20px 60px}" +
+      ".card{background:#fff;border:1px solid var(--ln);border-radius:20px;overflow:hidden;box-shadow:0 18px 50px rgba(11,47,79,.10)}" +
+      ".band{background:linear-gradient(135deg,var(--nv),#12456f);height:120px}" +
+      ".head{display:flex;gap:22px;align-items:flex-end;padding:0 34px;margin-top:-64px}" +
+      ".ph{width:132px;height:132px;border-radius:22px;overflow:hidden;background:linear-gradient(135deg,var(--nv),#2b6ca3);border:4px solid #fff;flex-shrink:0;display:flex;align-items:center;justify-content:center;box-shadow:0 8px 24px rgba(11,47,79,.18)}" +
+      ".ph img{width:100%;height:100%;object-fit:cover}.ini{color:#fff;font-weight:700;font-size:48px}" +
+      ".ident{padding-bottom:8px}.ident h1{margin:0 0 6px;font-size:30px;letter-spacing:-.5px}" +
+      ".role{color:var(--gr);font-weight:600;font-size:17px;margin:0}" +
+      ".chip{display:inline-block;margin-top:10px;background:#e9f4e0;color:#3c6a1f;font-size:12px;font-weight:600;padding:3px 10px;border-radius:999px;text-transform:uppercase;letter-spacing:.04em}" +
+      ".body{padding:26px 34px 38px}.body h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin:0 0 12px}" +
+      ".body p{font-size:16px;line-height:1.75;margin:0 0 14px}.muted{color:#9aa7b3}" +
+      "@media(max-width:560px){.head{flex-direction:column;align-items:flex-start;gap:14px}.ph{width:104px;height:104px}}" +
+      "</style></head><body><div class='wrap'><div class='card'>" +
+      "<div class='band'></div>" +
+      "<div class='head'><div class='ph'>" + photo + "</div>" +
+      "<div class='ident'><h1>" + esc(m.name || "Team member") + "</h1>" +
+      (m.role ? "<p class='role'>" + esc(m.role) + "</p>" : "") +
+      (m.section ? "<span class='chip'>" + esc(m.section) + "</span>" : "") +
+      "</div></div>" +
+      "<div class='body'><h2>Profile</h2>" + bioHtml + "</div>" +
+      "</div></div></body></html>";
+    var w = window.open("", "pb_member_profile");
+    if (!w) { alert("Please allow pop-ups to open the profile."); return; }
+    w.document.open(); w.document.write(doc); w.document.close();
+  };
+
+  window.PBData = {
+    cfg,
+    isConfigured() {
+      if (!client && ready && window.supabase) {
+        try { client = window.supabase.createClient(cfg.url, cfg.anonKey); }
+        catch (e) { console.warn("Supabase init retry failed:", e.message); }
+      }
+      return !!client;
+    },
+    get client() { return client; },
+
+    async loadTeam() {
+      if (!client) return;
+      const { data, error } = await client.from("team_members").select("*").order("sort", { ascending: true });
+      if (error) { console.warn("team load:", error.message); return; }
+      const groups = {};
+      (data || []).filter(m => m.status !== "draft").forEach(m => {
+        (groups[m.category] = groups[m.category] || []).push({
+          id: m.id, name: m.name, title: m.title, bio: m.bio, photo: m.photo_url, sort: m.sort,
+        });
+      });
+      window.PB_LIVE_TEAM = groups;
+      emit();
+    },
+    async loadPosts() {
+      if (!client) return;
+      // Fetch published + scheduled; show scheduled only once their publish time has passed.
+      const { data, error } = await client.from("posts").select("*").in("status", ["published", "scheduled"]).order("created_at", { ascending: false });
+      if (error) {
+        // Fallback for older schema without a status column.
+        const legacy = await client.from("posts").select("*").eq("published", true).order("created_at", { ascending: false });
+        window.PB_LIVE_POSTS = legacy.data || [];
+        emit(); return;
+      }
+      const now = Date.now();
+      window.PB_LIVE_POSTS = (data || []).filter((p) => p.status === "published" || (p.status === "scheduled" && p.publish_at && new Date(p.publish_at).getTime() <= now));
+      emit();
+    },
+    async loadAtms() {
+      if (!client) return;
+      const { data, error } = await client.from("atms").select("*").order("region", { ascending: true }).order("location", { ascending: true });
+      if (error) { console.warn("atms load:", error.message); return; }
+      window.PB_LIVE_ATMS = data || [];
+      emit();
+    },
+    async loadContent() {
+      if (!client) return;
+      const { data, error } = await client.from("site_content").select("*");
+      if (error) { console.warn("content load:", error.message); return; }
+      const o = {};
+      (data || []).forEach(r => { o[r.key] = r.value; });
+      window.PB_OVERRIDES = o;
+      applyOverrides();
+      emit();
+    },
+    getOverride(key) { return (window.PB_OVERRIDES || {})[key]; },
+    async saveContent(key, value) {
+      const res = await client.from("site_content").upsert({ key, value, updated_at: new Date().toISOString() }).select();
+      if (!res.error) { window.PB_OVERRIDES = Object.assign({}, window.PB_OVERRIDES, { [key]: value }); applyOverrides(); emit(); }
+      return res;
+    },
+
+    /* auth */
+    async signIn(email, password) { return client.auth.signInWithPassword({ email, password }); },
+    async signOut() { return client.auth.signOut(); },
+    async getSession() { const { data } = await client.auth.getSession(); return data.session; },
+    onAuth(cb) { return client.auth.onAuthStateChange((_e, s) => cb(s)); },
+    async changePassword(newPassword) { return client.auth.updateUser({ password: newPassword }); },
+    /* TOTP 2FA (Google Authenticator / Authy etc.) via Supabase MFA */
+    async mfaListFactors() { return client.auth.mfa.listFactors(); },
+    async mfaEnroll() { return client.auth.mfa.enroll({ factorType: "totp" }); },
+    async mfaChallenge(factorId) { return client.auth.mfa.challenge({ factorId: factorId }); },
+    async mfaVerify(factorId, challengeId, code) { return client.auth.mfa.verify({ factorId: factorId, challengeId: challengeId, code: code }); },
+    async mfaUnenroll(factorId) { return client.auth.mfa.unenroll({ factorId: factorId }); },
+    async mfaAAL() { return client.auth.mfa.getAuthenticatorAssuranceLevel(); },
+
+    /* team CRUD */
+    async listMembers() { return client.from("team_members").select("*").order("category", { ascending: true }).order("sort", { ascending: true }); },
+    async saveMember(m) { return client.from("team_members").upsert(m).select(); },
+    async deleteMember(id) { return client.from("team_members").delete().eq("id", id); },
+
+    /* posts CRUD */
+    async listPosts() { return client.from("posts").select("*").order("created_at", { ascending: false }); },
+    async listAtms() { return client.from("atms").select("*").order("region", { ascending: true }).order("location", { ascending: true }); },
+    async saveAtm(a) { return client.from("atms").upsert(a).select(); },
+    async deleteAtm(id) { return client.from("atms").delete().eq("id", id); },
+    async savePost(p) { return client.from("posts").upsert(p).select(); },
+    async deletePost(id) { return client.from("posts").delete().eq("id", id); },
+
+    /* storage (drag & drop images) */
+    async uploadImage(file, folder) {
+      if (!client) throw new Error("Supabase is not connected.");
+      const ext = (file.name.split(".").pop() || "png").toLowerCase().replace(/[^a-z0-9]/g, "") || "png";
+      const path = (folder || "misc") + "/" + Date.now() + "-" + Math.random().toString(36).slice(2, 8) + "." + ext;
+      const { error } = await client.storage.from("media").upload(path, file, { upsert: true, contentType: file.type || "image/png", cacheControl: "3600" });
+      if (error) {
+        if (/bucket not found/i.test(error.message)) throw new Error("Storage bucket 'media' is missing. Create it in Supabase → Storage (public).");
+        throw error;
+      }
+      const url = client.storage.from("media").getPublicUrl(path).data.publicUrl;
+      if (!url) throw new Error("Could not get a public URL — make sure the 'media' bucket is public.");
+      return url;
+    },
+  };
+
+  if (client) { window.PBData.loadContent(); window.PBData.loadTeam(); window.PBData.loadPosts(); window.PBData.loadAtms(); }
+})();
+
+/* ============================================================ */
+
+// Premier Bank — Logo + Icon vector system
+// All built from SVG paths, using brand colors. No emoji.
+
+/* -------------------------------------------------------------------------- */
+/*  Brand colors                                                              */
+/* -------------------------------------------------------------------------- */
+const PB_BRAND = {
+  navy: "#0b2f4f",
+  green: "#6cbe46",
+  white: "#ffffff",
+  cream: "#f7f4ee",
+};
+
+/* -------------------------------------------------------------------------- */
+/*  Logo Mark — 5-petal lotus, traced from official Premier Bank logo        */
+/*  Variants: "color" | "white" | "navy" | "green"                            */
+/* -------------------------------------------------------------------------- */
+function LogoMark({ size = 40, variant = "color", className = "" }) {
+  const petal = variant === "white" ? "#ffffff"
+              : variant === "navy"  ? PB_BRAND.navy
+              :                       PB_BRAND.green;
+  const stroke = variant === "color" ? PB_BRAND.green
+               : variant === "white" ? "#ffffff"
+               : variant === "navy"  ? PB_BRAND.navy
+               :                       PB_BRAND.green;
+  return (
+    <svg
+      width={size} height={size}
+      viewBox="0 0 100 80"
+      fill="none"
+      className={className}
+      aria-hidden="true"
+    >
+      {/* back-left petal */}
+      <path
+        d="M16 64 C10 50 14 36 28 30 C36 38 38 50 34 64 Z"
+        fill={petal}
+      />
+      {/* back-right petal */}
+      <path
+        d="M84 64 C90 50 86 36 72 30 C64 38 62 50 66 64 Z"
+        fill={petal}
+      />
+      {/* mid-left petal */}
+      <path
+        d="M30 64 C24 48 28 28 44 22 C50 32 52 50 48 64 Z"
+        fill={petal}
+        stroke={stroke}
+        strokeWidth="0.8"
+      />
+      {/* mid-right petal */}
+      <path
+        d="M70 64 C76 48 72 28 56 22 C50 32 48 50 52 64 Z"
+        fill={petal}
+        stroke={stroke}
+        strokeWidth="0.8"
+      />
+      {/* center petal */}
+      <path
+        d="M50 64 C44 46 44 26 50 8 C56 26 56 46 50 64 Z"
+        fill={petal}
+        stroke={stroke}
+        strokeWidth="0.8"
+      />
+    </svg>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Full Logo — mark + wordmark                                               */
+/*  Variants: "color" (green mark + navy text on light)                       */
+/*           "white" (white mark + white text — for dark bg)                  */
+/*           "white-text" (green mark + white text — for navy bg)             */
+/*           "mark" (just the symbol)                                         */
+/* -------------------------------------------------------------------------- */
+const LOGO_COLOR_B64 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAADbQAAAmxCAYAAAAzDJ9VAAAACXBIWXMAAC4jAAAuIwF4pT92AAAgAElEQVR4nOzbQQHAIBDAsDH/ng8VlAeJghrompkPAAAAAAAAAAAAAAAAAE77bwcAAAAAAAAAAAAAAAAA8AZDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAm307FgAAAAAY5G89i13lEQAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAA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AAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAA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AAAAgBACbQAAAAAAAAAAAAAAAACEEGgDAAAAAAAAAAAAAAAAIIRAGwAAAAAAAAAAAAAAAAAhBNoAAAAAAAAAAAAAAAAACCHQBgAAAAAAAAAAAAAAAEAIgTYAAAAAAAAAAAAAAAAAQgi0AQAAAAAAAAAAAAAAABBCoA0AAAAAAAAAAAAAAACAEAJtAAAAAAAAAAAAAAAAAIQQaAMAAAAAAAAAAAAAAAAghEAbAAAAAAAAAAAAAAAAACEE2gAAAAAAAAAAAAAAAAAIIdAGAAAAAAAAAAAAAAAAQAiBNgAAAAAAAAAAAAAAAABCCLQBAAAAAAAAAAAAAAAAEEKgDQAAAAAAAAAAAAAAAIAQAm0AAAAAAAAAAAAAAAAAhBBoAwAAAAAAAAAAAAAAACCEQBsAAAAAAAAAAAAAAAAAIQTaAAAAAAAAAAAAAAAAAAgh0AYAAAAAAAAAAAAAAABACIE2AAAAAAAAAAAAAAAAAEIItAEAAAAAAAAAAAAAAAAQQqANAAAAAAAAAAAAAAAAgBACbQAAAAAAAAAAAAAAAACEEGgDAAAAAAAAAAAAAAAAIIRAGwAAAAAAAAAAAAAAAAAhBNoAAAAAAAAAAAAAAAAACCHQBgAAAAAAAAAAAAAAAEAIgTYAAAAAAAAAAAAAAAAAQgi0AQAAAAAAAAAAAAAAABBCoA0AAAAAAAAAAAAAAACAEAJtAAAAAAAAAAAAAAAAAIQQaAMAAAAAAAAAAAAAAAAghEAbAAAAAAAAAAAAAAAAACEE2gAAAAAAAAAAAAAAAAAIIdAGAAAAAAAAAAAAAAAAQAiBNgAAAAAAAAAAAAAAAABCCLQBAAAAAAAAAAAAAAAAEEKgDQAAAAAAAAAAAAAAAIAQAm0AAAAAAAAAAAAAAAAAhBBoAwAAAAAAAAAAAAAAACCEQBsAAAAAAAAAAAAAAAAAIQTaAAAAAAAAAAAAAAAAAAgh0AYAAAAAAAAAAAAAAABACIE2AAAAAAAAAAAAAAAAAEIItAEAAAAAAAAAAAAAAAAQQqANAAAAAAAAAAAAAAAAgBACbQAAAAAAAAAAAAAAAACEEGgDAAAAAAAAAAAAAAAAIIRAGwAAAAAAAAAAAAAAAAAhBNoAAAAAAAAAAAAAAAAACCHQBgAAAAAAAAAAAAAAAEAIgTYAAAAAAAAAAAAAAAAAQgi0AQAAAAAAAAAAAAAAABBCoA0AAAAAAAAAAAAAAACAEAJtAAAAAAAAAAAAAAAAAIQQaAMAAAAAAAAAAAAAAAAghEAbAAAAAAAAAAAAAAAAACEE2gAAAAAAAAAAAAAAAAAIIdAGAAAAAAAAAAAAAAAAQAiBNgAAAAAAAAAAAAAAAABCCLQBAAAAAAAAAAAAAAAAEEKgDQAAAAAAAAAAAAAAAIAQAm0AAAAAAAAAAAAAAAAAhBBoAwAAAAAAAAAAAAAAACCEQBsAAAAAAAAAAAAAAAAAIQTaAAAAAAAAAAAAAAAAAAgh0AYAAAAAAAAAAAAAAABACIE2AAAAAAAAAAAAAAAAAEIItAEAAAAAAAAAAAAAAAAQQqANAAAAAAAAAAAAAAAAgBACbQAAAAAAAAAAAAAAAACEEGgDAAAAAAAAAAAAAAAAIIRAGwAAAAAAAAAAAAAAAAAhBNoAAAAAAAAAAAAAAAAACCHQBgAAAAAAAAAAAAAAAEAIgTYAAAAAAAAAAAAAAAAAQgi0AQAAAAAAAAAAAAAAABBCoA0AAAAAAAAAAAAAAACAEAJtAAAAAAAAAAAAAAAAAIQQaAMAAAAAAAAAAAAAAAAghEAbAAAAAAAAAAAAAAAAACEE2gAAAAAAAAAAAAAAAAAIIdAGAAAAAAAAAAAAAAAAQAiBNgAAAAAAAAAAAAAAAABCCLQBAAAAAAAAAAAAAAAAEEKgDQAAAAAAAAAAAAAAAIAQAm0AAAAAAAAAAAAAAAAAhBBoAwAAAAAAAAAAAAAAACCEQBsAAAAAAAAAAAAAAAAAIQTaAAAAAAAAAAAAAAAAAAgh0AYAAAAAAAAAAAAAAABACIE2AAAAAAAAAAAAAAAAAEIItAEAAAAAAAAAAAAAAAAQQqANAAAAAAAAAAAAAAAAgBACbQAAAAAAAAAAAAAAAACEEGgDAAAAAAAAAAAAAAAAIIRAGwAAAAAAAAAAAAAAAAAhBNoAAAAAAAAAAAAAAAAACCHQBgAAAAAAAAAAAAAAAEAIgTYAAAAAAAAAAAAAAAAAQgi0AQAAAAAAAAAAAAAAABBCoA0AAAAAAAAAAAAAAACAEAJtAAAAAAAAAAAAAAAAAIQQaAMAAAAAAAAAAAAAAAAghEAbAAAAAAAAAAAAAAAAACEE2gAAAAAAAAAAAAAAAAAIIdAGAAAAAAAAAAAAAAAAQAiBNgAAAAAAAAAAAAAAAABCCLQBAAAA8H/s27EAAAAAwCB/61nsKo8AAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAal6stAAAIABJREFUAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAYt+OBQAAAAAG+VvPYld5BAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCG1D7diwAAAAAMMjfeha7yiMAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAADrgqllAAAA+UlEQVQAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAsAuFV1MwbIVWfAAAAAElFTkSuQmCC";
+const LOGO_WHITE_B64 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAADbQAAAmxCAYAAAAzDJ9VAAAACXBIWXMAAC4jAAAuIwF4pT92AAAgAElEQVR4nOzbQQGAIADAQORLGKPYP42kYD68S7ACu9b9vAMAAAAAAAAAAAAAAAAADptfBwAAAAAAAAAAAAAAAADwD4Y2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAAAAAAAShjYAAAAAAAAAAAAAAAAAEoY2AAAAAAAAAAAAAAAAABKGNgAAAAAAAAAAAIDNvh0LAAAAAAzyt57FrvIIAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAEPfg5sAACAASURBVAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAIPbu5qiNIIyiqFlSBKNQFAMhKBJCIEyWeOFyFdj8CCTuTHefk8C8nv2tDwAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAgIWgDAAAAAAAAAAAAAAAAICFoAwAAAAAAAAAAAAAAACAhaAMAAAAAAAAAAAAAAAAg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AEIItAEAAAAAAAAAAAAAAAAQQqANAAAAAAAAAAAAAAAAgBACbQAAAAAAAAAAAAAAAACEEGgDAAAAAAAAAAAAAAAAIIRAGwAAAAAAAAAAAAAAAAAhBNoAAAAAAAAAAAAAAAAACCHQBgAAAAAAAAAAAAAAAEAIgTYAAAAAAAAAAAAAAAAAQgi0AQAAAAAAAAAAAAAAABBCoA0AAAAAAAAAAAAAAACAEAJtAAAAAAAAAAAAAAAAAIQQaAMAAAAAAAAAAAAAAAAghEAbAAAAAAAAAAAAAAAAACEE2gAAAAAAAAAAAAAAAAAIIdAGAAAAAAAAAAAAAAAAQAiBNgAAAAAAAAAAAAAAAABCCLQBAAAAAAAAAAAAAAAAEEKgDQAAAAAAAAAAAAAAAIAQAm0AAAAAAAAAAAAAAAAAhBBoAwAAAAAAAAAAAAAAACCEQBsAAAAAAAAAAAAAAAAAIQTaAAAAAAAAAAAAAAAAAAgh0AYAAAAAAAAAAAAAAABACIE2AAAAAAAAAAAAAAAAAEIItAEAAAAAAAAAAAAAAAAQQqANAAAAAAAAAAAAAAAAgBACbQAAAAAAAAAAAAAAAACEEGgDAAAAAAAAAAAAAAAAIIRAGwAAAAAAAAAAAAAAAAAhBNoAAAAAAAAAAAAAAAAACCHQBgAAAAAAAAAAAAAAAEAIgTYAAAAAAAAAAAAAAAAAQgi0AQAAAAAAAAAAAAAAABBCoA0AAAAAAAAAAAAAAACAEAJtAAAAAAAAAAAAAAAAAIQQaAMAAAAAAAAAAAAAAAAghEAbAAAAAAAAAAAAAAAAACEE2gAAAAAAAAAAAAAAAAAIIdAGAAAAAAAAAAAAAAAAQAiBNgAAAAAAAAAAAAAAAABCCLQBAAAAAAAAAAAAAAAAEEKgDQAAAAAAAAAAAAAAAIAQAm0AAAAAAAAAAAAAAAAAhBBoAwAAAAAAAAAAAAAAACCEQBsAAAAAAAAAAAAAAAAAIQTaAAAAAAAAAAAAAAAAAAgh0AYAAAAAAAAAAAAAAABACIE2AAAAAAAAAAAAAAAAAEIItAEAAAAAAAAAAAAAAAAQQqANAAAAAAAAAAAAAAAAgBACbQAAAAAAAAAAAAAAAACEEGgDAAAAAAAAAAAAAAAAIIRAGwAAAAAAAAAAAAAAAAAhBNoAAAAAAAAAAAAAAAAACCHQBgAAAAAAAAAAAAAAAEAIgTYAAAAAAAAAAAAAAAAAQgi0AQAAAAAAAAAAAAAAABBCoA0AAAAAAAAAAAAAAACAEAJtAAAAAAAAAAAAAAAAAIQQaAMAAAAAAAAAAAAAAAAghEAbAAAAAAAAAAAAAAAAACEE2gAAAAAAAAAAAAAAAAAIIdAGAAAAAAAAAAAAAAAAQAiBNgAAAAAAAAAAAAAAAABCCLQBAAAAAAAAAAAAAAAAEEKgDQAAAAAAAAAAAAAAAIAQAm0AAAAAAAAAAAAAAAAAhBBoAwAAAAAAAAAAAAAAACCEQBsAAAAAAAAAAAAAAAAAIQTaAAAAAAAAAAAAAAAAAAgh0AYAAAAAAAAAAAAAAABACIE2AAAAAAAAAAAAAAAAAEIItAEAAAAAAAAAAAAAAAAQQqANAAAAAAAAAAAAAAAAgBACbQAAAAAAAAAAAAAAAACEEGgDAAAAAAAAAAAAAAAAIIRAGwAAAAAAAAAAAAAAAAAhBNoAAAAAAAAAAAAAAAAACCHQBgAAAAAAAAAAAAAAAEAIgTYAAAAAAAAAAAAAAAAAQgi0AQAAAAAAAAAAAAAAABBCoA0AAAAAAAAAAAAAAACAEAJtAAAAAAAAAAAAAAAAAIQQaAMAAAAAAAAAAAAAAAAghEAbAAAAAAAAAAAAAAAAACEE2gAAAAAAAAAAAAAAAAAIIdAGAAAAAAAAAAAAAAAAQAiBNgAAAAAAAAAAAAAAAABCCLQBAAAAAAAAAAAAAAAAEEKgDQAAAAAAAAAAAAAAAIAQAm0AAAAAAAAAAAAAAAAAhBBoAwAAAAAAAAAAAAAAACCEQBsAAAAAAAAAAAAAAAAAIQTaAAAAAAAAAAAAAAAAAAgh0AYAAAAAAAAAAAAAAABACIE2AAAAAAAAAAAAAAAAAEIItAEAAAAAAAAAAAAAAAAQQqANAAAAAAAAAAAAAAAAgBACbQAAAAAAAAAAAAAAAACEEGgDAAAAAAAAAAAAAAAAIIRAGwAAAAAAAAAAAAAAAAAhBNoAAAAAAAAAAAAAAAAACCHQBgAAAAAAAAAAAAAAAEAIgTYAAAAAAAAAAAAAAAAAQgi0AQAAAAAAAAAAAAAAABBCoA0AAAAAAAAAAAAAAACAEAJtAAAAAAAAAAAAAAAAAIQQaAMAAAAAAAAAAAAAAAAghEAbAAAAAAAAAAAAAAAAACEE2gAAAAAAAAAAAAAAAAAIIdDG/9i3YwEAAACAQf7Ws9hVHgEAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAA3yGTUQAAIABJREFUAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAYt+OBQAAAAAG+VvPYld5BLAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAFD7diwAAAAAMMjfeha7yiMAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAABHfO/mAAAA5klEQVQAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAI093YBrEKdXgAAAAASUVORK5CYII=";
+const LOGO_MARK_B64  = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAADbQAAAmxCAYAAAAzDJ9VAAAACXBIWXMAAC4jAAAuIwF4pT92AAAgAElEQVR4nOzbQQHAIBDAsDH/ng8VlAeJghrompkPAAAAAAAAAAAAAAAAAE77bwcAAAAAAAAAAAAAAAAA8AZDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAAAAACUMbAAAAAAAAAAAAAAAAAAlDGwAAAAAAAAAAAAAAAAAJQxsAAAAAAAAAAAAAm307FgAAAAAY5G89i13lEQAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCG01Tej0AACAASURBVAAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAEDs3cFt20AQQFGwNJ9cjatRNT65NOYQBHAS2bIs+Yu7+14DnOF18TEAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAAAAAAAAAAAEBC0AYAAAAAAAAAAAAAAABAQtAGAAAAAAAAAAAAAAAAQELQBgAAAAAA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QBsAAAAAAAAAAAAAAAAAIQTaAAAAAAAAAAAAAAAAAAgh0AYAAAAAAAAAAAAAAABACIE2AAAAAAAAAAAAAAAAAEIItAEAAAAAAAAAAAAAAAAQQqANAAAAAAAAAAAAAAAAgBACbQAAAAAAAAAAAAAAAACEEGgDAAAAAAAAAAAAAAAAIIRAGwAAAAAAAAAAAAAAAAAhBNoAAAAAAAAAAAAAAAAACCHQBgAAAAAAAAAAAAAAAEAIgTYAAAAAAAAAAAAAAAAAQgi0AQAAAAAAAAAAAAAAABBCoA0AAAAAAAAAAAAAAACAEAJtAAAAAAAAAAAAAAAAAIQQaAMAAAAAAAAAAAAAAAAghEAbAAAAAAAAAAAAAAAAACEE2gAAAAAAAAAAAAAAAAAIIdAGAAAAAAAAAAAAAAAAQAiBNgAAAAAAAAAAAAAAAABCCLQBAAAAAAAAAAAAAAAAEEKgDQAAAAAAAAAAAAAAAIAQAm0AAAAAAAAAAAAAAAAAhBBoAwAAAAAAAAAAAAAAACCEQBsAAAAAAAAAAAAAAAAAIQTaAAAAAAAAAAAAAAAAAAgh0AYAAAAAAAAAAAAAAABACIE2AAAAAAAAAAAAAAAAAEIItAEAAAAAAAAAAAAAAAAQQqANAAAAAAAAAAAAAAAAgBACbQAAAAAAAAAAAAAAAACEEGgDAAAAAAAAAAAAAAAAIIRAGwAAAAAAAAAAAAAAAAAhBNoAAAAAAAAAAAAAAAAACCHQBgAAAAAAAAAAAAAAAEAIgTYAAAAAAAAAAAAAAAAAQgi0AQAAAAAAAAAAAAAAABBCoA0AAAAAAAAAAAAAAACAEAJtAAAAAAAAAAAAAAAAAIQQaAMAAAAAAAAAAAAAAAAghEAbAAAAAAAAAAAAAAAAACEE2gAAAAAAAAAAAAAAAAAIIdAGAAAAAAAAAAAAAAAAQAiBNgAAAAAAAAAAAAAAAABCCLQBAAAAAAAAAAAAAAAAEEKgDQAAAAAAAAAAAAAAAIAQAm0AAAAAAAAAAAAAAAAAhBBoAwAAAAAAAAAAAAAAACCEQBsAAAAAAAAAAAAAAAAAIQTaAAAAAAAAAAAAAAAAAAgh0AYAAAAAAAAAAAAAAABACIE2AAAAAAAAAAAAAAAAAEIItAEAAAAAAAAAAAAAAAAQQqANAAAAAAAAAAAAAAAAgBACbQAAAAAAAAAAAAAAAACEEGgDAAAAAAAAAAAAAAAAIIRAGwAAAAAAAAAAAAAAAAAhBNoAAAAAAAAAAAAAAAAACCHQBgAAAAAAAAAAAAAAAEAIgTYAAAAAAAAAAAAAAAAAQgi0AQAAAAAAAAAAAAAAABBCoA0AAAAAAAAAAAAAAACAEAJtAAAAAAAAAAAAAAAAAIQQaAMAAAAAAAAAAAAAAAAghEAbAAAAAAAAAAAAAAAAACEE2gAAAAAAAAAAAAAAAAAIIdAGAAAAAAAAAAAAAAAAQAiBNgAAAAAAAAAAAAAAAABCCLQBAAAAAAAAAAAAAAAAEEKgDQAAAAAAAAAAAAAAAIAQAm0AAAAAAAAAAAAAAAAAhBBoAwAAAAAAAAAAAAAAACCEQBsAAAAAAAAAAAAAAAAAIQTaAAAAAAAAAAAAAAAAAAgh0AYAAAAAAAAAAAAAAABACIE2AAAAAAAAAAAAAAAAAEIItAEAAAAAAAAAAAAAAAAQQqANAAAAAAAAAAAAAAAAgBACbQAAAAAAAAAAAAAAAACEEGgDAAAAAAAAAAAAAAAAIIRAGwAAAAAAAAAAAAAAAAAhBNoAAAAAAAAAAAAAAAAACCHQBgAAAAAAAAAAAAAAAEAIgTYAAAAAAAAAAAAAAAAAQgi0AQAAAAAAAAAAAAAAABBCoA0AAAAAAAAAAAAAAACAEAJtAAAAAAAAAAAAAAAAAIQQaAMAAAAAAAAAAAAAAAAghEAbAAAAAAAAAAAAAAAAACEE2gAAAAAAAAAAAAAAAAAIIdAGAAAAAAAAAAAAAAAAQAiBNgAAAAAAAAAAAAAAAABCCLQBAAAAAAAAAAAAAAAAEEKgDQAAAAAAAAAAAAAAAIAQAm0AAAAAAAAAAAAAAAAAhBBoAwAAAAAAAAAAAAAAACCEQBsAAAAAAAAAAAAAAAAAIQTaAAAAAAAAAAAAAAAAAAgh0AYAAAAAAAAAAAAAAABACIE2AAAAAAAAAAAAAAAAAEIItAEAAAAAAAAAAAAAAAAQQqANAAAAAAAAAAAAAAAAgBACbQAAAAAAAAAAAAAAAACEEGgDAAAAAAAAAAAAAAAAIIRAGwDwD/t2LAAAAAAwyN96FrvKIwAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCt+6wrAAAIABJREFUGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshLbYt2MBAAAAgEH+1rPYVR4BAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAGrfjgUAAAAABvlbz2JXeQTAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAEAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMBCaAMAAAAAAAAAAAAAAABgIbQBAAAAAAAAAAAAAAAAsBDaAAAAAAAAAAAAAAAAAFgIbQAAAAAAAAAAAAAAAAAshDYAAAAAAAAAAAAAAAAAFkIbAAAAAAAAAAAAAAAAAAuhDQAAAAAAAAAAAAAAAICF0AYAAAAAAAAAAAAAAADAQmgDAAAAAAAAAAAAAAAAYCG0AQAAAAAAAAAAAAAAALAQ2gAAAAAAAAAAAAAAAABYCG0AAAAAAAAAAAAAAAAALIQ2AAAAAAAAAAAAAAAAABZCGwAAAAAAAAAAAAAAAAALoQ0AAAAAAAAAAAAAAACAhdAGAAAAAAAAAAAAAAAAwEJoAwAAAAAAAAAAAAAAAGAhtAFqp7m0AAAAcUlEQVQAAAAAAAAAAAAAAACwENoAAAAAAAAAAAAAAAAAWAhtAAAAAAAAAAAAAAAAACyENgAAAAAAAAAAAAAAAAAWQhsAAAAAAAAAAAAAAAAAC6ENAAAAAAAAAAAAAAAAgIXQBgAAAAAAAAAAAAAAAMAicdM9MubSZA4AAAAASUVORK5CYII=";
+
+function PBLogo({ variant = "color", size = 40, showWord = true, className = "" }) {
+  const lg = (window.PB_OVERRIDES && window.PB_OVERRIDES.logos) || {};
+  if (!showWord || variant === "mark") {
+    const mh = lg.markSize || size;
+    return <img src={lg.mark || LOGO_MARK_B64} height={mh} style={{width:"auto",display:"inline-block",verticalAlign:"middle"}} className={className} alt="Premier Bank" />;
+  }
+  const isWhite = (variant === "white" || variant === "white-text");
+  const src = isWhite ? (lg.white || LOGO_WHITE_B64) : (lg.color || LOGO_COLOR_B64);
+  const custom = isWhite ? lg.white : lg.color;
+  const slotSize = isWhite ? lg.footerSize : lg.headerSize;
+  // If the admin set an explicit size, use it. Otherwise: official PNGs have
+  // ~40% transparent padding so they render at size*1.4; a tightly-cropped
+  // uploaded logo renders at the requested size.
+  const h = slotSize ? slotSize : (custom ? size : Math.round(size * 1.4));
+  return <img src={src} height={h} style={{width:"auto",display:"inline-block",verticalAlign:"middle"}} className={className} alt="Premier Bank" />;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Icon System — every product/service has a custom SVG icon                 */
+/*  Renders in a colored circular container with the icon in brand color.    */
+/* -------------------------------------------------------------------------- */
+const ICON_PATHS = {
+  // ── Accounts ────────────────────────────────────────────────────────────
+  account: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="6" width="18" height="13" rx="2" />
+      <path d="M3 10h18" />
+      <path d="M7 15h3M14 15h3" />
+    </g>
+  ),
+  personal: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="8" r="3.5" />
+      <path d="M5 20c0-3.5 3-6.5 7-6.5s7 3 7 6.5" />
+    </g>
+  ),
+  student: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 10l9-4 9 4-9 4-9-4z" />
+      <path d="M7 12v4c0 1.5 2.5 3 5 3s5-1.5 5-3v-4" />
+      <path d="M21 10v5" />
+    </g>
+  ),
+  salary: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="5" width="18" height="14" rx="2" />
+      <circle cx="12" cy="12" r="2.5" />
+      <path d="M6 9v.01M18 15v.01" />
+    </g>
+  ),
+  business: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="7" width="18" height="13" rx="1.5" />
+      <path d="M8 7V5a2 2 0 012-2h4a2 2 0 012 2v2" />
+      <path d="M3 12h18" />
+      <path d="M11 12v2h2v-2" />
+    </g>
+  ),
+  saving: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 11c0-3 2.5-5.5 6-5.5h4c3.5 0 6 2.5 6 5.5v4c0 2-1.5 3.5-3.5 3.5H17l-1 2h-2l-.5-2H10l-.5 2h-2l-1-2H7.5C5.5 18.5 4 17 4 15z" />
+      <circle cx="9" cy="11" r="1" fill="currentColor" />
+      <path d="M14 7c0-1 .8-2 2-2" />
+    </g>
+  ),
+  hajj: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5 21V11l7-5 7 5v10" />
+      <rect x="9" y="13" width="6" height="8" />
+      <path d="M12 4V2M11 2h2" />
+    </g>
+  ),
+  joint: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="8" cy="9" r="3" />
+      <circle cx="16" cy="9" r="3" />
+      <path d="M2 20c0-3 2.5-5 6-5s6 2 6 5" />
+      <path d="M10 20c0-3 2.5-5 6-5s6 2 6 5" />
+    </g>
+  ),
+  women: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="8" r="4" />
+      <path d="M12 12v8M9 17h6" />
+    </g>
+  ),
+  ngo: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 21s-7-5-7-11a4 4 0 017-2.5A4 4 0 0119 10c0 6-7 11-7 11z" />
+    </g>
+  ),
+  corporate: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="9" width="8" height="11" />
+      <rect x="13" y="4" width="8" height="16" />
+      <path d="M6 13h2M6 16h2M16 8h2M16 11h2M16 14h2M16 17h2" />
+    </g>
+  ),
+  diaspora: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18M12 3c2.5 3 4 6.5 4 9s-1.5 6-4 9c-2.5-3-4-6.5-4-9s1.5-6 4-9z" />
+    </g>
+  ),
+
+  // ── Cards ───────────────────────────────────────────────────────────────
+  card: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="2" y="6" width="20" height="13" rx="2" />
+      <path d="M2 11h20" />
+      <circle cx="17" cy="15.5" r="1.8" />
+      <circle cx="19.5" cy="15.5" r="1.8" />
+    </g>
+  ),
+  cardElite: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="2" y="6" width="20" height="13" rx="2" />
+      <path d="M5 11l1 3h3l-2.5 2 1 3-2.5-2-2.5 2 1-3L1 14h3z" transform="translate(4 -1)" />
+    </g>
+  ),
+  cardPlatinum: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="2" y="6" width="20" height="13" rx="2" />
+      <circle cx="12" cy="13" r="2.5" />
+      <path d="M9.5 16l-1 3M14.5 16l1 3" />
+    </g>
+  ),
+
+  // ── Financing ────────────────────────────────────────────────────────────
+  auto: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 13l2-5c.4-1 1.4-2 2.5-2h9c1.1 0 2.1 1 2.5 2l2 5v5H3z" />
+      <circle cx="7" cy="17" r="1.8" />
+      <circle cx="17" cy="17" r="1.8" />
+      <path d="M3 13h18" />
+    </g>
+  ),
+  land: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 20l5-10 4 4 3-6 6 12z" />
+      <circle cx="17" cy="6" r="2" />
+    </g>
+  ),
+  trade: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="7" width="18" height="11" rx="1" />
+      <path d="M3 7L7 3h10l4 4" />
+      <path d="M9 12h6M12 14v3" />
+    </g>
+  ),
+  invest: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 17l5-5 4 4 8-9" />
+      <path d="M14 7h6v6" />
+    </g>
+  ),
+
+  // ── Digital / Services ───────────────────────────────────────────────────
+  wallet: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="6" width="18" height="13" rx="2" />
+      <path d="M3 10h12a2 2 0 012 2v1a2 2 0 01-2 2H3" />
+      <circle cx="14" cy="12.5" r="1" fill="currentColor" />
+    </g>
+  ),
+  mastercard: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="9" cy="12" r="6" />
+      <circle cx="15" cy="12" r="6" />
+    </g>
+  ),
+  swift: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18" />
+      <path d="M12 3c3 3.5 3 14.5 0 18" />
+      <path d="M12 3c-3 3.5-3 14.5 0 18" />
+    </g>
+  ),
+  internet: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="5" width="18" height="12" rx="1.5" />
+      <path d="M2 20h20M9 17v3M15 17v3" />
+      <path d="M8 11h2v2M14 11l2 2-2 2" />
+    </g>
+  ),
+  atm: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="5" y="3" width="14" height="18" rx="2" />
+      <path d="M8 7h8M9 11h6M10 14l4 1M9 17h6" />
+    </g>
+  ),
+  pos: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="4" y="3" width="16" height="14" rx="1.5" />
+      <path d="M7 8h10M7 11h6" />
+      <rect x="4" y="17" width="16" height="4" rx="1" />
+    </g>
+  ),
+  agency: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 21V10l8-6 8 6v11" />
+      <path d="M9 21v-5h6v5" />
+      <path d="M2 10h20" />
+    </g>
+  ),
+  payroll: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="16" rx="1" />
+      <path d="M7 9h10M7 12h6M7 15h8" />
+      <circle cx="17" cy="15" r="1.5" />
+    </g>
+  ),
+  wearable: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="7" y="6" width="10" height="12" rx="2" />
+      <path d="M9 6V3h6v3M9 18v3h6v-3" />
+      <path d="M14 12l-2 0c-1 0-1 1.4 0 1.4M14.5 10.5a2 2 0 010 3M16 9a4 4 0 010 6" />
+    </g>
+  ),
+  gateway: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="9" width="18" height="10" rx="1.5" />
+      <path d="M7 9V6a5 5 0 0110 0v3" />
+      <circle cx="12" cy="14" r="1.5" />
+      <path d="M12 15.5v2" />
+    </g>
+  ),
+  remittance: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M8 10c2-2 6-2 8 0M16 14c-2 2-6 2-8 0" />
+      <path d="M5 9l3 1-1-3M19 15l-3-1 1 3" />
+    </g>
+  ),
+
+  // ── About / Generic ──────────────────────────────────────────────────────
+  about: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 8v.01M12 11v6" />
+    </g>
+  ),
+  shariah: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M14 4c-4 0-8 3.5-8 8s4 8 8 8c1.5 0 3-.5 4-1.2-3 1-7-1.5-7-6.8s4-7.8 7-6.8C17 4.5 15.5 4 14 4z" />
+      <path d="M16 9l1 2 2 .3-1.5 1.4.4 2-1.9-1-1.9 1 .4-2L13.5 11.3 15.5 11z" />
+    </g>
+  ),
+  board: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="6" cy="9" r="2.5" />
+      <circle cx="18" cy="9" r="2.5" />
+      <circle cx="12" cy="7" r="3" />
+      <path d="M2 19c0-2.5 2-4.5 4-4.5s4 2 4 4.5" />
+      <path d="M14 19c0-2.5 2-4.5 4-4.5s4 2 4 4.5" />
+      <path d="M7 19c0-3 2.5-5.5 5-5.5s5 2.5 5 5.5" />
+    </g>
+  ),
+  team: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="9" cy="9" r="3" />
+      <circle cx="17" cy="11" r="2.5" />
+      <path d="M3 20c0-3 2.5-5 6-5s6 2 6 5" />
+      <path d="M14 20c.5-2 2-3.5 3-3.5s2.5 1.5 3 3.5" />
+    </g>
+  ),
+  news: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="14" height="16" rx="1" />
+      <path d="M7 8h6M7 11h6M7 14h6M7 17h4" />
+      <path d="M17 8h4v10a2 2 0 01-2 2h-2" />
+    </g>
+  ),
+  press: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 9l9-5 9 5-9 5z" />
+      <path d="M7 11v4c0 2 2.5 3.5 5 3.5s5-1.5 5-3.5v-4" />
+      <path d="M21 9v6M21 17l-1 3h2z" fill="currentColor" />
+    </g>
+  ),
+  gallery: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="5" width="18" height="14" rx="1.5" />
+      <circle cx="9" cy="10" r="1.5" />
+      <path d="M5 18l4-5 4 4 3-2 3 3" />
+    </g>
+  ),
+
+  // ── Utility ──────────────────────────────────────────────────────────────
+  check: (
+    <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5 12l5 5L20 7" />
+    </g>
+  ),
+  arrow: (
+    <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5 12h14M13 6l6 6-6 6" />
+    </g>
+  ),
+  phone: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5 4h4l2 5-3 2c1 2.5 2.5 4 5 5l2-3 5 2v4c0 1-1 2-2 2C8 21 3 16 3 6c0-1 1-2 2-2z" />
+    </g>
+  ),
+  shield: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 3l8 3v5c0 5-3.5 9-8 10-4.5-1-8-5-8-10V6z" />
+      <path d="M9 12l2 2 4-4" />
+    </g>
+  ),
+  globe: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18M12 3c3 3.5 3 14.5 0 18M12 3c-3 3.5-3 14.5 0 18" />
+    </g>
+  ),
+  clock: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5l3 2" />
+    </g>
+  ),
+  star: (
+    <g fill="currentColor">
+      <path d="M12 3l2.5 6 6.5.6-5 4.4 1.5 6.4L12 17l-5.5 3.4L8 14l-5-4.4 6.5-.6z" />
+    </g>
+  ),
+  download: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 3v12M7 11l5 5 5-5M5 20h14" />
+    </g>
+  ),
+  play: (
+    <g fill="currentColor"><path d="M7 4l13 8-13 8z" /></g>
+  ),
+  chevronLeft: (
+    <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M15 6l-6 6 6 6" />
+    </g>
+  ),
+  chevronRight: (
+    <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 6l6 6-6 6" />
+    </g>
+  ),
+  search: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="11" cy="11" r="6" /><path d="M16 16l4 4" />
+    </g>
+  ),
+  close: (
+    <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M6 6l12 12M18 6L6 18" />
+    </g>
+  ),
+  plus: (
+    <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 5v14M5 12h14" />
+    </g>
+  ),
+  menu: (
+    <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 7h16M4 12h16M4 17h16" />
+    </g>
+  ),
+  send: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 4L3 11l7 2 2 7z" /><path d="M21 4L11 14" />
+    </g>
+  ),
+  receive: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 12V4M4 12h8M4 12L14 2" />
+    </g>
+  ),
+  bills: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M6 3h12v18l-3-2-3 2-3-2-3 2z" />
+      <path d="M9 8h6M9 12h6M9 16h4" />
+    </g>
+  ),
+  topup: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="6" y="3" width="12" height="18" rx="2" />
+      <path d="M12 11v6M9 14h6" />
+    </g>
+  ),
+  pin: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 21s-7-7-7-12a7 7 0 0114 0c0 5-7 12-7 12z" />
+      <circle cx="12" cy="9" r="2.5" />
+    </g>
+  ),
+  eye: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z" />
+      <circle cx="12" cy="12" r="3" />
+    </g>
+  ),
+  eyeOff: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9.9 5.2A9.5 9.5 0 0112 5c6.5 0 10 7 10 7a17 17 0 01-3 3.8M6.1 6.1A17 17 0 002 12s3.5 7 10 7a9.3 9.3 0 004.1-.9" />
+      <path d="M9.9 9.9a3 3 0 004.2 4.2" />
+      <path d="M3 3l18 18" />
+    </g>
+  ),
+  link: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M10 13a5 5 0 007.1 0l2-2a5 5 0 00-7.1-7.1l-1.2 1.2" />
+      <path d="M14 11a5 5 0 00-7.1 0l-2 2a5 5 0 007.1 7.1l1.2-1.2" />
+    </g>
+  ),
+  image: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <circle cx="8.5" cy="9" r="1.6" />
+      <path d="M21 16l-5-5-9 9" />
+    </g>
+  ),
+  warn: (
+    <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 3l9.5 16.5H2.5L12 3z" />
+      <path d="M12 10v4M12 17.5v.5" />
+    </g>
+  ),
+  quote: (
+    <g fill="currentColor" stroke="none">
+      <path d="M7 7c-2 0-3.5 1.6-3.5 3.6S5 14 6.7 14c.3 0 .6 0 .8-.1-.3 1.3-1.4 2.4-2.7 2.8l.7 1.3c2.4-.8 4-3 4-5.6V10.5C9.2 8.5 8.3 7 7 7zM16 7c-2 0-3.5 1.6-3.5 3.6S14 14 15.7 14c.3 0 .6 0 .8-.1-.3 1.3-1.4 2.4-2.7 2.8l.7 1.3c2.4-.8 4-3 4-5.6V10.5C18.2 8.5 17.3 7 16 7z" />
+    </g>
+  ),
+  bold: (
+    <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M7 5h6a3.5 3.5 0 010 7H7zM7 12h7a3.5 3.5 0 010 7H7z" />
+    </g>
+  ),
+};
+
+/* -------------------------------------------------------------------------- */
+/*  Icon component                                                            */
+/* -------------------------------------------------------------------------- */
+function Icon({ name, size = 24, color, className = "", style }) {
+  const path = ICON_PATHS[name];
+  if (!path) return null;
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      className={className}
+      style={{ color: color || "currentColor", display: "inline-block", verticalAlign: "middle", ...style }}
+      aria-hidden="true"
+    >{path}</svg>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  IconCircle — icon inside a tinted circle (the main UI affordance)        */
+/* -------------------------------------------------------------------------- */
+function IconCircle({ name, size = 48, tone = "green", className = "" }) {
+  // tone: "green" | "navy" | "ghost-green" | "ghost-navy"
+  const bg = {
+    green: PB_BRAND.green,
+    navy: PB_BRAND.navy,
+    "ghost-green": "rgba(108,190,70,0.14)",
+    "ghost-navy":  "rgba(11,47,79,0.08)",
+    "soft-green":  "rgba(108,190,70,0.18)",
+    "soft-navy":   "rgba(11,47,79,0.10)",
+  }[tone];
+  const fg = {
+    green: "#ffffff",
+    navy: "#ffffff",
+    "ghost-green": PB_BRAND.green,
+    "ghost-navy":  PB_BRAND.navy,
+    "soft-green":  PB_BRAND.green,
+    "soft-navy":   PB_BRAND.navy,
+  }[tone];
+  return (
+    <span
+      className={`pb-icon-circle ${className}`}
+      style={{
+        width: size,
+        height: size,
+        borderRadius: "50%",
+        background: bg,
+        color: fg,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flexShrink: 0,
+      }}
+    >
+      <Icon name={name} size={Math.round(size * 0.46)} />
+    </span>
+  );
+}
+
+Object.assign(window, { PB_BRAND, LogoMark, PBLogo, Icon, IconCircle, ICON_PATHS });
+
+
+/* ============================================================ */
+
+
+// tweaks-panel.jsx
+// Reusable Tweaks shell + form-control helpers.
+//
+// Owns the host protocol (listens for __activate_edit_mode / __deactivate_edit_mode,
+// posts __edit_mode_available / __edit_mode_set_keys / __edit_mode_dismissed) so
+// individual prototypes don't re-roll it. Ships a consistent set of controls so you
+// don't hand-draw <input type="range">, segmented radios, steppers, etc.
+//
+// Usage (in an HTML file that loads React + Babel):
+//
+//   const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+//     "primaryColor": "#D97757",
+//     "palette": ["#D97757", "#29261b", "#f6f4ef"],
+//     "fontSize": 16,
+//     "density": "regular",
+//     "dark": false
+//   }/*EDITMODE-END*/;
+//
+//   function App() {
+//     const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
+//     return (
+//       <div style={{ fontSize: t.fontSize, color: t.primaryColor }}>
+//         Hello
+//         <TweaksPanel>
+//           <TweakSection label="Typography" />
+//           <TweakSlider label="Font size" value={t.fontSize} min={10} max={32} unit="px"
+//                        onChange={(v) => setTweak('fontSize', v)} />
+//           <TweakRadio  label="Density" value={t.density}
+//                        options={['compact', 'regular', 'comfy']}
+//                        onChange={(v) => setTweak('density', v)} />
+//           <TweakSection label="Theme" />
+//           <TweakColor  label="Primary" value={t.primaryColor}
+//                        options={['#D97757', '#2A6FDB', '#1F8A5B', '#7A5AE0']}
+//                        onChange={(v) => setTweak('primaryColor', v)} />
+//           <TweakColor  label="Palette" value={t.palette}
+//                        options={[['#D97757', '#29261b', '#f6f4ef'],
+//                                  ['#475569', '#0f172a', '#f1f5f9']]}
+//                        onChange={(v) => setTweak('palette', v)} />
+//           <TweakToggle label="Dark mode" value={t.dark}
+//                        onChange={(v) => setTweak('dark', v)} />
+//         </TweaksPanel>
+//       </div>
+//     );
+//   }
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
+const __TWEAKS_STYLE = `
+  .twk-panel{position:fixed;right:16px;bottom:16px;z-index:2147483646;width:280px;
+    max-height:calc(100vh - 32px);display:flex;flex-direction:column;
+    transform:scale(var(--dc-inv-zoom,1));transform-origin:bottom right;
+    background:rgba(250,249,247,.78);color:#29261b;
+    -webkit-backdrop-filter:blur(24px) saturate(160%);backdrop-filter:blur(24px) saturate(160%);
+    border:.5px solid rgba(255,255,255,.6);border-radius:14px;
+    box-shadow:0 1px 0 rgba(255,255,255,.5) inset,0 12px 40px rgba(0,0,0,.18);
+    font:11.5px/1.4 ui-sans-serif,system-ui,-apple-system,sans-serif;overflow:hidden}
+  .twk-hd{display:flex;align-items:center;justify-content:space-between;
+    padding:10px 8px 10px 14px;cursor:move;user-select:none}
+  .twk-hd b{font-size:12px;font-weight:600;letter-spacing:.01em}
+  .twk-x{appearance:none;border:0;background:transparent;color:rgba(41,38,27,.55);
+    width:22px;height:22px;border-radius:6px;cursor:default;font-size:13px;line-height:1}
+  .twk-x:hover{background:rgba(0,0,0,.06);color:#29261b}
+  .twk-body{padding:2px 14px 14px;display:flex;flex-direction:column;gap:10px;
+    overflow-y:auto;overflow-x:hidden;min-height:0;
+    scrollbar-width:thin;scrollbar-color:rgba(0,0,0,.15) transparent}
+  .twk-body::-webkit-scrollbar{width:8px}
+  .twk-body::-webkit-scrollbar-track{background:transparent;margin:2px}
+  .twk-body::-webkit-scrollbar-thumb{background:rgba(0,0,0,.15);border-radius:4px;
+    border:2px solid transparent;background-clip:content-box}
+  .twk-body::-webkit-scrollbar-thumb:hover{background:rgba(0,0,0,.25);
+    border:2px solid transparent;background-clip:content-box}
+  .twk-row{display:flex;flex-direction:column;gap:5px}
+  .twk-row-h{flex-direction:row;align-items:center;justify-content:space-between;gap:10px}
+  .twk-lbl{display:flex;justify-content:space-between;align-items:baseline;
+    color:rgba(41,38,27,.72)}
+  .twk-lbl>span:first-child{font-weight:500}
+  .twk-val{color:rgba(41,38,27,.5);font-variant-numeric:tabular-nums}
+
+  .twk-sect{font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+    color:rgba(41,38,27,.45);padding:10px 0 0}
+  .twk-sect:first-child{padding-top:0}
+
+  .twk-field{appearance:none;width:100%;height:26px;padding:0 8px;
+    border:.5px solid rgba(0,0,0,.1);border-radius:7px;
+    background:rgba(255,255,255,.6);color:inherit;font:inherit;outline:none}
+  .twk-field:focus{border-color:rgba(0,0,0,.25);background:rgba(255,255,255,.85)}
+  select.twk-field{padding-right:22px;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='rgba(0,0,0,.5)' d='M0 0h10L5 6z'/></svg>");
+    background-repeat:no-repeat;background-position:right 8px center}
+
+  .twk-slider{appearance:none;-webkit-appearance:none;width:100%;height:4px;margin:6px 0;
+    border-radius:999px;background:rgba(0,0,0,.12);outline:none}
+  .twk-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;
+    width:14px;height:14px;border-radius:50%;background:#fff;
+    border:.5px solid rgba(0,0,0,.12);box-shadow:0 1px 3px rgba(0,0,0,.2);cursor:default}
+  .twk-slider::-moz-range-thumb{width:14px;height:14px;border-radius:50%;
+    background:#fff;border:.5px solid rgba(0,0,0,.12);box-shadow:0 1px 3px rgba(0,0,0,.2);cursor:default}
+
+  .twk-seg{position:relative;display:flex;padding:2px;border-radius:8px;
+    background:rgba(0,0,0,.06);user-select:none}
+  .twk-seg-thumb{position:absolute;top:2px;bottom:2px;border-radius:6px;
+    background:rgba(255,255,255,.9);box-shadow:0 1px 2px rgba(0,0,0,.12);
+    transition:left .15s cubic-bezier(.3,.7,.4,1),width .15s}
+  .twk-seg.dragging .twk-seg-thumb{transition:none}
+  .twk-seg button{appearance:none;position:relative;z-index:1;flex:1;border:0;
+    background:transparent;color:inherit;font:inherit;font-weight:500;min-height:22px;
+    border-radius:6px;cursor:default;padding:4px 6px;line-height:1.2;
+    overflow-wrap:anywhere}
+
+  .twk-toggle{position:relative;width:32px;height:18px;border:0;border-radius:999px;
+    background:rgba(0,0,0,.15);transition:background .15s;cursor:default;padding:0}
+  .twk-toggle[data-on="1"]{background:#34c759}
+  .twk-toggle i{position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;
+    background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.25);transition:transform .15s}
+  .twk-toggle[data-on="1"] i{transform:translateX(14px)}
+
+  .twk-num{display:flex;align-items:center;height:26px;padding:0 0 0 8px;
+    border:.5px solid rgba(0,0,0,.1);border-radius:7px;background:rgba(255,255,255,.6)}
+  .twk-num-lbl{font-weight:500;color:rgba(41,38,27,.6);cursor:ew-resize;
+    user-select:none;padding-right:8px}
+  .twk-num input{flex:1;min-width:0;height:100%;border:0;background:transparent;
+    font:inherit;font-variant-numeric:tabular-nums;text-align:right;padding:0 8px 0 0;
+    outline:none;color:inherit;-moz-appearance:textfield}
+  .twk-num input::-webkit-inner-spin-button,.twk-num input::-webkit-outer-spin-button{
+    -webkit-appearance:none;margin:0}
+  .twk-num-unit{padding-right:8px;color:rgba(41,38,27,.45)}
+
+  .twk-btn{appearance:none;height:26px;padding:0 12px;border:0;border-radius:7px;
+    background:rgba(0,0,0,.78);color:#fff;font:inherit;font-weight:500;cursor:default}
+  .twk-btn:hover{background:rgba(0,0,0,.88)}
+  .twk-btn.secondary{background:rgba(0,0,0,.06);color:inherit}
+  .twk-btn.secondary:hover{background:rgba(0,0,0,.1)}
+
+  .twk-swatch{appearance:none;-webkit-appearance:none;width:56px;height:22px;
+    border:.5px solid rgba(0,0,0,.1);border-radius:6px;padding:0;cursor:default;
+    background:transparent;flex-shrink:0}
+  .twk-swatch::-webkit-color-swatch-wrapper{padding:0}
+  .twk-swatch::-webkit-color-swatch{border:0;border-radius:5.5px}
+  .twk-swatch::-moz-color-swatch{border:0;border-radius:5.5px}
+
+  .twk-chips{display:flex;gap:6px}
+  .twk-chip{position:relative;appearance:none;flex:1;min-width:0;height:46px;
+    padding:0;border:0;border-radius:6px;overflow:hidden;cursor:default;
+    box-shadow:0 0 0 .5px rgba(0,0,0,.12),0 1px 2px rgba(0,0,0,.06);
+    transition:transform .12s cubic-bezier(.3,.7,.4,1),box-shadow .12s}
+  .twk-chip:hover{transform:translateY(-1px);
+    box-shadow:0 0 0 .5px rgba(0,0,0,.18),0 4px 10px rgba(0,0,0,.12)}
+  .twk-chip[data-on="1"]{box-shadow:0 0 0 1.5px rgba(0,0,0,.85),
+    0 2px 6px rgba(0,0,0,.15)}
+  .twk-chip>span{position:absolute;top:0;bottom:0;right:0;width:34%;
+    display:flex;flex-direction:column;box-shadow:-1px 0 0 rgba(0,0,0,.1)}
+  .twk-chip>span>i{flex:1;box-shadow:0 -1px 0 rgba(0,0,0,.1)}
+  .twk-chip>span>i:first-child{box-shadow:none}
+  .twk-chip svg{position:absolute;top:6px;left:6px;width:13px;height:13px;
+    filter:drop-shadow(0 1px 1px rgba(0,0,0,.3))}
+`;
+
+// ── useTweaks ───────────────────────────────────────────────────────────────
+// Single source of truth for tweak values. setTweak persists via the host
+// (__edit_mode_set_keys → host rewrites the EDITMODE block on disk).
+function useTweaks(defaults) {
+  const [values, setValues] = React.useState(defaults);
+  // Accepts either setTweak('key', value) or setTweak({ key: value, ... }) so a
+  // useState-style call doesn't write a "[object Object]" key into the persisted
+  // JSON block.
+  const setTweak = React.useCallback((keyOrEdits, val) => {
+    const edits = typeof keyOrEdits === 'object' && keyOrEdits !== null
+      ? keyOrEdits : { [keyOrEdits]: val };
+    setValues((prev) => ({ ...prev, ...edits }));
+    window.parent.postMessage({ type: '__edit_mode_set_keys', edits }, '*');
+    // Same-window signal so in-page listeners (deck-stage rail thumbnails)
+    // can react — the parent message only reaches the host, not peers.
+    window.dispatchEvent(new CustomEvent('tweakchange', { detail: edits }));
+  }, []);
+  return [values, setTweak];
+}
+
+// ── TweaksPanel ─────────────────────────────────────────────────────────────
+// Floating shell. Registers the protocol listener BEFORE announcing
+// availability — if the announce ran first, the host's activate could land
+// before our handler exists and the toolbar toggle would silently no-op.
+// The close button posts __edit_mode_dismissed so the host's toolbar toggle
+// flips off in lockstep; the host echoes __deactivate_edit_mode back which
+// is what actually hides the panel.
+function TweaksPanel({ title = 'Tweaks', noDeckControls = false, children }) {
+  const [open, setOpen] = React.useState(false);
+  const dragRef = React.useRef(null);
+  // Auto-inject a rail toggle when a <deck-stage> is on the page. The
+  // toggle drives the deck's per-viewer _railVisible via window message;
+  // state is mirrored from the same localStorage key the deck reads so
+  // the control reflects reality across reloads. The mechanism is the
+  // message — authors who want custom placement can post it directly
+  // and pass noDeckControls to suppress this one.
+  const hasDeckStage = React.useMemo(
+    () => typeof document !== 'undefined' && !!document.querySelector('deck-stage'),
+    [],
+  );
+  // Hide the toggle until the host has actually enabled the rail (the
+  // __omelette_rail_enabled window message, posted only when the
+  // omelette_deck_rail_enabled flag is on for this user). The initial read
+  // covers TweaksPanel mounting after the message already arrived; the
+  // listener covers the common case of mounting first.
+  const [railEnabled, setRailEnabled] = React.useState(
+    () => hasDeckStage && !!document.querySelector('deck-stage')?._railEnabled,
+  );
+  React.useEffect(() => {
+    if (!hasDeckStage || railEnabled) return undefined;
+    const onMsg = (e) => {
+      if (e.data && e.data.type === '__omelette_rail_enabled') setRailEnabled(true);
+    };
+    window.addEventListener('message', onMsg);
+    return () => window.removeEventListener('message', onMsg);
+  }, [hasDeckStage, railEnabled]);
+  const [railVisible, setRailVisible] = React.useState(() => {
+    try { return localStorage.getItem('deck-stage.railVisible') !== '0'; } catch (e) { return true; }
+  });
+  const toggleRail = (on) => {
+    setRailVisible(on);
+    window.postMessage({ type: '__deck_rail_visible', on }, '*');
+  };
+  const offsetRef = React.useRef({ x: 16, y: 16 });
+  const PAD = 16;
+
+  const clampToViewport = React.useCallback(() => {
+    const panel = dragRef.current;
+    if (!panel) return;
+    const w = panel.offsetWidth, h = panel.offsetHeight;
+    const maxRight = Math.max(PAD, window.innerWidth - w - PAD);
+    const maxBottom = Math.max(PAD, window.innerHeight - h - PAD);
+    offsetRef.current = {
+      x: Math.min(maxRight, Math.max(PAD, offsetRef.current.x)),
+      y: Math.min(maxBottom, Math.max(PAD, offsetRef.current.y)),
+    };
+    panel.style.right = offsetRef.current.x + 'px';
+    panel.style.bottom = offsetRef.current.y + 'px';
+  }, []);
+
+  React.useEffect(() => {
+    if (!open) return;
+    clampToViewport();
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', clampToViewport);
+      return () => window.removeEventListener('resize', clampToViewport);
+    }
+    const ro = new ResizeObserver(clampToViewport);
+    ro.observe(document.documentElement);
+    return () => ro.disconnect();
+  }, [open, clampToViewport]);
+
+  React.useEffect(() => {
+    const onMsg = (e) => {
+      const t = e?.data?.type;
+      if (t === '__activate_edit_mode') setOpen(true);
+      else if (t === '__deactivate_edit_mode') setOpen(false);
+    };
+    window.addEventListener('message', onMsg);
+    window.parent.postMessage({ type: '__edit_mode_available' }, '*');
+    return () => window.removeEventListener('message', onMsg);
+  }, []);
+
+  const dismiss = () => {
+    setOpen(false);
+    window.parent.postMessage({ type: '__edit_mode_dismissed' }, '*');
+  };
+
+  const onDragStart = (e) => {
+    const panel = dragRef.current;
+    if (!panel) return;
+    const r = panel.getBoundingClientRect();
+    const sx = e.clientX, sy = e.clientY;
+    const startRight = window.innerWidth - r.right;
+    const startBottom = window.innerHeight - r.bottom;
+    const move = (ev) => {
+      offsetRef.current = {
+        x: startRight - (ev.clientX - sx),
+        y: startBottom - (ev.clientY - sy),
+      };
+      clampToViewport();
+    };
+    const up = () => {
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+    };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+  };
+
+  if (!open) return null;
+  return (
+    <>
+      <style>{__TWEAKS_STYLE}</style>
+      <div ref={dragRef} className="twk-panel" data-noncommentable=""
+           style={{ right: offsetRef.current.x, bottom: offsetRef.current.y }}>
+        <div className="twk-hd" onMouseDown={onDragStart}>
+          <b>{title}</b>
+          <button className="twk-x" aria-label="Close tweaks"
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={dismiss}>✕</button>
+        </div>
+        <div className="twk-body">
+          {children}
+          {hasDeckStage && railEnabled && !noDeckControls && (
+            <TweakSection label="Deck">
+              <TweakToggle label="Thumbnail rail" value={railVisible} onChange={toggleRail} />
+            </TweakSection>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ── Layout helpers ──────────────────────────────────────────────────────────
+
+function TweakSection({ label, children }) {
+  return (
+    <>
+      <div className="twk-sect">{label}</div>
+      {children}
+    </>
+  );
+}
+
+function TweakRow({ label, value, children, inline = false }) {
+  return (
+    <div className={inline ? 'twk-row twk-row-h' : 'twk-row'}>
+      <div className="twk-lbl">
+        <span>{label}</span>
+        {value != null && <span className="twk-val">{value}</span>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+// ── Controls ────────────────────────────────────────────────────────────────
+
+function TweakSlider({ label, value, min = 0, max = 100, step = 1, unit = '', onChange }) {
+  return (
+    <TweakRow label={label} value={`${value}${unit}`}>
+      <input type="range" className="twk-slider" min={min} max={max} step={step}
+             value={value} onChange={(e) => onChange(Number(e.target.value))} />
+    </TweakRow>
+  );
+}
+
+function TweakToggle({ label, value, onChange }) {
+  return (
+    <div className="twk-row twk-row-h">
+      <div className="twk-lbl"><span>{label}</span></div>
+      <button type="button" className="twk-toggle" data-on={value ? '1' : '0'}
+              role="switch" aria-checked={!!value}
+              onClick={() => onChange(!value)}><i /></button>
+    </div>
+  );
+}
+
+function TweakRadio({ label, value, options, onChange }) {
+  const trackRef = React.useRef(null);
+  const [dragging, setDragging] = React.useState(false);
+  // The active value is read by pointer-move handlers attached for the lifetime
+  // of a drag — ref it so a stale closure doesn't fire onChange for every move.
+  const valueRef = React.useRef(value);
+  valueRef.current = value;
+
+  // Segments wrap mid-word once per-segment width runs out. The track is
+  // ~248px (280 panel − 28 body pad − 4 seg pad), each button loses 12px
+  // to its own padding, and 11.5px system-ui averages ~6.3px/char — so 2
+  // options fit ~16 chars each, 3 fit ~10. Past that (or >3 options), fall
+  // back to a dropdown rather than wrap.
+  const labelLen = (o) => String(typeof o === 'object' ? o.label : o).length;
+  const maxLen = options.reduce((m, o) => Math.max(m, labelLen(o)), 0);
+  const fitsAsSegments = maxLen <= ({ 2: 16, 3: 10 }[options.length] ?? 0);
+  if (!fitsAsSegments) {
+    // <select> emits strings — map back to the original option value so the
+    // fallback stays type-preserving (numbers, booleans) like the segment path.
+    const resolve = (s) => {
+      const m = options.find((o) => String(typeof o === 'object' ? o.value : o) === s);
+      return m === undefined ? s : typeof m === 'object' ? m.value : m;
+    };
+    return <TweakSelect label={label} value={value} options={options}
+                        onChange={(s) => onChange(resolve(s))} />;
+  }
+  const opts = options.map((o) => (typeof o === 'object' ? o : { value: o, label: o }));
+  const idx = Math.max(0, opts.findIndex((o) => o.value === value));
+  const n = opts.length;
+
+  const segAt = (clientX) => {
+    const r = trackRef.current.getBoundingClientRect();
+    const inner = r.width - 4;
+    const i = Math.floor(((clientX - r.left - 2) / inner) * n);
+    return opts[Math.max(0, Math.min(n - 1, i))].value;
+  };
+
+  const onPointerDown = (e) => {
+    setDragging(true);
+    const v0 = segAt(e.clientX);
+    if (v0 !== valueRef.current) onChange(v0);
+    const move = (ev) => {
+      if (!trackRef.current) return;
+      const v = segAt(ev.clientX);
+      if (v !== valueRef.current) onChange(v);
+    };
+    const up = () => {
+      setDragging(false);
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+
+  return (
+    <TweakRow label={label}>
+      <div ref={trackRef} role="radiogroup" onPointerDown={onPointerDown}
+           className={dragging ? 'twk-seg dragging' : 'twk-seg'}>
+        <div className="twk-seg-thumb"
+             style={{ left: `calc(2px + ${idx} * (100% - 4px) / ${n})`,
+                      width: `calc((100% - 4px) / ${n})` }} />
+        {opts.map((o) => (
+          <button key={o.value} type="button" role="radio" aria-checked={o.value === value}>
+            {o.label}
+          </button>
+        ))}
+      </div>
+    </TweakRow>
+  );
+}
+
+function TweakSelect({ label, value, options, onChange }) {
+  return (
+    <TweakRow label={label}>
+      <select className="twk-field" value={value} onChange={(e) => onChange(e.target.value)}>
+        {options.map((o) => {
+          const v = typeof o === 'object' ? o.value : o;
+          const l = typeof o === 'object' ? o.label : o;
+          return <option key={v} value={v}>{l}</option>;
+        })}
+      </select>
+    </TweakRow>
+  );
+}
+
+function TweakText({ label, value, placeholder, onChange }) {
+  return (
+    <TweakRow label={label}>
+      <input className="twk-field" type="text" value={value} placeholder={placeholder}
+             onChange={(e) => onChange(e.target.value)} />
+    </TweakRow>
+  );
+}
+
+function TweakNumber({ label, value, min, max, step = 1, unit = '', onChange }) {
+  const clamp = (n) => {
+    if (min != null && n < min) return min;
+    if (max != null && n > max) return max;
+    return n;
+  };
+  const startRef = React.useRef({ x: 0, val: 0 });
+  const onScrubStart = (e) => {
+    e.preventDefault();
+    startRef.current = { x: e.clientX, val: value };
+    const decimals = (String(step).split('.')[1] || '').length;
+    const move = (ev) => {
+      const dx = ev.clientX - startRef.current.x;
+      const raw = startRef.current.val + dx * step;
+      const snapped = Math.round(raw / step) * step;
+      onChange(clamp(Number(snapped.toFixed(decimals))));
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+  return (
+    <div className="twk-num">
+      <span className="twk-num-lbl" onPointerDown={onScrubStart}>{label}</span>
+      <input type="number" value={value} min={min} max={max} step={step}
+             onChange={(e) => onChange(clamp(Number(e.target.value)))} />
+      {unit && <span className="twk-num-unit">{unit}</span>}
+    </div>
+  );
+}
+
+// Relative-luminance contrast pick — checkmarks drawn over a swatch need to
+// read on both #111 and #fafafa without per-option configuration. Hex input
+// only (#rgb / #rrggbb); named or rgb()/hsl() colors fall through to "light".
+function __twkIsLight(hex) {
+  const h = String(hex).replace('#', '');
+  const x = h.length === 3 ? h.replace(/./g, (c) => c + c) : h.padEnd(6, '0');
+  const n = parseInt(x.slice(0, 6), 16);
+  if (Number.isNaN(n)) return true;
+  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  return r * 299 + g * 587 + b * 114 > 148000;
+}
+
+const __TwkCheck = ({ light }) => (
+  <svg viewBox="0 0 14 14" aria-hidden="true">
+    <path d="M3 7.2 5.8 10 11 4.2" fill="none" strokeWidth="2.2"
+          strokeLinecap="round" strokeLinejoin="round"
+          stroke={light ? 'rgba(0,0,0,.78)' : '#fff'} />
+  </svg>
+);
+
+// TweakColor — curated color/palette picker. Each option is either a single
+// hex string or an array of 1-5 hex strings; the card adapts — a lone color
+// renders solid, a palette renders colors[0] as the hero (left ~2/3) with the
+// rest stacked in a sharp column on the right. onChange emits the
+// option in the shape it was passed (string stays string, array stays array).
+// Without options it falls back to the native color input for back-compat.
+function TweakColor({ label, value, options, onChange }) {
+  if (!options || !options.length) {
+    return (
+      <div className="twk-row twk-row-h">
+        <div className="twk-lbl"><span>{label}</span></div>
+        <input type="color" className="twk-swatch" value={value}
+               onChange={(e) => onChange(e.target.value)} />
+      </div>
+    );
+  }
+  // Native <input type=color> emits lowercase hex per the HTML spec, so
+  // compare case-insensitively. String() guards JSON.stringify(undefined),
+  // which returns the primitive undefined (no .toLowerCase).
+  const key = (o) => String(JSON.stringify(o)).toLowerCase();
+  const cur = key(value);
+  return (
+    <TweakRow label={label}>
+      <div className="twk-chips" role="radiogroup">
+        {options.map((o, i) => {
+          const colors = Array.isArray(o) ? o : [o];
+          const [hero, ...rest] = colors;
+          const sup = rest.slice(0, 4);
+          const on = key(o) === cur;
+          return (
+            <button key={i} type="button" className="twk-chip" role="radio"
+                    aria-checked={on} data-on={on ? '1' : '0'}
+                    aria-label={colors.join(', ')} title={colors.join(' · ')}
+                    style={{ background: hero }}
+                    onClick={() => onChange(o)}>
+              {sup.length > 0 && (
+                <span>
+                  {sup.map((c, j) => <i key={j} style={{ background: c }} />)}
+                </span>
+              )}
+              {on && <__TwkCheck light={__twkIsLight(hero)} />}
+            </button>
+          );
+        })}
+      </div>
+    </TweakRow>
+  );
+}
+
+function TweakButton({ label, onClick, secondary = false }) {
+  return (
+    <button type="button" className={secondary ? 'twk-btn secondary' : 'twk-btn'}
+            onClick={onClick}>{label}</button>
+  );
+}
+
+Object.assign(window, {
+  useTweaks, TweaksPanel, TweakSection, TweakRow,
+  TweakSlider, TweakToggle, TweakRadio, TweakSelect,
+  TweakText, TweakNumber, TweakColor, TweakButton,
+});
+
+
+/* ============================================================ */
+
+// Premier Bank — chrome (nav, utility bar, ticker, footer, login modal, branch locator)
+// Uses PBLogo + Icon from premier-brand.jsx
+const { useState, useEffect, useRef } = React;
+
+/* -------------------------------------------------------------------------- */
+/*  Utility (top) bar                                                         */
+/* -------------------------------------------------------------------------- */
+function UtilityBar({ lang, setLang }) {
+  return (
+    <div className="pb-utility">
+      <div className="pb-container pb-utility-inner">
+        <div className="pb-utility-left">
+          <span><Icon name="phone" size={13} /> +252 61 9999 999</span>
+          <span className="pb-util-sep">•</span>
+          <span>info@premierbank.so</span>
+          <span className="pb-util-sep pb-hide-md">•</span>
+          <span className="pb-hide-md">SWIFT · PBSMSOSM</span>
+        </div>
+        <div className="pb-utility-right">
+          <button className={`pb-lang-btn ${lang === "en" ? "is-active" : ""}`} onClick={() => setLang("en")}>EN</button>
+          <span className="pb-lang-sep">/</span>
+          <button className={`pb-lang-btn ${lang === "so" ? "is-active" : ""}`} onClick={() => setLang("so")}>SO</button>
+          <span className="pb-util-sep">•</span>
+          <a href="#careers">Careers</a>
+          <a href="#help">Help</a>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Sticky nav                                                                */
+/* -------------------------------------------------------------------------- */
+function Nav({ lang, setLang, onLogin, onOpenAccount, onOpenDetail, onLogo }) {
+  const [scrolled, setScrolled] = useState(false);
+  const [open, setOpen] = useState(null);
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const items = window.PB_CONTENT.nav[lang];
+
+  useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 8);
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+
+  return (
+    <header className={`pb-nav ${scrolled ? "is-scrolled" : ""}`}>
+      <UtilityBar lang={lang} setLang={setLang} />
+      <div className="pb-nav-main">
+        <div className="pb-container pb-nav-inner">
+          <a href="#" className="pb-nav-logo" onClick={(e) => { e.preventDefault(); if (onLogo) { onLogo(); } else { window.scrollTo({ top: 0, behavior: "smooth" }); } }}>
+            <PBLogo variant="color" size={36} />
+          </a>
+
+          <nav className="pb-nav-items pb-hide-md" onMouseLeave={() => setOpen(null)}>
+            {items.map((it, i) => (
+              <div
+                key={it.label}
+                className={`pb-nav-item ${open === i ? "is-open" : ""}`}
+                onMouseEnter={() => setOpen(i)}
+              >
+                <button>{it.label}<span className="pb-caret">▾</span></button>
+                {open === i && (
+                  <div className="pb-nav-dropdown">
+                    <div className="pb-nav-dropdown-grid">
+                      {it.items.map((sub) => {
+                        const key = window.PB_DETAIL_KEY && window.PB_DETAIL_KEY[sub];
+                        return (
+                          <button
+                            key={sub}
+                            type="button"
+                            className="pb-nav-dropdown-item"
+                            onClick={() => { setOpen(null); onOpenDetail && onOpenDetail(key || sub); }}
+                          >
+                            <span className="pb-nav-dropdown-dot" />
+                            <span>
+                              <strong>{sub}</strong>
+                              <em>{lang === "en" ? "Learn how it works →" : "Sida ay u shaqeyso →"}</em>
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </nav>
+
+          <div className="pb-nav-cta">
+            <button className="pb-btn pb-btn-ghost pb-hide-md" onClick={onLogin}>
+              Internet Banking
+            </button>
+            <button className="pb-btn pb-btn-primary" onClick={onOpenAccount}>
+              {lang === "en" ? "Open Account" : "Furo Akoon"}
+            </button>
+            <button className="pb-burger pb-show-md" onClick={() => setMobileOpen(!mobileOpen)} aria-label="menu">
+              <Icon name={mobileOpen ? "close" : "menu"} size={22} />
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {mobileOpen && (
+        <div className="pb-mobile-menu">
+          {items.map((it) => (
+            <details key={it.label}>
+              <summary>{it.label}</summary>
+              {it.items.map((s) => {
+                const key = window.PB_DETAIL_KEY && window.PB_DETAIL_KEY[s];
+                return (
+                  <a key={s} href="#" onClick={(e) => { e.preventDefault(); setMobileOpen(false); onOpenDetail && onOpenDetail(key || s); }}>{s}</a>
+                );
+              })}
+            </details>
+          ))}
+          <button className="pb-btn pb-btn-ghost" onClick={onLogin}>Internet Banking</button>
+        </div>
+      )}
+    </header>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  FX Ticker                                                                 */
+/* -------------------------------------------------------------------------- */
+function Ticker() {
+  const rates = window.PB_CONTENT.ticker;
+  const doubled = [...rates, ...rates, ...rates];
+  return (
+    <div className="pb-ticker">
+      <div className="pb-ticker-label">
+        <span className="pb-ticker-pulse" />
+        Live FX · {new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })}
+      </div>
+      <div className="pb-ticker-track">
+        <div className="pb-ticker-marquee">
+          {doubled.map((r, i) => (
+            <div key={i} className="pb-ticker-item">
+              <span className="pb-ticker-code">{r.code}</span>
+              <span className="pb-ticker-bid">{r.buy}</span>
+              <span className="pb-ticker-ask">{r.sell}</span>
+              <span className={`pb-ticker-arrow ${r.up ? "up" : "down"}`}>{r.up ? "▲" : "▼"}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Phone — Premier Wallet preview                                            */
+/* -------------------------------------------------------------------------- */
+function WalletPhone({ lang = "en", small = false }) {
+  const t = (en, so) => (lang === "en" ? en : so);
+  return (
+    <div className={`pb-phone ${small ? "is-small" : ""}`}>
+      <div className="pb-phone-frame">
+        <div className="pb-phone-notch" />
+        <div className="pb-phone-screen">
+          <div className="pb-phone-status">
+            <span>9:41</span>
+            <span className="pb-phone-status-icons">●●●●</span>
+          </div>
+          <div className="pb-phone-greet">
+            <div>
+              <p>{t("Salaam, Khadra", "Salaam, Khadra")}</p>
+              <h4>{t("Premier Wallet", "Premier Wallet")}</h4>
+            </div>
+            <div className="pb-phone-logo"><LogoMark size={28} variant="color" /></div>
+          </div>
+          <div className="pb-phone-balance">
+            <span>{t("Available balance", "Hadhaaga")}</span>
+            <strong>$ 4,820<sup>.50</sup></strong>
+            <div className="pb-phone-balance-foot">
+              <span>SOS 132,108,400</span>
+              <span className="pb-phone-pill">+ 2.4% mo</span>
+            </div>
+          </div>
+          <div className="pb-phone-actions">
+            {[
+              ["send",    t("Send",   "Dir")],
+              ["receive", t("Receive","Hel")],
+              ["bills",   t("Bills",  "Biil")],
+              ["topup",   t("Top up", "Top up")],
+            ].map(([icn, lab]) => (
+              <button key={lab}>
+                <IconCircle name={icn} size={36} tone="soft-green" />
+                {lab}
+              </button>
+            ))}
+          </div>
+          <div className="pb-phone-section">
+            <span>{t("Recent activity", "Wax dhowaan dhacay")}</span>
+            <a>{t("See all", "Eeg dhammaan")}</a>
+          </div>
+          <div className="pb-phone-tx">
+            {[
+              { icn: "send",      t: "Turkish Airlines", s: "Travel · 14 Mar",  a: "− $ 412.00", c: "out" },
+              { icn: "bills",     t: "Hano Supermarket", s: "Groceries · 13 Mar", a: "− $ 86.40", c: "out" },
+              { icn: "receive",   t: t("From Yusuf (Dubai)", "Ka Yusuf (Dubai)"), s: "Diaspora · 12 Mar", a: "+ $ 350.00", c: "in" },
+              { icn: "bills",     t: "BENADIR Water",    s: "Bills · 10 Mar",   a: "− $ 12.00",  c: "out" },
+            ].map((x, i) => (
+              <div key={i} className="pb-phone-tx-row">
+                <span className="pb-phone-tx-icon"><Icon name={x.icn} size={16} color={x.c === "in" ? "#6cbe46" : "#0b2f4f"} /></span>
+                <div className="pb-phone-tx-meta">
+                  <strong>{x.t}</strong>
+                  <em>{x.s}</em>
+                </div>
+                <span className={`pb-phone-tx-amt ${x.c}`}>{x.a}</span>
+              </div>
+            ))}
+          </div>
+          <div className="pb-phone-tabbar">
+            <span className="active">Home</span>
+            <span>Cards</span>
+            <span>Pay</span>
+            <span>Profile</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Login modal                                                               */
+/* -------------------------------------------------------------------------- */
+function LoginModal({ open, onClose }) {
+  const [tab, setTab] = useState("personal");
+  if (!open) return null;
+  return (
+    <div className="pb-modal-bg" onClick={onClose}>
+      <div className="pb-modal" onClick={(e) => e.stopPropagation()}>
+        <button className="pb-modal-close" onClick={onClose}><Icon name="close" size={16} /></button>
+        <div className="pb-modal-grid">
+          <div className="pb-modal-side">
+            <PBLogo variant="white" size={40} />
+            <h3>Internet Banking</h3>
+            <p>Bank from your desk. SWIFT, payroll, escrow, and statements — all secure, all online.</p>
+            <ul>
+              <li><Icon name="shield" size={16} /> 256-bit TLS · 2-factor authentication</li>
+              <li><Icon name="send" size={16} /> Instant Premier-to-Premier transfers</li>
+              <li><Icon name="globe" size={16} /> SWIFT to 101+ countries (PBSMSOSM)</li>
+            </ul>
+            <span className="pb-modal-trust">Secured by Premier Bank · ISO 27001</span>
+          </div>
+          <div className="pb-modal-form">
+            <div className="pb-modal-tabs">
+              <button className={tab === "personal" ? "is-active" : ""} onClick={() => setTab("personal")}>Personal</button>
+              <button className={tab === "corporate" ? "is-active" : ""} onClick={() => setTab("corporate")}>Corporate / Omni</button>
+            </div>
+            <label>
+              <span>{tab === "personal" ? "User ID" : "Corporate ID"}</span>
+              <input type="text" placeholder={tab === "personal" ? "e.g. 0617XXXXXX" : "PB-CORP-XXXXX"} defaultValue="" />
+            </label>
+            <label>
+              <span>Password</span>
+              <input type="password" placeholder="••••••••" defaultValue="" />
+            </label>
+            <div className="pb-modal-row">
+              <label className="pb-checkbox">
+                <input type="checkbox" /> <span>Remember this device</span>
+              </label>
+              <a href="#">Forgot?</a>
+            </div>
+            <button className="pb-btn pb-btn-primary pb-btn-block" onClick={onClose}>
+              Sign in securely
+            </button>
+            <p className="pb-modal-foot">
+              First time? <a>Activate your online banking →</a>
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Branch locator                                                            */
+/* -------------------------------------------------------------------------- */
+function BranchLocator({ lang }) {
+  const staticBranches = window.PB_CONTENT.branches;
+  const liveAtms = window.PB_LIVE_ATMS || [];
+  const hasLive = liveAtms.length > 0;
+
+  // Convert lat/lng to approximate SVG x/y (Somalia bbox: lat 0-12, lng 41-51)
+  const latLngToXY = (lat, lng) => ({
+    x: Math.min(95, Math.max(5, ((parseFloat(lng) - 41) / 10) * 100)),
+    y: Math.min(95, Math.max(5, ((12 - parseFloat(lat)) / 12) * 100)),
+  });
+
+  // Build branch items: live ATMs grouped by region, or static fallback
+  const [active, setActive] = useState(0);
+  const [filter, setFilter] = useState("all");
+  const [atmFilter, setAtmFilter] = useState("all");
+
+  // Static branch locator (always shown)
+  const filtered = filter === "all" ? staticBranches : filter === "intl" ? staticBranches.filter(b => b.intl) : staticBranches.filter(b => !b.intl);
+
+  // Live ATM list — filtered by region
+  const atmRegions = hasLive ? ["all"].concat([...new Set(liveAtms.map(a => a.region).filter(Boolean))]) : [];
+  const filteredAtms = hasLive
+    ? (atmFilter === "all" ? liveAtms : liveAtms.filter(a => a.region === atmFilter))
+    : [];
+
+  return (
+    <section className="pb-section pb-locator-section" id="locator">
+      <div className="pb-container">
+        <div className="pb-section-head">
+          <span className="pb-eyebrow">{lang === "en" ? "Find us" : "Naga hel"}</span>
+          <h2>{lang === "en" ? "40+ branches. 12,000+ agents." : "40+ laan. 12,000+ wakiil."}</h2>
+          <p>{lang === "en"
+            ? "From Berbera to Kismayo, Hargeisa to London — Premier is wherever Somalia goes."
+            : "Berbera ilaa Kismaayo, Hargeysa ilaa London — Premier wuxuu joogaa meel kasta oo Soomaali joogto."}</p>
+        </div>
+
+        {/* Branch map — static city pins */}
+        <div className="pb-locator">
+          <div className="pb-locator-list">
+            <div className="pb-locator-filter">
+              {[["all", "All"], ["dom", "Somalia"], ["intl", "International"]].map(([k, l]) => (
+                <button key={k} className={filter === k ? "is-active" : ""} onClick={() => { setFilter(k); setActive(0); }}>{l}</button>
+              ))}
+            </div>
+            <div className="pb-locator-items">
+              {filtered.map((b, i) => (
+                <button key={b.city} className={`pb-locator-item ${active === i ? "is-active" : ""}`} onClick={() => setActive(i)}>
+                  <span className="pb-locator-pin"><Icon name="pin" size={18} color={active === i ? "#6cbe46" : "#0b2f4f"} /></span>
+                  <span>
+                    <strong>{b.city}</strong>
+                    <em>{b.addr}</em>
+                  </span>
+                  <span className="pb-locator-count">{b.count}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="pb-locator-map">
+            <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="pb-locator-svg">
+              <defs>
+                <pattern id="pbgrid" width="4" height="4" patternUnits="userSpaceOnUse">
+                  <path d="M 4 0 L 0 0 0 4" fill="none" stroke="rgba(11,47,79,0.06)" strokeWidth="0.2" />
+                </pattern>
+              </defs>
+              <rect width="100" height="100" fill="url(#pbgrid)" />
+              <path
+                d="M30 20 Q35 10 50 12 Q66 14 72 22 Q70 32 66 38 Q62 50 58 60 Q56 72 52 82 Q44 88 40 78 Q36 68 38 58 Q32 50 30 38 Q28 28 30 20Z"
+                fill="rgba(108,190,70,0.08)"
+                stroke="rgba(11,47,79,0.18)"
+                strokeWidth="0.3"
+              />
+            </svg>
+            {filtered.map((b, i) => (
+              <button
+                key={b.city}
+                className={`pb-locator-pin-btn ${active === i ? "is-active" : ""} ${b.intl ? "is-intl" : ""}`}
+                style={{ left: `${b.x}%`, top: `${b.y}%` }}
+                onClick={() => setActive(i)}
+              >
+                <span className="pb-locator-ping" />
+                <span className="pb-locator-dot" />
+                {active === i && (
+                  <span className="pb-locator-tip">
+                    <strong>{b.city}</strong>
+                    <em>{b.count} {b.count === 1 ? "branch" : "branches"}</em>
+                  </span>
+                )}
+              </button>
+            ))}
+            {/* Live ATM pins from Supabase */}
+            {hasLive && liveAtms.filter(a => a.lat && a.lng).map((a) => {
+              const { x, y } = latLngToXY(a.lat, a.lng);
+              return (
+                <span key={a.id} className="pb-locator-pin-btn is-atm" style={{ left: `${x}%`, top: `${y}%`, pointerEvents: "none" }} title={a.location}>
+                  <span className="pb-locator-dot" style={{ background: "#6cbe46", width: 8, height: 8 }} />
+                </span>
+              );
+            })}
+            <div className="pb-locator-legend">
+              <span><i className="dom" /> Somalia</span>
+              <span><i className="intl" /> International</span>
+              {hasLive && <span><i style={{ background: "#6cbe46", borderRadius: "50%", display: "inline-block", width: 8, height: 8 }} /> ATM</span>}
+            </div>
+          </div>
+        </div>
+
+        {/* Live ATM directory from Supabase */}
+        {hasLive && (
+          <div style={{ marginTop: 40 }}>
+            <div className="pb-section-head" style={{ marginBottom: 20 }}>
+              <span className="pb-eyebrow"><Icon name="atm" size={14} /> {lang === "en" ? `${liveAtms.length} ATMs` : `${liveAtms.length} ATM`}</span>
+              <h3 style={{ fontSize: 22, margin: 0 }}>{lang === "en" ? "ATM Network" : "Shabakadda ATM"}</h3>
+            </div>
+            <div className="pb-locator-filter" style={{ marginBottom: 16, display: "flex", gap: 4, flexWrap: "wrap" }}>
+              {atmRegions.map(r => (
+                <button key={r} className={"pb-btn pb-btn-sm" + (atmFilter === r ? " pb-btn-secondary" : " pb-btn-outline")} style={{ padding: "6px 14px", fontSize: 13 }}
+                  onClick={() => setAtmFilter(r)}>
+                  {r === "all" ? (lang === "en" ? "All regions" : "Dhammaan") : r}
+                </button>
+              ))}
+            </div>
+            <div className="pb-atm-grid">
+              {filteredAtms.map(a => (
+                <div key={a.id} className="pb-atm-card">
+                  <div className="pb-atm-photo">
+                    {a.image
+                      ? <img src={a.image} alt={a.location} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                      : <IconCircle name="atm" size={40} tone="ghost-green" />}
+                  </div>
+                  <div className="pb-atm-body">
+                    {a.region && <span className="pb-atm-region">{a.region}</span>}
+                    <h3>{a.location}</h3>
+                    {a.number && <p className="pb-atm-num">ATM #{a.number}</p>}
+                    {a.lat && a.lng && (
+                      <a className="pb-atm-link"
+                        href={`https://www.google.com/maps/search/?api=1&query=${a.lat},${a.lng}`}
+                        target="_blank" rel="noopener">
+                        {lang === "en" ? "Open in Maps →" : "Fur Maps →"}
+                      </a>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Footer                                                                    */
+/* -------------------------------------------------------------------------- */
+function Footer({ lang, onOpenDetail }) {
+  const fo = (window.PB_OVERRIDES && window.PB_OVERRIDES.footer) || {};
+  const openLink = (label) => {
+    const key = window.PB_DETAIL_KEY && window.PB_DETAIL_KEY[label];
+    if (key && onOpenDetail) onOpenDetail(key);
+  };
+  const defDesc = lang === "en"
+    ? "Premier Bank is a Shari'ah-compliant commercial bank incorporated in Somalia in 2013 and licensed by the Central Bank of Somalia in 2014."
+    : "Premier Bank waa bangi waafaqsan Shareecada, Soomaaliya laga aasaasay 2013, oo shati ka qaatay CBS 2014.";
+  const desc = (lang === "en" ? fo.descEn : fo.descSo) || defDesc;
+  const socials = [["f", "Facebook"], ["ig", "Instagram"], ["x", "X"], ["in", "LinkedIn"], ["yt", "YouTube"]];
+  const copyright = fo.copyright || ("© " + new Date().getFullYear() + " Premier Bank Ltd. All rights reserved · Mogadishu · Hargeisa · Dubai · Nairobi · London");
+  const cols = [
+    { h: "Bank",     links: ["Personal Current", "Saving Account", "Salary Account", "Hajj & Umra", "Premier Wallet"] },
+    { h: "Borrow",   links: ["Auto Finance", "Land & Construction", "Business Trade Financing"] },
+    { h: "Services", links: ["Premier Mastercard", "ATM Network", "Premier POS", "SWIFT", "Payroll", "Agency Banking", "Payment Gateway"] },
+    { h: "Company",  links: ["Who We Are", "Mission & Values", "Board Members", "Shari'ah Board", "Newsroom"] },
+    { h: "Help",     links: ["FAQ", "Customer Support", "Terms & Conditions", "Privacy", "Security Statement"] },
+  ];
+  return (
+    <footer className="pb-footer">
+      <div className="pb-container">
+        <div className="pb-footer-top">
+          <div className="pb-footer-brand">
+            <PBLogo variant="white-text" size={42} />
+            <p>{desc}</p>
+            <div className="pb-footer-app">
+              <a className="pb-store">
+                <span><Icon name="download" size={20} color="#fff" /></span>
+                <span><em>Download on the</em><strong>App Store</strong></span>
+              </a>
+              <a className="pb-store">
+                <span><Icon name="play" size={18} color="#fff" /></span>
+                <span><em>Get it on</em><strong>Google Play</strong></span>
+              </a>
+            </div>
+            <div className="pb-footer-social">
+              {socials.map(([s, name]) => {
+                const href = (fo.social && fo.social[s]) || "";
+                return href
+                  ? <a key={s} href={href} target="_blank" rel="noopener" title={name}>{s.toUpperCase()}</a>
+                  : <a key={s} href="#" onClick={(e) => e.preventDefault()} title={name}>{s.toUpperCase()}</a>;
+              })}
+            </div>
+          </div>
+          <div className="pb-footer-cols">
+            {cols.map((c) => (
+              <div key={c.h}>
+                <h5>{c.h}</h5>
+                {c.links.map((l) => {
+                  const key = window.PB_DETAIL_KEY && window.PB_DETAIL_KEY[l];
+                  return key && onOpenDetail
+                    ? <a key={l} href="#" onClick={(e) => { e.preventDefault(); openLink(l); }}>{l}</a>
+                    : <a key={l} href="#" onClick={(e) => e.preventDefault()}>{l}</a>;
+                })}
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="pb-footer-bottom">
+          <div className="pb-footer-trust">
+            <span><Icon name="shield" size={12} color="#6cbe46" /> ISO 27001</span>
+            <span><Icon name="check" size={12} color="#6cbe46" /> PCI-DSS</span>
+            <span><Icon name="shariah" size={12} color="#6cbe46" /> Shari'ah Certified</span>
+            <span><Icon name="globe" size={12} color="#6cbe46" /> SWIFT BIC: PBSMSOSM</span>
+          </div>
+          <p>
+            {copyright}
+            <a href="#admin"
+              onClick={(e) => { e.preventDefault(); if (location.hash !== "#admin") { location.hash = "admin"; } }}
+              style={{ marginLeft: 14, color: "rgba(255,255,255,.45)", fontSize: 12, textDecoration: "none", display: "inline-flex", alignItems: "center", gap: 5 }}
+              title="Staff / admin login">
+              <Icon name="shield" size={12} color="rgba(255,255,255,.45)" /> {lang === "en" ? "Admin login" : "Gelitaanka maamulka"}
+            </a>
+          </p>
+        </div>
+      </div>
+    </footer>
+  );
+}
+
+Object.assign(window, { Nav, UtilityBar, Ticker, WalletPhone, LoginModal, BranchLocator, Footer });
+
+
+/* ============================================================ */
+
+// Premier Bank — main page sections
+const { useState: useStateS, useEffect: useEffectS, useRef: useRefS } = React;
+
+/* -------------------------------------------------------------------------- */
+/*  HERO SLIDER — 5 slides, autoplay, dot nav, arrow nav                      */
+/* -------------------------------------------------------------------------- */
+function HeroSlider({ lang, customHeadline, _tick }) {
+  const slides = window.PB_CONTENT.heroSlides;
+  const [i, setI] = useStateS(0);
+  const [paused, setPaused] = useStateS(false);
+  const len = slides.length;
+
+  useEffectS(() => {
+    if (paused) return;
+    const id = setInterval(() => setI((x) => (x + 1) % len), 6000);
+    return () => clearInterval(id);
+  }, [paused, len]);
+
+  const tt = (o) => (lang === "en" ? o.en : o.so) || o.en;
+  const next = () => setI((x) => (x + 1) % len);
+  const prev = () => setI((x) => (x - 1 + len) % len);
+
+  return (
+    <section
+      className="pb-hero-slider"
+      onMouseEnter={() => setPaused(true)}
+      onMouseLeave={() => setPaused(false)}>
+      
+      <div className="pb-hero-track" style={{ transform: `translateX(-${i * 100}%)` }}>
+        {slides.map((s, idx) =>
+        <HeroSlide key={s.id} slide={s} lang={lang} active={idx === i} customHeadline={idx === 0 ? customHeadline : ""} />
+        )}
+      </div>
+
+      <button className="pb-hero-arrow pb-hero-arrow-prev" onClick={prev} aria-label="Previous">
+        <Icon name="chevronLeft" size={20} />
+      </button>
+      <button className="pb-hero-arrow pb-hero-arrow-next" onClick={next} aria-label="Next">
+        <Icon name="chevronRight" size={20} />
+      </button>
+
+      <div className="pb-hero-dots">
+        {slides.map((s, idx) =>
+        <button
+          key={s.id}
+          className={`pb-hero-dot ${i === idx ? "is-active" : ""}`}
+          onClick={() => setI(idx)}
+          aria-label={`Slide ${idx + 1}`}>
+          
+            <span className="pb-hero-dot-track"><span className="pb-hero-dot-fill" /></span>
+            <em>0{idx + 1}</em>
+            <strong>{tt(s.eyebrow)}</strong>
+          </button>
+        )}
+      </div>
+
+      <div className="pb-hero-progress">
+        <div className="pb-hero-progress-bar" style={{ width: `${(i + 1) / len * 100}%` }} />
+      </div>
+    </section>);
+
+}
+
+function HeroSlide({ slide, lang, active, customHeadline }) {
+  const tt = (o) => (lang === "en" ? o.en : o.so) || o.en;
+  const title = customHeadline || tt(slide.title);
+  const bg = slide.image;            // optional full-bleed background image
+  const artImg = slide.artImage;     // optional image replacing the vector art
+  return (
+    <div className={`pb-hero-slide pb-hero-slide-${slide.tint}${bg ? " has-bg" : ""}`}>
+      <div className="pb-hero-slide-bg" aria-hidden>
+        {bg && <img className="pb-hero-bg-img" src={bg} alt="" />}
+        <span className="pb-hero-blob pb-hero-blob-a" />
+        <span className="pb-hero-blob pb-hero-blob-b" />
+        <span className="pb-hero-gridlines" />
+      </div>
+      <div className="pb-container pb-hero-slide-grid">
+        <div className={`pb-hero-copy ${active ? "is-in" : ""}`}>
+          <span className="pb-hero-eyebrow"><Icon name={slide.icon} size={14} /> {tt(slide.eyebrow)}</span>
+          <h1 className="pb-h1">{title}</h1>
+          <p className="pb-hero-sub">{tt(slide.sub)}</p>
+          <div className="pb-hero-ctas">
+            <button className="pb-btn pb-btn-secondary pb-btn-lg">{tt(slide.cta)} <Icon name="arrow" size={16} /></button>
+            <button className="pb-btn pb-btn-glass pb-btn-lg"><Icon name="play" size={12} /> Watch tour</button>
+          </div>
+        </div>
+        <div className={`pb-hero-art ${active ? "is-in" : ""}`}>
+          {artImg ? <img className="pb-hero-art-img" src={artImg} alt="" /> : <HeroArt kind={slide.art} lang={lang} />}
+        </div>
+      </div>
+    </div>);
+
+}
+
+/* -------------------------------------------------------------------------- */
+/*  HERO ART — per-slide visual                                               */
+/* -------------------------------------------------------------------------- */
+function HeroArt({ kind, lang }) {
+  if (kind === "wallet") return <ArtWallet lang={lang} />;
+  if (kind === "card") return <ArtCard />;
+  if (kind === "swift") return <ArtSwift />;
+  if (kind === "finance") return <ArtFinance />;
+  if (kind === "agency") return <ArtAgency />;
+  return null;
+}
+
+function ArtWallet({ lang }) {
+  return (
+    <div className="pb-art pb-art-wallet">
+      <WalletPhone lang={lang} small />
+      <div className="pb-art-card pb-art-card-tx">
+        <IconCircle name="receive" size={36} tone="soft-green" />
+        <div>
+          <strong>+ $ 350.00</strong>
+          <em>From Yusuf · Dubai → Mogadishu</em>
+        </div>
+      </div>
+      <div className="pb-art-card pb-art-card-rating">
+        <Icon name="star" size={20} color="#6cbe46" />
+        <div>
+          <strong>4.8 / 5</strong>
+          <em>180k Wallet reviews</em>
+        </div>
+      </div>
+    </div>);
+
+}
+
+function ArtCard() {
+  return (
+    <div className="pb-art pb-art-card">
+      <div className="pb-bcard pb-bcard-elite">
+        <div className="pb-bcard-row">
+          <PBLogo variant="white" size={30} />
+          <span className="pb-bcard-chip" />
+        </div>
+        <div className="pb-bcard-num">5102  ••••  ••••  4019</div>
+        <div className="pb-bcard-foot">
+          <span><em>Cardholder</em><strong>KHADRA AHMED</strong></span>
+          <span><em>Expires</em><strong>09/28</strong></span>
+          <Icon name="mastercard" size={36} color="#fff" />
+        </div>
+        <span className="pb-bcard-tier">WORLD ELITE</span>
+      </div>
+      <div className="pb-bcard pb-bcard-platinum">
+        <div className="pb-bcard-row">
+          <PBLogo variant="white" size={30} />
+          <span className="pb-bcard-chip" />
+        </div>
+        <div className="pb-bcard-num">4827  ••••  ••••  6612</div>
+        <div className="pb-bcard-foot">
+          <span><em>Cardholder</em><strong>YUSUF IBRAHIM</strong></span>
+          <span><em>Expires</em><strong>11/27</strong></span>
+          <Icon name="mastercard" size={36} color="#fff" />
+        </div>
+        <span className="pb-bcard-tier">PLATINUM</span>
+      </div>
+    </div>);
+
+}
+
+function ArtSwift() {
+  return (
+    <div className="pb-art pb-art-swift">
+      <div className="pb-swift-globe">
+        <svg viewBox="0 0 200 200" width="280" height="280">
+          <defs>
+            <radialGradient id="globe-g" cx="50%" cy="40%">
+              <stop offset="0%" stopColor="#6cbe46" stopOpacity="0.25" />
+              <stop offset="100%" stopColor="#6cbe46" stopOpacity="0" />
+            </radialGradient>
+          </defs>
+          <circle cx="100" cy="100" r="80" fill="url(#globe-g)" />
+          <circle cx="100" cy="100" r="80" fill="none" stroke="rgba(255,255,255,0.35)" strokeWidth="1" />
+          <ellipse cx="100" cy="100" rx="80" ry="28" fill="none" stroke="rgba(255,255,255,0.18)" strokeWidth="1" />
+          <ellipse cx="100" cy="100" rx="80" ry="48" fill="none" stroke="rgba(255,255,255,0.18)" strokeWidth="1" />
+          <ellipse cx="100" cy="100" rx="48" ry="80" fill="none" stroke="rgba(255,255,255,0.18)" strokeWidth="1" />
+          <ellipse cx="100" cy="100" rx="28" ry="80" fill="none" stroke="rgba(255,255,255,0.18)" strokeWidth="1" />
+          <line x1="20" y1="100" x2="180" y2="100" stroke="rgba(255,255,255,0.18)" strokeWidth="1" />
+          <line x1="100" y1="20" x2="100" y2="180" stroke="rgba(255,255,255,0.18)" strokeWidth="1" />
+          {/* hops */}
+          {[[50, 60], [140, 55], [170, 110], [60, 150], [110, 135]].map(([cx, cy], i) =>
+          <g key={i}>
+              <circle cx={cx} cy={cy} r="4" fill="#6cbe46" />
+              <circle cx={cx} cy={cy} r="8" fill="none" stroke="#6cbe46" strokeOpacity="0.4">
+                <animate attributeName="r" values="4;14" dur="2s" begin={`${i * 0.3}s`} repeatCount="indefinite" />
+                <animate attributeName="stroke-opacity" values="0.6;0" dur="2s" begin={`${i * 0.3}s`} repeatCount="indefinite" />
+              </circle>
+            </g>
+          )}
+        </svg>
+      </div>
+      <div className="pb-art-card pb-art-swift-card">
+        <em>SWIFT Code</em>
+        <strong>PBSMSOSM</strong>
+        <span>Premier Bank — Mogadishu</span>
+      </div>
+      <div className="pb-art-card pb-art-swift-countries">
+        <Icon name="globe" size={20} color="#6cbe46" />
+        <div>
+          <strong>101+ Countries</strong>
+          <em>Receive & send worldwide</em>
+        </div>
+      </div>
+    </div>);
+
+}
+
+function ArtFinance() {
+  return (
+    <div className="pb-art pb-art-finance">
+      <div className="pb-finance-mock">
+        <div className="pb-finance-head">
+          <strong>Auto Finance · Toyota Land Cruiser</strong>
+          <span className="pb-pill pb-pill-green">Pre-approved</span>
+        </div>
+        <div className="pb-finance-grid">
+          <div><em>Vehicle</em><strong>$ 62,000</strong></div>
+          <div><em>Down (30%)</em><strong>$ 18,600</strong></div>
+          <div><em>Term</em><strong>24 mo</strong></div>
+          <div><em>Monthly</em><strong>$ 1,809</strong></div>
+        </div>
+        <div className="pb-finance-bar">
+          <div style={{ width: "30%" }}><span>Down</span></div>
+          <div style={{ width: "70%" }}><span>Murabaha</span></div>
+        </div>
+        <p className="pb-finance-note">Profit rate locked · Shari'ah-compliant · Decision in 7 days</p>
+      </div>
+      <div className="pb-art-card pb-art-finance-tag">
+        <IconCircle name="check" size={36} tone="green" />
+        <div>
+          <strong>Approved in 24h</strong>
+          <em>Free planning + expert advice</em>
+        </div>
+      </div>
+    </div>);
+
+}
+
+function ArtAgency() {
+  return (
+    <div className="pb-art pb-art-agency">
+      <div className="pb-agency-map">
+        <svg viewBox="0 0 200 200" width="320" height="280">
+          <defs>
+            <pattern id="agency-grid" width="10" height="10" patternUnits="userSpaceOnUse">
+              <path d="M 10 0 L 0 0 0 10" fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="0.5" />
+            </pattern>
+          </defs>
+          <rect width="200" height="200" fill="url(#agency-grid)" />
+          <path d="M60 40 Q70 30 100 32 Q130 36 140 50 Q138 80 130 100 Q120 130 110 160 Q90 170 80 150 Q70 130 75 110 Q65 90 65 70 Q60 55 60 40Z" fill="rgba(108,190,70,0.15)" stroke="rgba(108,190,70,0.5)" strokeWidth="1" />
+          {/* agent pins */}
+          {[[80, 60], [100, 80], [120, 75], [90, 110], [110, 140], [75, 130], [125, 120], [95, 150]].map(([x, y], i) =>
+          <g key={i}>
+              <circle cx={x} cy={y} r="3" fill="#6cbe46" />
+              <circle cx={x} cy={y} r="6" fill="none" stroke="#6cbe46" strokeOpacity="0.5">
+                <animate attributeName="r" values="3;10" dur="2.5s" begin={`${i * 0.2}s`} repeatCount="indefinite" />
+                <animate attributeName="stroke-opacity" values="0.6;0" dur="2.5s" begin={`${i * 0.2}s`} repeatCount="indefinite" />
+              </circle>
+            </g>
+          )}
+        </svg>
+      </div>
+      <div className="pb-art-card pb-art-agency-tag">
+        <IconCircle name="agency" size={36} tone="ghost-green" />
+        <div>
+          <strong>12,000+ Agents</strong>
+          <em>Premier wherever you go</em>
+        </div>
+      </div>
+    </div>);
+
+}
+
+/* -------------------------------------------------------------------------- */
+/*  TRUST STRIP                                                               */
+/* -------------------------------------------------------------------------- */
+function TrustStrip({ lang }) {
+  const logos = window.PB_CONTENT.trustLogos;
+  const imgs = (window.PB_OVERRIDES && window.PB_OVERRIDES.trustLogoImages) || {};
+  return (
+    <section className="pb-trust">
+      <div className="pb-container">
+        <p className="pb-trust-label">
+          {lang === "en" ? "Licensed by the Central Bank of Somalia · partners we work with" : "Shati ka leh CBS · macaamiisheenna caalami"}
+        </p>
+        <div className="pb-trust-grid">
+          {logos.map((l) =>
+            imgs[l]
+              ? <span key={l} className="pb-trust-logo"><img src={imgs[l]} alt={l} title={l} /></span>
+              : <span key={l}>{l}</span>
+          )}
+        </div>
+      </div>
+    </section>);
+}
+
+/* -------------------------------------------------------------------------- */
+/*  STATS BAR                                                                 */
+/* -------------------------------------------------------------------------- */
+function StatsBar({ lang }) {
+  const stats = window.PB_CONTENT.stats;
+  return (
+    <section className="pb-stats-bar">
+      <div className="pb-container">
+        <div className="pb-stats-grid">
+          {stats.map((s, i) =>
+          <div key={i} className="pb-stat">
+              <strong>{s.value}</strong>
+              <span>{lang === "en" ? s.label.en : s.label.so}</span>
+            </div>
+          )}
+        </div>
+      </div>
+    </section>);
+
+}
+
+/* -------------------------------------------------------------------------- */
+/*  VALUES (Mission, Vision, Core Values)                                     */
+/* -------------------------------------------------------------------------- */
+function Values({ lang }) {
+  const list = window.PB_CONTENT.values[lang];
+  return (
+    <section className="pb-section" id="values">
+      <div className="pb-container">
+        <div className="pb-section-head">
+          <span className="pb-eyebrow">{lang === "en" ? "Mission · Vision · Values" : "Hadafka & Qiimaha"}</span>
+          <h2>{lang === "en" ?
+            <>The best bank that <em>customers will ever want.</em></> :
+            <>Bangiga ugu <em>fiican.</em></>}</h2>
+          <p>{lang === "en" ?
+            "To provide transformative and accessible financial solutions through excellent service for a better society." :
+            "Inaan bixino xal maaliyadeed gaadhi kara dhammaan dadka, si bulsho fiican loo helo."}</p>
+        </div>
+        <div className="pb-values-grid">
+          {list.map((v, i) =>
+          <article key={v.title} className="pb-value-card">
+              <IconCircle name={v.icon} size={56} tone={i % 2 === 0 ? "ghost-green" : "ghost-navy"} />
+              <h3>{v.title}</h3>
+              <p>{v.body}</p>
+            </article>
+          )}
+        </div>
+      </div>
+    </section>);
+
+}
+
+/* -------------------------------------------------------------------------- */
+/*  ACCOUNTS SHOWCASE — visual grid of all 11 account types                   */
+/* -------------------------------------------------------------------------- */
+function AccountsShowcase({ lang, onOpenDetail }) {
+  const list = window.PB_CONTENT.accounts;
+  return (
+    <section className="pb-section pb-accounts-section" id="accounts">
+      <div className="pb-container">
+        <div className="pb-section-head">
+          <span className="pb-eyebrow">{lang === "en" ? "Account Types" : "Nooca Akoonada"}</span>
+          <h2>{lang === "en" ? "An account for every chapter of life." : "Akoon u dhigma marxalad kasta oo noloshaada."}</h2>
+          <p>{lang === "en" ?
+            "From your first student account to a multi-signatory corporate facility — eleven account types, all Shari'ah-compliant." :
+            "Akoon arday ilaa akoon shirkadeed — koob iyo toban nooc, dhammaan waafaqsan Shareecada."}</p>
+        </div>
+        <div className="pb-accounts-grid">
+          {list.map((a) =>
+          <button key={a.id} className="pb-account-card" onClick={() => onOpenDetail && onOpenDetail(a.id)}>
+              <IconCircle name={a.icon} size={48} tone="ghost-green" />
+              <strong>{lang === "en" ? a.name.en : a.name.so}</strong>
+              <em>{lang === "en" ? a.for.en : a.for.so}</em>
+              <span className="pb-account-arrow"><Icon name="arrow" size={16} /></span>
+            </button>
+          )}
+        </div>
+      </div>
+    </section>);
+
+}
+
+/* -------------------------------------------------------------------------- */
+/*  CARDS SHOWCASE                                                            */
+/* -------------------------------------------------------------------------- */
+function CardsShowcase({ lang, onOpenDetail }) {
+  const list = window.PB_CONTENT.cards;
+  return (
+    <section className="pb-section pb-cards-section">
+      <div className="pb-container">
+        <div className="pb-section-head">
+          <span className="pb-eyebrow">{lang === "en" ? "Premier Mastercard" : "Premier Mastercard"}</span>
+          <h2>{lang === "en" ? "Four cards. One trusted bank." : "Afar kaar. Hal bangi la aaminsan yahay."}</h2>
+          <p>{lang === "en" ?
+            "Pay anywhere Mastercard is accepted, withdraw from any ATM worldwide. From $2,000 Classic to $5,000 World Elite." :
+            "Bixi meel kasta oo Mastercard la aqbalo, ATM caalamka ka dhig. $2,000 Classic ilaa $5,000 World Elite."}</p>
+        </div>
+        <div className="pb-cards-grid">
+          {list.map((c) =>
+          <article key={c.id} className="pb-card-tile" style={{ "--card-bg": c.color }}>
+              <div className="pb-card-tile-card">
+                <div className="pb-bcard pb-bcard-lg" style={{ background: c.color }}>
+                  <div className="pb-bcard-row">
+                    <PBLogo variant="white" size={26} />
+                    <span className="pb-bcard-chip" />
+                  </div>
+                  <div className="pb-bcard-num">5102  ••••  ••••  {String(1000 + Math.floor(Math.random() * 9000)).padStart(4, "0")}</div>
+                  <div className="pb-bcard-foot">
+                    <span><em>Limit</em><strong>{c.limit}</strong></span>
+                    <Icon name="mastercard" size={32} color="#fff" />
+                  </div>
+                  <span className="pb-bcard-tier">{c.name.toUpperCase().replace("MASTERCARD", "").trim()}</span>
+                </div>
+              </div>
+              <div className="pb-card-tile-body">
+                <h3>{c.name}</h3>
+                <p>{lang === "en" ? c.desc.en : c.desc.so}</p>
+                <div className="pb-card-tile-meta">
+                  <span><Icon name="check" size={14} color="#6cbe46" /> Worldwide acceptance</span>
+                  <span><Icon name="check" size={14} color="#6cbe46" /> 24/7 ATM withdrawal</span>
+                  <span><Icon name="check" size={14} color="#6cbe46" /> Limit {c.limit}</span>
+                </div>
+                <button className="pb-link-arrow" onClick={() => onOpenDetail && onOpenDetail(c.id)}>
+                  {lang === "en" ? "Apply for this card" : "Codso kaarkan"} <Icon name="arrow" size={14} />
+                </button>
+              </div>
+            </article>
+          )}
+        </div>
+      </div>
+    </section>);
+
+}
+
+/* -------------------------------------------------------------------------- */
+/*  WALLET SECTION                                                            */
+/* -------------------------------------------------------------------------- */
+function WalletSection({ lang }) {
+  const tt = (en, so) => lang === "en" ? en : so;
+  return (
+    <section className="pb-section pb-wallet-section" id="wallet">
+      <div className="pb-container">
+        <div className="pb-wallet-grid">
+          <div className="pb-wallet-copy">
+            <span className="pb-eyebrow pb-eyebrow-light">{tt("Premier Wallet", "Premier Wallet")}</span>
+            <h2 className="pb-h2-light">{tt("The most-loved mobile money service in Somalia.", "Adeega lacagta mobile-ka ee ugu jecel Soomaaliya.")}</h2>
+            <p>{tt(
+                "Premier Wallet is a safe, affordable and secure way to bank on your smartphone — for banked and non-banked alike. Top-up, transfer, withdraw, pay bills, and remit to 101+ countries.",
+                "Premier Wallet waa hab amaan ah oo qiime jaban — bixi top-up, wareeji, soo qaado, bixi biil oo u dir 101+ dal."
+              )}</p>
+            <div className="pb-wallet-feat">
+              {[
+              ["topup", tt("Top-up airtime", "Top-up")],
+              ["send", tt("Money transfer", "Lacag wareejin")],
+              ["receive", tt("Wallet send", "Wallet send")],
+              ["bills", tt("Bill payment", "Bixin biil")],
+              ["atm", tt("Withdrawals", "Lacag qaadasho")],
+              ["internet", tt("Mobile banking", "Mobile banking")]].
+              map(([icn, l]) =>
+              <div key={l}>
+                  <IconCircle name={icn} size={36} tone="soft-green" />
+                  <span>{l}</span>
+                </div>
+              )}
+            </div>
+            <div className="pb-hero-ctas">
+              <button className="pb-btn pb-btn-secondary pb-btn-lg">{tt("Download Wallet", "Soo dejiso Wallet")}</button>
+              <button className="pb-btn pb-btn-glass pb-btn-lg">{tt("See all features", "Eeg dhammaan")} <Icon name="arrow" size={14} /></button>
+            </div>
+          </div>
+          <div className="pb-wallet-visual">
+            <WalletPhone lang={lang} />
+            <div className="pb-wallet-floater pb-wallet-floater-a">
+              <IconCircle name="send" size={32} tone="soft-green" />
+              <div>
+                <strong>$ 120.00 sent</strong>
+                <em>To Hano Supermarket</em>
+              </div>
+            </div>
+            <div className="pb-wallet-floater pb-wallet-floater-b">
+              <IconCircle name="globe" size={32} tone="soft-green" />
+              <div>
+                <strong>101+ countries</strong>
+                <em>Mobile money · Cash · Bank</em>
+              </div>
+            </div>
+            <div className="pb-wallet-rating">
+              <Icon name="star" size={14} color="#0b2f4f" />
+              <strong>4.8</strong>
+              <span>180k reviews</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>);
+
+}
+
+/* -------------------------------------------------------------------------- */
+/*  MORE SERVICES — Blinq-inspired image-led tile grid                        */
+/* -------------------------------------------------------------------------- */
+function MoreServices({ lang, onOpenDetail }) {
+  const tiles = window.PB_CONTENT.tiles;
+  // Layout: 4 cols x 2 rows, last cell = "Open account" CTA
+  return (
+    <section className="pb-section pb-more-services" id="services">
+      <div className="pb-container">
+        <div className="pb-more-head">
+          <div>
+            <span className="pb-eyebrow">{lang === "en" ? "More from Premier" : "Wax kale oo Premier"}</span>
+            <h2>{lang === "en" ? "Banking, beyond the branch." : "Bangiyada, ka dheer laanta."}</h2>
+          </div>
+          <p>{lang === "en" ?
+            "Every Premier service in one place — built for life in Somalia and for Somalis abroad." :
+            "Adeegyada Premier hal meel — loo dhisay nolosha Soomaaliya iyo Soomaalida dibadda."}</p>
+        </div>
+
+        <div className="pb-tiles-grid">
+          {tiles.map((t) =>
+          <button key={t.id} className="pb-tile" style={{ background: t.bg }} onClick={() => onOpenDetail && onOpenDetail(t.id)}>
+              <div className="pb-tile-art">
+                <TileArt kind={t.art} />
+              </div>
+              <div className="pb-tile-foot">
+                <div>
+                  <strong>{lang === "en" ? t.label.en : t.label.so}</strong>
+                  <em>{lang === "en" ? t.blurb.en : t.blurb.so}</em>
+                </div>
+                <span className="pb-tile-arrow"><Icon name="arrow" size={18} /></span>
+              </div>
+            </button>
+          )}
+          <button className="pb-tile pb-tile-cta" onClick={() => onOpenDetail && onOpenDetail("personal")}>
+            <div className="pb-tile-cta-inner">
+              <h3>{lang === "en" ? <>Open my<br />Premier account</> : <>Furo<br />akoon Premier</>}</h3>
+              <span className="pb-tile-cta-arrow"><Icon name="arrow" size={22} color="#0b2f4f" /></span>
+            </div>
+          </button>
+        </div>
+      </div>
+    </section>);
+
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Tile artwork — distinct SVG illustration per tile                         */
+/* -------------------------------------------------------------------------- */
+function TileArt({ kind }) {
+  if (kind === "wallet-phone") {
+    return (
+      <div className="pb-tile-illus pb-tile-illus-wallet">
+        <div className="pb-mini-phone">
+          <div className="pb-mini-phone-head"><LogoMark size={14} variant="color" /><span /></div>
+          <div className="pb-mini-phone-bal">
+            <em>Premier Wallet</em>
+            <strong>$ 4,820<sup>.50</sup></strong>
+            <span>SOS 132M · +2.4% mo</span>
+          </div>
+          <div className="pb-mini-phone-acts">
+            <span><IconCircle name="send" size={28} tone="soft-green" /><em>Send</em></span>
+            <span><IconCircle name="receive" size={28} tone="soft-green" /><em>Receive</em></span>
+            <span><IconCircle name="bills" size={28} tone="soft-green" /><em>Bills</em></span>
+            <span><IconCircle name="topup" size={28} tone="soft-green" /><em>Top up</em></span>
+          </div>
+        </div>
+      </div>);
+
+  }
+  if (kind === "mastercard") {
+    return (
+      <div className="pb-tile-illus pb-tile-illus-card">
+        <div className="pb-mini-card pb-mini-card-front">
+          <div className="pb-mini-card-row"><LogoMark size={14} variant="white" /><span className="pb-mini-card-chip" /></div>
+          <div className="pb-mini-card-num">5102  ••••  ••••  4019</div>
+          <div className="pb-mini-card-foot">
+            <span>YUSUF AHMED</span>
+            <Icon name="mastercard" size={28} color="#fff" />
+          </div>
+        </div>
+        <div className="pb-mini-card pb-mini-card-back" />
+      </div>);
+
+  }
+  if (kind === "atm") {
+    return (
+      <div className="pb-tile-illus pb-tile-illus-atm">
+        <svg viewBox="0 0 200 140" width="100%" height="100%">
+          <rect x="50" y="20" width="100" height="110" rx="8" fill="rgba(255,255,255,0.08)" stroke="rgba(255,255,255,0.2)" />
+          <rect x="60" y="30" width="80" height="44" rx="4" fill="#6cbe46" />
+          <text x="100" y="55" textAnchor="middle" fill="#fff" fontFamily="Lexend" fontSize="9" fontWeight="600">PREMIER ATM</text>
+          <text x="100" y="68" textAnchor="middle" fill="#fff" fontFamily="Lexend" fontSize="7" opacity="0.8">$ 200 · 500 · 1,000</text>
+          <rect x="64" y="80" width="16" height="6" rx="1" fill="rgba(255,255,255,0.3)" />
+          <rect x="84" y="80" width="16" height="6" rx="1" fill="rgba(255,255,255,0.3)" />
+          <rect x="104" y="80" width="16" height="6" rx="1" fill="rgba(255,255,255,0.3)" />
+          <rect x="124" y="80" width="16" height="6" rx="1" fill="rgba(255,255,255,0.3)" />
+          <rect x="64" y="92" width="76" height="6" rx="1" fill="rgba(255,255,255,0.15)" />
+          <rect x="64" y="105" width="76" height="20" rx="2" fill="rgba(255,255,255,0.1)" />
+          {/* card */}
+          <rect x="135" y="105" width="40" height="24" rx="3" fill="#0b2f4f" transform="rotate(15 155 117)" />
+          <rect x="135" y="105" width="40" height="3" fill="#6cbe46" transform="rotate(15 155 117)" />
+        </svg>
+      </div>);
+
+  }
+  if (kind === "pos") {
+    return (
+      <div className="pb-tile-illus pb-tile-illus-pos">
+        <svg viewBox="0 0 200 140" width="100%" height="100%">
+          <rect x="60" y="15" width="80" height="105" rx="10" fill="#0b2f4f" />
+          <rect x="68" y="28" width="64" height="34" rx="3" fill="#6cbe46" />
+          <text x="100" y="42" textAnchor="middle" fill="#fff" fontFamily="Lexend" fontSize="8" fontWeight="700">$ 42.50</text>
+          <text x="100" y="54" textAnchor="middle" fill="#fff" fontFamily="Lexend" fontSize="6" opacity="0.8">Tap to pay</text>
+          {[0, 1, 2, 3].map((r) => [0, 1, 2].map((c) =>
+          <rect key={r + '-' + c} x={70 + c * 22} y={70 + r * 11} width="18" height="9" rx="2" fill="rgba(255,255,255,0.18)" />
+          ))}
+          {/* card hovering */}
+          <rect x="20" y="60" width="56" height="34" rx="4" fill="#0b2f4f" transform="rotate(-10 48 77)" />
+          <rect x="20" y="60" width="56" height="3" fill="#6cbe46" transform="rotate(-10 48 77)" />
+          <circle cx="62" cy="80" r="2" fill="#fff" opacity="0.6" />
+          <path d="M70 70 Q75 75 70 80" stroke="#fff" strokeWidth="1" fill="none" opacity="0.6" />
+        </svg>
+      </div>);
+
+  }
+  if (kind === "swift") {
+    return (
+      <div className="pb-tile-illus pb-tile-illus-swift">
+        <svg viewBox="0 0 200 140" width="100%" height="100%">
+          <circle cx="100" cy="70" r="50" fill="rgba(255,255,255,0.12)" />
+          <circle cx="100" cy="70" r="50" fill="none" stroke="#fff" strokeWidth="1" opacity="0.6" />
+          <ellipse cx="100" cy="70" rx="50" ry="18" fill="none" stroke="#fff" strokeWidth="1" opacity="0.3" />
+          <ellipse cx="100" cy="70" rx="50" ry="30" fill="none" stroke="#fff" strokeWidth="1" opacity="0.3" />
+          <line x1="50" y1="70" x2="150" y2="70" stroke="#fff" strokeWidth="1" opacity="0.3" />
+          <line x1="100" y1="20" x2="100" y2="120" stroke="#fff" strokeWidth="1" opacity="0.3" />
+          {[[70, 50], [130, 55], [120, 90], [78, 92]].map(([cx, cy], i) =>
+          <circle key={i} cx={cx} cy={cy} r="3" fill="#0b2f4f" />
+          )}
+          <text x="100" y="135" textAnchor="middle" fill="#fff" fontFamily="Lexend" fontSize="9" fontWeight="700" letterSpacing="2">PBSMSOSM</text>
+        </svg>
+      </div>);
+
+  }
+  if (kind === "wearable") {
+    return (
+      <div className="pb-tile-illus pb-tile-illus-wear">
+        <svg viewBox="0 0 200 140" width="100%" height="100%">
+          {/* watch */}
+          <rect x="74" y="20" width="52" height="14" rx="2" fill="rgba(255,255,255,0.5)" />
+          <rect x="74" y="106" width="52" height="14" rx="2" fill="rgba(255,255,255,0.5)" />
+          <rect x="65" y="34" width="70" height="72" rx="12" fill="#0b2f4f" />
+          <rect x="72" y="42" width="56" height="56" rx="8" fill="#000" />
+          <text x="100" y="62" textAnchor="middle" fill="#6cbe46" fontFamily="Lexend" fontSize="7" fontWeight="700">PREMIER</text>
+          <text x="100" y="75" textAnchor="middle" fill="#fff" fontFamily="Lexend" fontSize="11" fontWeight="700">$ 12.40</text>
+          <text x="100" y="86" textAnchor="middle" fill="#fff" fontFamily="Lexend" fontSize="6" opacity="0.7">Tap2Pay</text>
+          {/* nfc waves */}
+          <path d="M140 60 Q148 70 140 80" stroke="#6cbe46" strokeWidth="1.5" fill="none" />
+          <path d="M148 56 Q160 70 148 84" stroke="#6cbe46" strokeWidth="1.5" fill="none" opacity="0.6" />
+          <path d="M156 52 Q172 70 156 88" stroke="#6cbe46" strokeWidth="1.5" fill="none" opacity="0.3" />
+        </svg>
+      </div>);
+
+  }
+  if (kind === "agency") {
+    return (
+      <div className="pb-tile-illus pb-tile-illus-agency">
+        <svg viewBox="0 0 200 140" width="100%" height="100%">
+          <rect x="20" y="80" width="160" height="50" fill="rgba(11,47,79,0.05)" />
+          {/* shop */}
+          <rect x="55" y="40" width="90" height="65" fill="#0b2f4f" />
+          <rect x="55" y="34" width="90" height="10" fill="#6cbe46" />
+          <text x="100" y="42" textAnchor="middle" fill="#fff" fontSize="6" fontWeight="700" fontFamily="Lexend">PREMIER AGENT</text>
+          <rect x="65" y="50" width="20" height="16" fill="rgba(255,255,255,0.2)" />
+          <rect x="90" y="50" width="20" height="16" fill="rgba(255,255,255,0.2)" />
+          <rect x="115" y="50" width="20" height="16" fill="rgba(255,255,255,0.2)" />
+          <rect x="90" y="75" width="20" height="30" fill="#6cbe46" />
+          <circle cx="106" cy="90" r="1" fill="#0b2f4f" />
+          {/* badge */}
+          <circle cx="160" cy="55" r="18" fill="#6cbe46" />
+          <path d="M155 55l3 3 7-7" stroke="#fff" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </div>);
+
+  }
+  if (kind === "gateway") {
+    return (
+      <div className="pb-tile-illus pb-tile-illus-gw">
+        <svg viewBox="0 0 200 140" width="100%" height="100%">
+          {/* browser window */}
+          <rect x="30" y="20" width="140" height="100" rx="8" fill="#fff" />
+          <rect x="30" y="20" width="140" height="16" rx="8" fill="rgba(11,47,79,0.85)" />
+          <circle cx="40" cy="28" r="2" fill="#ff5f57" />
+          <circle cx="48" cy="28" r="2" fill="#ffbd2e" />
+          <circle cx="56" cy="28" r="2" fill="#28c840" />
+          <rect x="70" y="24" width="80" height="8" rx="4" fill="rgba(255,255,255,0.2)" />
+          {/* form */}
+          <rect x="42" y="50" width="116" height="10" rx="2" fill="rgba(11,47,79,0.08)" />
+          <rect x="42" y="66" width="70" height="10" rx="2" fill="rgba(11,47,79,0.08)" />
+          <rect x="118" y="66" width="40" height="10" rx="2" fill="rgba(11,47,79,0.08)" />
+          <rect x="42" y="82" width="116" height="14" rx="3" fill="#0b2f4f" />
+          <text x="100" y="92" textAnchor="middle" fill="#fff" fontFamily="Lexend" fontSize="7" fontWeight="700">PAY $ 248.00</text>
+          <text x="100" y="108" textAnchor="middle" fill="rgba(11,47,79,0.6)" fontFamily="Lexend" fontSize="6">Powered by Premier MPGS</text>
+        </svg>
+      </div>);
+
+  }
+  return null;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  TESTIMONIALS                                                              */
+/* -------------------------------------------------------------------------- */
+function Testimonials({ lang }) {
+  const list = window.PB_CONTENT.testimonials[lang];
+  return (
+    <section className="pb-section pb-testimonials">
+      <div className="pb-container">
+        <div className="pb-section-head">
+          <span className="pb-eyebrow">{lang === "en" ? "Loved by Somalia" : "Soomaaliya way jeceshahay"}</span>
+          <h2>{lang === "en" ? "Their words. Not ours." : "Hadalkooda."}</h2>
+        </div>
+        <div className="pb-test-grid">
+          {list.map((t, i) =>
+          <article key={i} className={`pb-test-card pb-test-card-${i % 4}`}>
+              <span className="pb-test-quote">"</span>
+              <p>{t.quote}</p>
+              <div className="pb-test-foot">
+                <span className="pb-avatar">{t.who[0]}</span>
+                <div>
+                  <strong>{t.who}</strong>
+                  <em>{t.role}</em>
+                </div>
+                <span className="pb-stars">
+                  {[0, 1, 2, 3, 4].map((s) => <Icon key={s} name="star" size={12} />)}
+                </span>
+              </div>
+            </article>
+          )}
+        </div>
+      </div>
+    </section>);
+
+}
+
+/* -------------------------------------------------------------------------- */
+/*  SECURITY                                                                  */
+/* -------------------------------------------------------------------------- */
+function SecurityBand({ lang }) {
+  const tt = (en, so) => lang === "en" ? en : so;
+  const items = [
+  { icon: "shield", t: "ISO 27001", s: tt("Information security certified", "Shahaado amni") },
+  { icon: "card", t: "PCI-DSS", s: tt("Card processing standard", "Heer ammaan kaarka") },
+  { icon: "shariah", t: "Shari'ah Certified", s: tt("Independent supervisory board", "Guddi madax-banaan") },
+  { icon: "internet", t: "256-bit TLS", s: tt("End-to-end encryption", "Sirayn buuxda") }];
+
+  return (
+    <section className="pb-section pb-security">
+      <div className="pb-container">
+        <div className="pb-security-grid">
+          <div>
+            <span className="pb-eyebrow pb-eyebrow-light">{tt("Trust", "Aamin")}</span>
+            <h2 className="pb-h2-light">{tt("Your money. Protected by everything that matters.", "Lacagtaada. Lagu ilaaliyay wax kasta oo muhiim ah.")}</h2>
+            <p>{tt(
+                "Premier is licensed by the Central Bank of Somalia and audited annually. Information security to ISO 27001, card processing to PCI-DSS, and every product reviewed by an independent Shari'ah board.",
+                "Premier wuxuu shati ka leeyahay CBS, oo sannadkii la baadhaa. Amni macluumaadeed heer ISO 27001 ah."
+              )}</p>
+          </div>
+          <div className="pb-security-pills">
+            {items.map((p) =>
+            <div key={p.t} className="pb-security-pill">
+                <IconCircle name={p.icon} size={44} tone="soft-green" />
+                <strong>{p.t}</strong>
+                <em>{p.s}</em>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </section>);
+
+}
+
+/* -------------------------------------------------------------------------- */
+/*  FAQ                                                                       */
+/* -------------------------------------------------------------------------- */
+function FAQ({ lang }) {
+  const list = window.PB_CONTENT.faq[lang];
+  const [open, setOpen] = useStateS(0);
+  return (
+    <section className="pb-section pb-faq" id="faq">
+      <div className="pb-container">
+        <div className="pb-faq-grid">
+          <div>
+            <span className="pb-eyebrow">FAQ</span>
+            <h2>{lang === "en" ? "Frequently asked questions" : "Su'aalaha inta badan la weydiiyo"}</h2>
+            <p>{lang === "en" ?
+              "Can't find the answer? Talk to a Premier banker — we reply within 2 hours, 7 days a week." :
+              "Maad heli weyday? Nala soo xidhiidh — 2 saac gudahood baan kuu jawaabnaa."}</p>
+            <div className="pb-faq-contact">
+              <button className="pb-btn pb-btn-primary">{lang === "en" ? "Talk to a banker" : "La hadal banker"}</button>
+              <a href="tel:+252619999999" className="pb-link-arrow"><Icon name="phone" size={14} /> +252 61 9999 999 <Icon name="arrow" size={14} /></a>
+            </div>
+          </div>
+          <div className="pb-faq-list">
+            {list.map((q, i) =>
+            <details key={q.q} open={open === i} onClick={(e) => {e.preventDefault();setOpen(open === i ? -1 : i);}}>
+                <summary>
+                  <span>{q.q}</span>
+                  <span className="pb-faq-plus"><Icon name={open === i ? "close" : "plus"} size={14} /></span>
+                </summary>
+                <p>{q.a}</p>
+              </details>
+            )}
+          </div>
+        </div>
+      </div>
+    </section>);
+
+}
+
+/* -------------------------------------------------------------------------- */
+/*  CTA CLOSER                                                                */
+/* -------------------------------------------------------------------------- */
+function CTACloser({ lang }) {
+  const tt = (en, so) => lang === "en" ? en : so;
+  return (
+    <section className="pb-section pb-cta-closer">
+      <div className="pb-container">
+        <div className="pb-cta-card" style={{ backgroundPosition: "center top", backgroundSize: "cover" }}>
+          <div className="pb-cta-card-bg" aria-hidden>
+            <LogoMark size={420} variant="white" />
+          </div>
+          <div className="pb-cta-card-inner">
+            <span className="pb-eyebrow pb-eyebrow-light">{tt("Get started", "Bilow")}</span>
+            <h2 className="pb-h2-light">{tt("Open your Premier account in under 5 minutes.", "Akoonkaaga Premier 5 daqiiqo ku furo.")}</h2>
+            <p>{tt(
+                "All you need is a phone, your ID, and a clear photo. Premier Wallet activates the moment your account is approved.",
+                "Mobile, kaarka aqoonsiga, iyo sawir cad ayaa kaa kaafi ah."
+              )}</p>
+            <div className="pb-hero-ctas">
+              <button className="pb-btn pb-btn-secondary pb-btn-lg">{tt("Open an account", "Furo akoon")} <Icon name="arrow" size={14} /></button>
+              <button className="pb-btn pb-btn-glass pb-btn-lg">{tt("Talk to us", "Nala hadal")}</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>);
+
+}
+
+Object.assign(window, {
+  HeroSlider, HeroSlide, HeroArt,
+  TrustStrip, StatsBar, Values,
+  AccountsShowcase, CardsShowcase,
+  WalletSection, MoreServices, TileArt,
+  Testimonials, SecurityBand, FAQ, CTACloser
+});
+
+/* ============================================================ */
+
+// Premier Bank — Menu detail panels (one full-context page per nav link)
+// Content sourced from "Bank products and services Update 2025.pptx"
+const { useState: useStateD, useEffect: useEffectD } = React;
+
+/* -------------------------------------------------------------------------- */
+/*  Nav label → detail key                                                    */
+/* -------------------------------------------------------------------------- */
+window.PB_DETAIL_KEY = {
+  // About
+  "Who We Are": "who", "Yaan Nahay": "who",
+  "Mission & Values": "values", "Hadafka & Qiimaha": "values",
+  "Board Members": "board", "Guddiga Maamulka": "board",
+  "Shari'ah Board": "shariah", "Guddiga Shareecada": "shariah",
+  "Senior Management": "leadership", "Maamulka Sare": "leadership",
+  // Accounts
+  "Personal Current": "personal", "Akoon Shakhsi": "personal",
+  "Saving Account": "savings", "Akoon Kayd": "savings",
+  "Salary Account": "salary", "Akoon Mushahar": "salary",
+  "Student Account": "student", "Akoon Arday": "student",
+  "Joint Account": "joint", "Akoon Wadaag": "joint",
+  "Hajj & Umra": "hajj", "Hajj & Cumra": "hajj",
+  "Maandeeq (Women)": "women", "Maandeeq": "women", "Maandeeq (Haween)": "women",
+  "Business Current": "business", "Akoon Ganacsi": "business",
+  "Sole-Proprietor": "sole", "Mulkiile Keli": "sole",
+  "Umma (NGO)": "ngo",
+  "Corporate Account": "corporate", "Akoon Shirkadeed": "corporate",
+  // Cards
+  "Premier Classic": "classic",
+  "Premier Platinum": "platinum",
+  "Corporate Card": "corpcard", "Kaarka Shirkadda": "corpcard",
+  "World Elite": "elite",
+  // Financing
+  "Auto Finance": "auto", "Maalgelin Baabuur": "auto",
+  "Land & Construction": "land", "Dhul & Dhismo": "land", "Dhulka & Dhismaha": "land",
+  "Business Trade Financing": "trade", "Maalgelin Ganacsi": "trade",
+  // Services
+  "Premier Wallet": "wallet",
+  "Internet Banking": "internet",
+  "SWIFT": "swift",
+  "ATM Network": "atm", "Shabakadda ATM": "atm",
+  "Premier POS": "pos",
+  "Agency Banking": "agency", "Adeega Wakiilka": "agency",
+  "Payroll": "payroll", "Mushahar": "payroll",
+  "Wearables (Tap2Pay)": "wearable",
+  "Payment Gateway": "gateway", "Albaab Lacageed": "gateway",
+  // News
+  "Newsroom": "news", "Qolka Wararka": "news",
+  "Press Release": "press", "Saxaafadda": "press",
+  "Gallery": "gallery", "Sawirada": "gallery",
+};
+
+/* -------------------------------------------------------------------------- */
+/*  Helpers                                                                   */
+/* -------------------------------------------------------------------------- */
+const en_so = (en, so) => ({ en, so: so || en });
+
+// shorthand step builder
+const step = (title, body) => ({ title, body });
+// generic KYC requirements shared by personal accounts
+const KYC_PERSONAL = [
+  "Copy of valid Passport, National ID, Birth Certificate, Regional Government ID, or Driving Licence",
+  "Valid Employment ID",
+  "Passport-size photograph",
+  "Contact and address information",
+];
+const KYC_BUSINESS = [
+  "Copy of valid certificate of registration",
+  "Notarized memorandum or articles of association",
+  "Valid ID for directors and authorised signatories",
+  "Request letter indicating resolution to open account & signing mandates",
+  "Passport-size photo for each signatory",
+  "Company / organisation profile",
+];
+
+/* -------------------------------------------------------------------------- */
+/*  Detail content (D)                                                        */
+/* -------------------------------------------------------------------------- */
+const D = window.PB_DETAILS = {
+
+  /* ============================  ABOUT  ===================================*/
+  who: {
+    cat: "About", cat_so: "Ku Saabsan", accent: "primary", icon: "about",
+    title: en_so("Who We Are", "Yaan Nahay"),
+    eyebrow: en_so("Premier Bank · Est. 2013, licensed 2014", "Premier Bank · 2013 / 2014"),
+    tagline: en_so(
+      "Premier Bank is a privately-owned Shari'ah-compliant commercial bank, incorporated in Somalia in 2013 and licensed by the Central Bank of Somalia in 2014. We offer comprehensive one-stop financial solutions to private and government institutions, corporate and SME businesses, and individuals across Somalia and the diaspora.",
+      "Premier Bank waa bangi gaar loo leeyahay, waafaqsan Shareecada, oo Soomaaliya laga aasaasay 2013, shati ka qaatay CBS 2014."
+    ),
+    highlights: [
+      { value: "2013", label: en_so("Founded in Somalia", "Asaaska Soomaaliya") },
+      { value: "2014", label: en_so("CBS-licensed", "Shati CBS") },
+      { value: "101+", label: en_so("Remittance countries", "Dalal remittance") },
+    ],
+    features: [
+      { icon: "shariah", title: "Shari'ah-compliant by design", body: "Every product is structured around Islamic finance principles — no riba, full transparency, profit-sharing where applicable." },
+      { icon: "globe",   title: "Built for a new Somalia",      body: "We believe in the promise of a new Somalia. Our role is to encourage economic and community development through modern banking." },
+      { icon: "team",    title: "One-stop financial solutions", body: "Private individuals, SMEs, corporates and government — all served from the same network of branches, agents, and digital rails." },
+      { icon: "agency",  title: "12,000+ authorised agents",    body: "Wherever you live in Somalia, a Premier counter is nearby — even far from a branch." },
+    ],
+    steps: [
+      step("Open in a branch or the Wallet", "Personal accounts open same-day in any branch, or remotely via Premier Wallet."),
+      step("Bank with us",                    "Accounts, cards, financing, transfers — all on one customer ID."),
+      step("Grow with us",                    "Move from a student account to a salary account to a business facility — without changing banks."),
+    ],
+    faqs: [
+      { q: "Is Premier Bank Shari'ah-compliant?", a: "Yes — fully. Every product is reviewed and certified by our independent Shari'ah Supervisory Board." },
+      { q: "Where is Premier regulated?",         a: "Licensed and supervised by the Central Bank of Somalia (CBS)." },
+    ],
+    cta1: en_so("Open an account", "Furo akoon"),
+    cta2: en_so("Read 2024 report", "Akhri warbixin 2024"),
+  },
+
+  values: {
+    cat: "About", cat_so: "Ku Saabsan", accent: "secondary", icon: "star",
+    title: en_so("Mission, Vision & Values", "Hadafka, Aragtida & Qiimaha"),
+    eyebrow: en_so("What guides every Premier decision", "Waxa hagaya go'aan kasta"),
+    tagline: en_so(
+      "Mission — to provide transformative and accessible financial solutions through excellent services for a better society. Vision — to be the best bank that customers will ever want.",
+      "Hadaf — bixinta xal maaliyadeed gaadhi kara. Aragti — inaan noqono bangiga ugu fiican ee macaamiisha ay marba doonayaan."
+    ),
+    highlights: [
+      { value: "5",     label: en_so("Core values",          "Qiimo gundheer") },
+      { value: "100%",  label: en_so("Shari'ah-aligned",     "Shareecada") },
+      { value: "Daily", label: en_so("Lived, not posted",    "Maalin walba") },
+    ],
+    features: [
+      { icon: "personal", title: "People First",        body: "We build relationships. We are professional. We offer excellent service." },
+      { icon: "shield",   title: "Integrity",           body: "We are trustworthy and behave in an open, honest and ethical manner — considering the impact and consequences of every decision and action." },
+      { icon: "check",    title: "Accountability",      body: "We take responsibility for our decisions, actions and performance. We adhere to Shari'ah principles and international banking standards." },
+      { icon: "joint",    title: "Partnership",         body: "We are committed to partnering with all stakeholders — seeking innovative and efficient ways to meet everyone's needs." },
+      { icon: "star",     title: "Customer Centricity", body: "We understand who the customer is, and deliver high-quality services that meet and exceed every customer's expectation." },
+    ],
+    steps: [
+      step("Mission",         "To provide transformative and accessible financial solutions through excellent services for a better society."),
+      step("Vision",          "To be the best bank that customers will ever want."),
+      step("Promise",         "We believe in the promise of a new Somalia — and our role in rebuilding it through modern banking."),
+    ],
+    faqs: [],
+    cta1: en_so("Open an account", "Furo akoon"),
+    cta2: en_so("Talk to a banker", "La hadal banker"),
+  },
+
+  board: {
+    cat: "About", cat_so: "Ku Saabsan", accent: "primary", icon: "board",
+    title: en_so("Board of Directors", "Guddiga Maamulka"),
+    eyebrow: en_so("Independent governance", "Maamul madax-banaan"),
+    tagline: en_so(
+      "An independent, non-executive board steering Premier's long-term strategy, risk and Shari'ah governance — with deep experience across Islamic finance, regulatory affairs, technology and East African markets.",
+      "Guddi madax-banaan oo hagaya istaraatiijiyadda bangiga."
+    ),
+    highlights: [
+      { value: "7",  label: en_so("Board members",       "Xubnaha") },
+      { value: "5",  label: en_so("Independent",         "Madax-banaan") },
+      { value: "4",  label: en_so("Standing committees", "Guddiyo") },
+    ],
+    features: [
+      { icon: "shield",  title: "Audit & Risk",          body: "Reviews financial reporting, internal controls and Pillar III disclosures every quarter." },
+      { icon: "shariah", title: "Shari'ah oversight",    body: "Coordinates with the Shari'ah Supervisory Board on product approvals and compliance audits." },
+      { icon: "invest",  title: "Strategy",              body: "Sets three-year strategy, M&A direction and regional expansion priorities." },
+      { icon: "team",    title: "Nominations & remuneration", body: "Owns C-suite succession, executive pay and director independence reviews." },
+    ],
+    steps: [
+      step("Chairman",                "Sets agenda; leads quarterly cycles. Independent. Reports to shareholders."),
+      step("Independent directors",   "Lead Audit, Risk and Shari'ah committees. Three-year terms, max two consecutive."),
+      step("Executive director (CEO)","Bridge between management and governance — the only executive on the board."),
+    ],
+    members: [
+      { name: "Jibril Hassan Mohamed", title: en_so("Chairman", "Gudoomiye"),
+        bio: "An astute businessman who has been in business since 2002. As Chair, he guides the Board in overseeing strategy, policy, investor relations and key partnerships within the Bank. He holds an MBA majoring in Finance, a Bachelor of Mathematics degree, and a Postgraduate Diploma in Information Technology." },
+      { name: "Mohamed Djirde Hussein", title: en_so("Director", "Agaasime"),
+        bio: "Holds a BS in Economics and Business Administration from the USA and has been in business since 1972, bringing decades of commercial leadership and enterprise experience to the Board." },
+      { name: "Ahmed Abdirahman Sheikh", title: en_so("Non-Executive Director", "Agaasime aan fulineed"),
+        bio: "A businessman with vast experience in the financial industry who has served as a Director of Premier Bank since 2014, contributing deep knowledge of Somali markets and regional finance." },
+      { name: "Khadar Mohamoud Jama", title: en_so("Director", "Agaasime"),
+        bio: "Owner and Managing Director of AMS Logistics Co., operating across Somalia, the UAE, Djibouti and Ethiopia since 1998. He holds three Diplomas in Accounting & Business Management." },
+      { name: "Abdelaziz Ali Eid", title: en_so("Director", "Agaasime"),
+        bio: "In the financial-services business for over 16 years; a Director and Shareholder of International Commercial Bank (ICB) Juba, South Sudan. He holds a Bachelor's degree in History and a Master's degree in African History." },
+      { name: "Tengeri Nyaramba Osoro", title: en_so("Director", "Agaasime"),
+        bio: "A Chartered Financial Analyst (CFA) with over 10 years' experience in finance and banking in Kenya and the wider East African region." },
+      { name: "Abdullahi Shidane", title: en_so("Director", "Agaasime"),
+        bio: "A long-serving Director of Premier Bank, contributing extensive commercial and entrepreneurial experience to the Board's governance and strategic oversight." },
+    ],
+    faqs: [],
+    cta1: en_so("Investor relations", "Maalgashada"),
+    cta2: en_so("Download 2024 report", "Soo dejiso warbixin"),
+  },
+
+  shariah: {
+    cat: "About", cat_so: "Ku Saabsan", accent: "secondary", icon: "shariah",
+    title: en_so("Shari'ah Supervisory Board", "Guddiga Shareecada Islaamka"),
+    eyebrow: en_so("Independent · Three scholars", "Madax-banaan · Saddex culimo"),
+    tagline: en_so(
+      "Premier Bank's products, contracts and operations are reviewed continuously by an independent panel of three internationally-recognised Shari'ah scholars, following AAOIFI standards.",
+      "Adeegyada Premier waxaa eega saddex culimo madax-banaan, sida heerarka AAOIFI."
+    ),
+    highlights: [
+      { value: "3",      label: en_so("SSB scholars",            "Culimo SSB") },
+      { value: "100%",   label: en_so("Products reviewed",       "Adeegyo la eegay") },
+      { value: "AAOIFI", label: en_so("Standards followed",      "Heerarka") },
+    ],
+    features: [
+      { icon: "press",  title: "Pre-launch fatwa",       body: "Every new product receives a written fatwa before launch, signed by all three scholars." },
+      { icon: "check",  title: "Annual Shari'ah audit",  body: "Internal team reviews 100% of contracts; SSB signs off on the audit report." },
+      { icon: "shield", title: "Profit purification",    body: "Any non-compliant income is identified, donated to charity, and disclosed publicly." },
+      { icon: "news",   title: "Customer education",     body: "Fatwas, contract templates and product mechanics are published openly on the Shari'ah resource centre." },
+    ],
+    steps: [
+      step("Product team drafts",  "Business team builds the contract and process, with the in-house Shari'ah officer."),
+      step("Internal review",      "Shari'ah officer reviews, then forwards to the SSB if compliant."),
+      step("SSB deliberation",     "Scholars meet and either issue a fatwa, request changes, or reject."),
+      step("Annual audit",         "Once live, contracts are sampled annually for ongoing compliance."),
+    ],
+    members: [
+      { name: en_so("Add a Shari'ah scholar", "Ku dar culimo Shareeco"), title: en_so("Shari'ah Supervisory Board", "Guddiga Shareecada"),
+        bio: "Premier Bank's Shari'ah Supervisory Board is an independent panel of internationally-recognised scholars in Islamic jurisprudence and finance, following AAOIFI standards. Add each scholar's name, photo and biography from the admin panel.", placeholder: true },
+    ],
+    faqs: [
+      { q: "Can the SSB block a product?",      a: "Yes. SSB approval is mandatory; no financial product launches without a written fatwa." },
+      { q: "Are the scholars paid by Premier?", a: "They receive a fixed retainer disclosed in the annual report. Independence is contractual and enforced." },
+    ],
+    cta1: en_so("Read our fatwas", "Akhri fatwooyinka"),
+    cta2: en_so("Contact the SSB", "La xidhiidh SSB"),
+  },
+
+  leadership: {
+    cat: "About", cat_so: "Ku Saabsan", accent: "primary", icon: "team",
+    title: en_so("Senior Management", "Maamulka Sare"),
+    eyebrow: en_so("The team running Premier", "Kooxda maamulka"),
+    tagline: en_so(
+      "A bench of bankers, technologists and operators with experience across Citi, Standard Chartered, the Islamic Development Bank and the largest banks in East Africa.",
+      "Koox bangiyo, tikniyolajiyad iyo hawlgal leh."
+    ),
+    highlights: [
+      { value: "9",    label: en_so("C-suite executives", "Madaxda sare") },
+      { value: "180+", label: en_so("Years combined",     "Sano la isku daray") },
+      { value: "5/9",  label: en_so("Somali nationals",   "Soomaali") },
+    ],
+    features: [
+      { icon: "team",  title: "CEO",                  body: "Sets group strategy and chairs the executive committee. Reports to the Board quarterly." },
+      { icon: "invest",title: "CFO & COO",            body: "Run finance, treasury, balance sheet, and operations + branch network respectively." },
+      { icon: "internet",title: "CTO & CDO",          body: "Own core banking, the Wallet app, and data + analytics." },
+      { icon: "shield",title: "CRO, CCO, General Counsel", body: "Risk, compliance, AML and legal — direct reporting to the Audit Committee for independence." },
+    ],
+    members: [
+      { name: "Dr. Mohamed Ghedi Jumale", title: en_so("Managing Director & CEO", "Agaasimaha Guud & CEO"),
+        bio: "Elected Managing Director of Premier Bank in March 2024. A management practitioner with over 20 years' experience, Dr. Ghedi sets group strategy, chairs the executive committee, and leads the bank's day-to-day operations and regional growth agenda." },
+      { name: "Osman Dualle Ahmed", title: en_so("Executive Director", "Agaasime Fulineed"),
+        bio: "Joined Premier Bank as Deputy Managing Director in 2018 and went on to serve as Managing Director & CEO, steering the bank through a period of rapid expansion across Somalia and the region." },
+    ],
+    steps: [],
+    faqs: [],
+    cta1: en_so("Investor relations", "Maalgashada"),
+    cta2: en_so("Press enquiries", "Saxaafad"),
+  },
+
+  /* ============================  ACCOUNTS  ================================*/
+  personal: {
+    cat: "Accounts", cat_so: "Akoonada", accent: "secondary", icon: "personal",
+    title: en_so("Personal Current Account", "Akoon Shakhsi"),
+    eyebrow: en_so("Everyday banking", "Maalmaha caadiga"),
+    tagline: en_so(
+      "Your everyday Premier account — for salaries, bills, debit-card purchases and Wallet transfers. Open in any branch with valid ID, or remotely via Premier Wallet.",
+      "Akoonkaaga maalmaha caadiga ah — mushahar, biil, kaar iyo Wallet."
+    ),
+    highlights: [
+      { value: "Same-day", label: en_so("Account opening", "Furida akoon") },
+      { value: "Free",     label: en_so("Premier Wallet",  "Premier Wallet") },
+      { value: "Free",     label: en_so("First debit card","Kaar koowaad") },
+    ],
+    features: [
+      { icon: "card",     title: "Free Mastercard debit",  body: "Use your Premier debit card at any POS and ATM worldwide where Mastercard is accepted." },
+      { icon: "wallet",   title: "Wallet bundled in",       body: "Same customer ID, same login — Premier Wallet works alongside your account from day one." },
+      { icon: "send",     title: "Premier-to-Premier instant", body: "Send and receive between Premier accounts in seconds, with notifications on both sides." },
+      { icon: "shield",   title: "SMS & app alerts",        body: "Every transaction triggers a notification. Spend control, card freeze and limits all in-app." },
+    ],
+    steps: [
+      step("Visit a branch (or open in-app)", "Same-day opening in branch. Wallet-based remote onboarding for KYC-eligible customers."),
+      step("Submit requirements",             KYC_PERSONAL.join("; ")),
+      step("Receive your details",            "Account number issued at the counter. Debit card delivered within 2–4 working days."),
+      step("Start banking",                   "Salaries, bills, Wallet transfers and Mastercard purchases — all live."),
+    ],
+    faqs: [
+      { q: "What documents do I need?", a: KYC_PERSONAL.join(", ") + "." },
+      { q: "Is there a minimum balance?", a: "No minimum balance for personal accounts. Funding is recommended to access card and Wallet features." },
+    ],
+    cta1: en_so("Open in the Wallet", "Ku fur Wallet"),
+    cta2: en_so("Compare accounts",   "Isbarbar dhig"),
+  },
+
+  savings: {
+    cat: "Accounts", cat_so: "Akoonada", accent: "secondary", icon: "saving",
+    title: en_so("Personal Saving Account", "Akoon Kayd"),
+    eyebrow: en_so("Mudaraba profit-sharing", "Mudaraba"),
+    tagline: en_so(
+      "A Shari'ah-compliant savings account based on the Mudaraba profit-sharing structure — your savings are invested in halal business activity, and you share the profit.",
+      "Akoon kayd waafaqsan Shareecada — Mudaraba oo aad faa'iidada la wadaagto."
+    ),
+    highlights: [
+      { value: "Profit-share", label: en_so("No interest",        "Faa'iido la wadaago") },
+      { value: "Quarterly",    label: en_so("Profit distribution","Bil-saddexaad") },
+      { value: "Flexible",     label: en_so("Anytime withdrawal", "Soo qaado mar kasta") },
+    ],
+    features: [
+      { icon: "invest", title: "Profit-sharing returns",  body: "Returns come from real economic activity — not interest — paid out quarterly." },
+      { icon: "wallet", title: "Goals & jars",             body: "Split your savings into named goals (Hajj, school fees, emergency) and track progress." },
+      { icon: "shield", title: "Capital preserved",        body: "Your principal is preserved; only profits fluctuate with performance." },
+      { icon: "check",  title: "Shari'ah-certified",       body: "Reviewed and certified by our Shari'ah Supervisory Board, following AAOIFI standards." },
+    ],
+    steps: [
+      step("Open in branch or Wallet", "Same-day setup with personal ID."),
+      step("Submit requirements",      KYC_PERSONAL.join("; ")),
+      step("Fund your account",        "Top up any amount — there is no minimum for the liquid Mudaraba."),
+      step("Receive quarterly profit", "Notification when profit posts. Withdraw any time."),
+    ],
+    faqs: [],
+    cta1: en_so("Open savings", "Furo kayd"),
+    cta2: en_so("Profit calculator", "Xisaabin faa'iido"),
+  },
+
+  salary: {
+    cat: "Accounts", cat_so: "Akoonada", accent: "secondary", icon: "salary",
+    title: en_so("Personal Salary Account", "Akoon Mushahar"),
+    eyebrow: en_so("For salaried professionals", "Shaqaale mushahar"),
+    tagline: en_so(
+      "A Premier account designed for salaried professionals. Receive your pay, automate bills, and access bundled benefits like free debit and Wallet.",
+      "Akoon loogu talagalay shaqaalaha mushahar — ka hel, biil bixin oo ku adeegso wallet bilaash."
+    ),
+    highlights: [
+      { value: "Free",      label: en_so("Premier debit card", "Kaar bilaash") },
+      { value: "Same-day",  label: en_so("Salary credit",      "Mushahar isla maalin") },
+      { value: "No fee",    label: en_so("Account maintenance","Bilaash") },
+    ],
+    features: [
+      { icon: "payroll", title: "Direct salary credit",    body: "Your employer's Premier Payroll feed credits your account same-day with an SMS notification." },
+      { icon: "card",    title: "Free debit card",          body: "Mastercard debit card — first card free, replacement at standard fee." },
+      { icon: "wallet",  title: "Wallet & bills",           body: "Pay rent, utilities and school fees from the Wallet, set up standing orders inside the app." },
+      { icon: "shield",  title: "Spend tracking",           body: "Every transaction logged with category, merchant and notification." },
+    ],
+    steps: [
+      step("Get a letter from your employer", "Most employers on Premier Payroll can onboard you in branch the same day."),
+      step("Submit requirements",             KYC_PERSONAL.join("; ")),
+      step("Activate Wallet and card",        "Mobile and physical card live within 24 hours."),
+    ],
+    faqs: [
+      { q: "Does my employer need to be on Premier Payroll?", a: "No, but it speeds salary settlement. We accept inbound salary from any local bank." },
+    ],
+    cta1: en_so("Open salary account", "Furo akoon mushahar"),
+    cta2: en_so("Talk to a banker", "La hadal banker"),
+  },
+
+  student: {
+    cat: "Accounts", cat_so: "Akoonada", accent: "secondary", icon: "student",
+    title: en_so("Personal Student Account", "Akoon Arday"),
+    eyebrow: en_so("For students", "Arday"),
+    tagline: en_so(
+      "A starter Premier account for students — minimum-fee banking, free Wallet and Mastercard, and savings goals for fees and books.",
+      "Akoonka koowaad ee ardayda — Wallet & Mastercard bilaash, kayd hadaf leh."
+    ),
+    highlights: [
+      { value: "13+",  label: en_so("Minimum age (with guardian)", "Da'da ugu yar") },
+      { value: "Free", label: en_so("Account & Wallet",            "Akoon & Wallet") },
+      { value: "Free", label: en_so("Mastercard",                  "Mastercard") },
+    ],
+    features: [
+      { icon: "saving", title: "Saving jars for fees",  body: "Set targets for tuition, books and exams. Track progress in the Wallet." },
+      { icon: "wallet", title: "Wallet for daily life", body: "Top up airtime, pay university fees, and split costs with friends." },
+      { icon: "card",   title: "Mastercard debit",      body: "Free first card. Works at any Mastercard POS or ATM in Somalia or abroad." },
+    ],
+    steps: [
+      step("Submit student requirements", "Valid ID + Valid Student ID + Passport-size photo + Contact information."),
+      step("Optional guardian co-sign",   "Under-18 customers require a parent or guardian co-signer."),
+      step("Activate in 24h",             "Account live same-day; physical card delivered 2–4 days."),
+    ],
+    faqs: [],
+    cta1: en_so("Open student account", "Furo akoon arday"),
+    cta2: en_so("FAQs", "Su'aalaha"),
+  },
+
+  joint: {
+    cat: "Accounts", cat_so: "Akoonada", accent: "primary", icon: "joint",
+    title: en_so("Joint Account", "Akoon Wadaag"),
+    eyebrow: en_so("2–5 individuals", "2–5 qof"),
+    tagline: en_so(
+      "A shared Premier account for two to five individuals — perfect for couples, families, business partners and pooled goal-savings.",
+      "Akoon labo ilaa shan qof oo wadaagaan."
+    ),
+    highlights: [
+      { value: "2–5",  label: en_so("Account holders",  "Mulkiile") },
+      { value: "Flexible", label: en_so("Operating mandate", "Sida la maamulo") },
+      { value: "Shared",   label: en_so("Cards & Wallet",     "Kaar & Wallet") },
+    ],
+    features: [
+      { icon: "joint",   title: "Multi-signatory rules", body: "Choose 'any one' or 'all-together' operating mandate for transactions." },
+      { icon: "saving",  title: "Shared savings goals",  body: "Pool funds toward family goals — house deposit, Hajj, weddings, education." },
+      { icon: "wallet",  title: "Shared Wallet view",    body: "Every signatory sees activity in their own Wallet, with SMS alerts." },
+    ],
+    steps: [
+      step("All signatories submit IDs",   "Valid Passport / National ID / Birth Cert / Driving Licence for every account holder."),
+      step("Submit request letter",        "Letter stating the account operating mandate and purpose."),
+      step("Provide photos & contacts",    "Passport-size photo and address details for each holder."),
+    ],
+    faqs: [],
+    cta1: en_so("Open joint account", "Furo akoon wadaag"),
+    cta2: en_so("Talk to a banker", "La hadal banker"),
+  },
+
+  hajj: {
+    cat: "Accounts", cat_so: "Akoonada", accent: "secondary", icon: "hajj",
+    title: en_so("Hajj & Umra Account", "Hajj & Cumra"),
+    eyebrow: en_so("Goal-based savings", "Kayd hadaf leh"),
+    tagline: en_so(
+      "A dedicated account for saving toward Hajj and Umrah — set your target, see the timeline, and let Premier help you get there.",
+      "Akoon gaar ah oo aad u kaydsato Hajj iyo Cumra — qabo hadaf, raac waqtigaaga, oo Premier wuu kuu caawinayaa."
+    ),
+    highlights: [
+      { value: "Goal-based", label: en_so("Savings plan",     "Qorshe kayd") },
+      { value: "Mudaraba",   label: en_so("Profit-sharing",   "Faa'iido la wadaago") },
+      { value: "Partner",    label: en_so("Travel partners",  "Iskaashi safarid") },
+    ],
+    features: [
+      { icon: "saving",   title: "Pilgrimage savings", body: "Save monthly toward Hajj or Umrah; Premier shows you the projected timeline based on cost estimates." },
+      { icon: "wallet",   title: "Pay-in from Wallet", body: "Round up Wallet transactions into the Hajj jar, automatic deposits, or one-off contributions." },
+      { icon: "joint",    title: "Family co-saving",   body: "Multiple family members can contribute to a single goal — co-saving for a parent's pilgrimage." },
+    ],
+    steps: [
+      step("Open the Hajj account",         "In branch or the Wallet."),
+      step("Submit requirements",           KYC_PERSONAL.join("; ")),
+      step("Set your target & timeline",    "Premier calculates a recommended monthly contribution."),
+      step("Travel with confidence",        "When you're ready, Premier's travel partners help with logistics."),
+    ],
+    faqs: [],
+    cta1: en_so("Start saving for Hajj", "Bilow kayd Hajj"),
+    cta2: en_so("Speak to a banker", "La hadal banker"),
+  },
+
+  women: {
+    cat: "Accounts", cat_so: "Akoonada", accent: "secondary", icon: "women",
+    title: en_so("Maandeeq Account (Women)", "Maandeeq Akoon Haween"),
+    eyebrow: en_so("Applicable only for women", "Haween kaliya"),
+    tagline: en_so(
+      "Maandeeq is a Premier account designed specifically for women — featuring goal savings, business onboarding support, and a dedicated relationship banker.",
+      "Akoon Maandeeq waxaa loo qaabeeyay haweenka — kayd hadaf leh, taageero ganacsi iyo banker gaar ah."
+    ),
+    highlights: [
+      { value: "Women", label: en_so("Eligibility",        "Cidda u qalanta") },
+      { value: "Free",  label: en_so("Account & Wallet",   "Akoon & Wallet") },
+      { value: "1:1",   label: en_so("Relationship banker","Banker gaar ah") },
+    ],
+    features: [
+      { icon: "saving",  title: "Savings groups (Hagbad)", body: "Run rotating-savings groups inside the Wallet — fully tracked, fully Shari'ah-compliant." },
+      { icon: "business",title: "Business onboarding",     body: "If you start a business, Maandeeq supports the transition to a sole-trader account with reduced paperwork." },
+      { icon: "team",    title: "Women's banking events",   body: "Quarterly events on financial literacy, entrepreneurship and Shari'ah finance." },
+    ],
+    steps: [
+      step("Submit requirements", KYC_PERSONAL.join("; ")),
+      step("Activate Maandeeq",   "Same-day account opening, with dedicated onboarding banker."),
+      step("Bank your way",       "Wallet, card, savings, group savings — all on one customer ID."),
+    ],
+    faqs: [],
+    cta1: en_so("Open Maandeeq", "Furo Maandeeq"),
+    cta2: en_so("Visit a branch", "Booqo laanta"),
+  },
+
+  business: {
+    cat: "Accounts", cat_so: "Akoonada", accent: "primary", icon: "business",
+    title: en_so("Business Current Account", "Akoon Ganacsi"),
+    eyebrow: en_so("For traders, importers & SMEs", "Ganacsato"),
+    tagline: en_so(
+      "Built for Somali business: multi-currency, multi-signatory, payroll-ready, and integrated with Premier Omni for online treasury, escrow and SWIFT.",
+      "Loo dhisay ganacsiga Soomaaliyeed — lacago kala duwan, saxiixyo badan, payroll & SWIFT."
+    ),
+    highlights: [
+      { value: "USD / SOS", label: en_so("Multi-currency",        "Lacago kala duwan") },
+      { value: "Up to 8",   label: en_so("Authorised signatories","Saxiixayaal") },
+      { value: "Dedicated", label: en_so("Relationship manager",  "Banker khaas") },
+    ],
+    features: [
+      { icon: "internet",title: "Premier Omni online banking", body: "Multi-user, role-based dashboard with maker-checker controls for every transaction." },
+      { icon: "payroll", title: "Bulk payroll",                  body: "Upload a payroll file or push from your HR system; salaries hit Wallets and accounts instantly." },
+      { icon: "swift",   title: "SWIFT for trade",                body: "Outbound payments to 101+ countries via PBSMSOSM." },
+      { icon: "shield",  title: "Escrow accounts",                body: "Lock funds for tenders, real-estate or marketplace deals — released only when conditions are met." },
+    ],
+    steps: [
+      step("Submit corporate KYC", KYC_BUSINESS.join("; ")),
+      step("Relationship manager",  "A named banker guides setup, signatories, and first transactions."),
+      step("Go live on Omni",        "Typical SME go-live: 5 business days."),
+    ],
+    faqs: [
+      { q: "Can I bank in USD?", a: "Yes — USD is supported as a primary or secondary currency, alongside SOS." },
+    ],
+    cta1: en_so("Talk to a banker", "La hadal banker"),
+    cta2: en_so("See Omni demo",    "Eeg Omni"),
+  },
+
+  sole: {
+    cat: "Accounts", cat_so: "Akoonada", accent: "primary", icon: "corporate",
+    title: en_so("Business Sole-Proprietor Account", "Akoon Mulkiile Keli"),
+    eyebrow: en_so("For single-owner businesses", "Ganacsi keligii leh"),
+    tagline: en_so(
+      "A simplified business account for sole proprietors — one signatory, one trade licence, full access to payroll, POS and Mastercard.",
+      "Akoon ganacsi fudud oo loogu talagalay ganacsato keligood leh — adeeg buuxa."
+    ),
+    highlights: [
+      { value: "1",         label: en_so("Owner / signatory",  "Mulkiile") },
+      { value: "Same-day",  label: en_so("Setup",              "Furida") },
+      { value: "Bundled",   label: en_so("POS & Wallet",       "POS & Wallet") },
+    ],
+    features: [
+      { icon: "pos",      title: "POS for your shop",     body: "Accept Mastercard, Visa and Premier Wallet at your counter; settle same-day to your account." },
+      { icon: "wallet",   title: "Wallet for the business", body: "Pay suppliers, run small payroll, and collect payments — all from a single Wallet linked to your business." },
+      { icon: "card",     title: "Business Mastercard",    body: "Separate business debit card with controlled limits and expense tracking." },
+    ],
+    steps: [
+      step("Submit requirements", "Valid business certificate; Valid ID for owner; Request letter; Photo; Address & contact information."),
+      step("Activate Wallet & card", "Account live same-day; POS terminal delivered within 48 hours if ordered."),
+    ],
+    faqs: [],
+    cta1: en_so("Open sole-proprietor", "Furo Mulkiile Keli"),
+    cta2: en_so("Get a POS terminal", "Hel POS"),
+  },
+
+  ngo: {
+    cat: "Accounts", cat_so: "Akoonada", accent: "primary", icon: "ngo",
+    title: en_so("Umma Account (NGO)", "Umma Akoon (NGO)"),
+    eyebrow: en_so("NGOs, trusts, charities, education sector", "NGO, charity, waxbarasho"),
+    tagline: en_so(
+      "Umma is the Premier account for non-profits — NGOs, trusts, charities and educational institutions. Built for donor reporting, multi-signatory governance and Shari'ah compliance.",
+      "Akoon Umma waa kan Premier ee NGO, charity, iyo waxbarashada."
+    ),
+    highlights: [
+      { value: "Multi", label: en_so("Signatories",         "Saxiixayaal badan") },
+      { value: "Audit", label: en_so("Trail for every txn", "Daawasho bixin kasta") },
+      { value: "Donor", label: en_so("Reporting ready",     "Warbixin deeq") },
+    ],
+    features: [
+      { icon: "shield", title: "Donor-ready statements", body: "Granular statements you can hand directly to donors, with txn-level metadata and receipts." },
+      { icon: "swift",  title: "Inbound USD via SWIFT",  body: "Receive donor funds globally via PBSMSOSM with full audit trail." },
+      { icon: "team",   title: "Programme accounts",      body: "Sub-accounts per programme or project with separate signatories and budgets." },
+    ],
+    steps: [
+      step("Submit requirements", "Valid registration certificate; Notarised memorandum or articles; Director IDs; Request letter; Organisation profile; Declaration of source of income."),
+      step("Banker assignment",    "Dedicated NGO banker walks you through programme account setup."),
+      step("Go live",              "Average activation: 7 business days."),
+    ],
+    faqs: [],
+    cta1: en_so("Open Umma account", "Furo Umma"),
+    cta2: en_so("Talk to NGO team", "La hadal kooxda NGO"),
+  },
+
+  corporate: {
+    cat: "Accounts", cat_so: "Akoonada", accent: "primary", icon: "corporate",
+    title: en_so("Corporate Account", "Akoon Shirkadeed"),
+    eyebrow: en_so("For groups & large corporates", "Shirkado waaweyn"),
+    tagline: en_so(
+      "Premier's corporate banking — for large enterprises, holding companies and group entities. Multi-entity, multi-currency, multi-signatory, with Omni online banking and dedicated treasury.",
+      "Bangiyada shirkadeed ee Premier — shirkado waaweyn iyo kooxo."
+    ),
+    highlights: [
+      { value: "Multi-entity",   label: en_so("Group structure",  "Habdhiska kooxda") },
+      { value: "USD/SOS/EUR",    label: en_so("Currencies",        "Lacago") },
+      { value: "Treasury",       label: en_so("Dedicated desk",    "Mid khaas") },
+    ],
+    features: [
+      { icon: "internet", title: "Omni online banking",   body: "Role-based access, maker-checker, audit trail and SWIFT-from-the-desktop." },
+      { icon: "swift",    title: "Trade finance & LCs",    body: "Letters of credit, shipping guarantees, bank guarantees, import / invoice financing." },
+      { icon: "invest",   title: "Treasury desk",          body: "FX hedging, money-market deposits and structured products — all Shari'ah-compliant." },
+      { icon: "shield",   title: "Escrow & custody",       body: "Lockup funds for M&A, tenders or shareholder agreements." },
+    ],
+    steps: [
+      step("Submit requirements", KYC_BUSINESS.join("; ")),
+      step("Credit committee",     "Two-week underwriting on first facility; faster on renewals."),
+      step("Go live on Omni",      "Group structures: 10 business days. Treasury desk activated thereafter."),
+    ],
+    faqs: [],
+    cta1: en_so("Talk to corporate", "La hadal corporate"),
+    cta2: en_so("See trade finance", "Eeg trade finance"),
+  },
+
+  diaspora: {
+    cat: "Accounts", cat_so: "Akoonada", accent: "secondary", icon: "diaspora",
+    title: en_so("Diaspora Account", "Akoon Diaspora"),
+    eyebrow: en_so("For Somalis abroad", "Soomaalida dibadda"),
+    tagline: en_so(
+      "A Premier account designed for Somalis living abroad — open from London, Minneapolis, Stockholm or Dubai, and send to family at transparent FX rates via 101+ countries.",
+      "Akoon Premier oo loogu talagalay Soomaalida dibadda — 101+ dal."
+    ),
+    highlights: [
+      { value: "0.4%",   label: en_so("FX margin",       "Margin sarrif") },
+      { value: "30 sec", label: en_so("Family payout",   "Lacag-bixin") },
+      { value: "Remote", label: en_so("Onboarding",      "Online") },
+    ],
+    features: [
+      { icon: "globe",   title: "Open from anywhere",    body: "Verify with your foreign address, residence permit and Somali passport. Average remote onboarding: 36 hours." },
+      { icon: "swift",   title: "Live, transparent FX",  body: "Mid-market rate and 0.4% margin shown upfront. No surprises for the receiver." },
+      { icon: "joint",   title: "Family Wallet links",   body: "Set up named recipients with monthly limits. They get a full Premier Wallet." },
+    ],
+    steps: [
+      step("Apply online",       "Upload passport, foreign ID and proof of address."),
+      step("Video KYC",          "Quick call with an onboarding banker, usually within 24 hours."),
+      step("Fund and send",      "Top up via SWIFT, Wise, or partner banks. Send to family in seconds."),
+    ],
+    faqs: [],
+    cta1: en_so("Apply remotely", "Codso online"),
+    cta2: en_so("FX calculator",  "Xisaabin sarrif"),
+  },
+
+  /* ============================  CARDS  ===================================*/
+  classic: {
+    cat: "Cards", cat_so: "Kaararka", accent: "primary", icon: "card",
+    title: en_so("Premier Classic Mastercard", "Premier Classic"),
+    eyebrow: en_so("Card limit · USD 2,000", "Xadka · USD 2,000"),
+    tagline: en_so(
+      "Premier Classic Mastercard is a secure tool for payment via Internet/POS and cash withdrawal via ATM worldwide. Use it anywhere the Mastercard logo is displayed in Somalia or abroad.",
+      "Kaar amaan ah oo loogu talagalay bixin online & POS iyo lacag soo qaadasho ATM — meel kasta oo Mastercard la aqbalo."
+    ),
+    highlights: [
+      { value: "$2,000",   label: en_so("Card limit",        "Xadka") },
+      { value: "Worldwide",label: en_so("Mastercard accepted","Loo aqbalo") },
+      { value: "Chip+PIN", label: en_so("Security",          "Amni") },
+    ],
+    features: [
+      { icon: "pos",      title: "Pay anywhere with POS",   body: "Supermarkets, hotels, companies — anywhere the Mastercard logo is displayed." },
+      { icon: "atm",      title: "ATM withdrawals worldwide",body: "Withdraw cash from any Mastercard-enabled ATM, 24/7." },
+      { icon: "internet", title: "Online checkout",          body: "Use for airline tickets, hotel bookings, e-commerce — globally." },
+      { icon: "shield",   title: "Safety & convenience",      body: "Skip carrying cash; transactions backed by Mastercard's global consumer protection." },
+    ],
+    steps: [
+      step("Apply in branch or Wallet", "Existing Premier customer? Order from the Wallet. New? Visit any branch."),
+      step("KYC & verification",        KYC_PERSONAL.join("; ")),
+      step("Receive your card",         "Delivered in 2–4 working days. Activate with a tap in the Wallet."),
+    ],
+    faqs: [],
+    cta1: en_so("Apply for Classic", "Codso Classic"),
+    cta2: en_so("Compare cards",     "Isbarbar dhig"),
+  },
+
+  platinum: {
+    cat: "Cards", cat_so: "Kaararka", accent: "secondary", icon: "cardPlatinum",
+    title: en_so("Premier Platinum Mastercard", "Premier Platinum"),
+    eyebrow: en_so("Card limit · USD 2,000", "Xadka · USD 2,000"),
+    tagline: en_so(
+      "A premium Platinum Mastercard with the same worldwide acceptance — designed for customers who want a higher card grade with enhanced look and feel.",
+      "Kaar tayo sare ah — heer Platinum, dunida oo dhan loo aqbalo."
+    ),
+    highlights: [
+      { value: "$2,000",  label: en_so("Card limit",        "Xadka") },
+      { value: "Platinum",label: en_so("Card grade",        "Heerka") },
+      { value: "Premium", label: en_so("Look & finish",     "Muuqaalka") },
+    ],
+    features: [
+      { icon: "pos",     title: "Worldwide POS",        body: "Convenient payment processing at any Mastercard POS in Somalia or abroad." },
+      { icon: "atm",     title: "ATM withdrawals",       body: "24/7 cash access at any Mastercard-enabled ATM." },
+      { icon: "shield",  title: "Enhanced security",     body: "Built with high-end security features for safer banking." },
+    ],
+    steps: [
+      step("Existing Premier customer", "Order from the Wallet or via your relationship banker."),
+      step("KYC & verification",         KYC_PERSONAL.join("; ")),
+      step("Card delivered",             "2–4 working days; instant virtual card available in the Wallet."),
+    ],
+    faqs: [],
+    cta1: en_so("Apply for Platinum", "Codso Platinum"),
+    cta2: en_so("Compare cards",      "Isbarbar dhig"),
+  },
+
+  corpcard: {
+    cat: "Cards", cat_so: "Kaararka", accent: "primary", icon: "card",
+    title: en_so("Premier Corporate Mastercard", "Kaarka Shirkadda"),
+    eyebrow: en_so("Card limit · USD 3,000", "Xadka · USD 3,000"),
+    tagline: en_so(
+      "Premier Corporate Mastercard is suitable for medium-sized and large companies with complex expense structures and higher demands in terms of reporting.",
+      "Kaarka shirkadda — shirkadaha dhexe iyo waaweyn ee leh kharashyo isku dhafan."
+    ),
+    highlights: [
+      { value: "$3,000",   label: en_so("Card limit",      "Xadka") },
+      { value: "Multi-user",label: en_so("Cards per company","Kaararka shirkad") },
+      { value: "Reports",  label: en_so("Expense tracking", "Xisaabin kharash") },
+    ],
+    features: [
+      { icon: "corporate",title: "For SMEs and corporates", body: "Modern, secure payment for daily business expenditure." },
+      { icon: "internet", title: "Expense reporting",        body: "Detailed reports per cardholder, per category — exported to your accounting system." },
+      { icon: "shield",   title: "Spend controls",            body: "Per-card and per-category limits; freeze and adjust from Omni in seconds." },
+    ],
+    steps: [
+      step("Corporate facility",  "Available to Premier business customers. Talk to your relationship manager."),
+      step("Cardholder KYC",       "ID + photo + business letter for each cardholder."),
+      step("Cards delivered",      "Bulk delivery to your office; activation via Omni." ),
+    ],
+    faqs: [],
+    cta1: en_so("Request corporate cards", "Codso kaararka shirkadda"),
+    cta2: en_so("See Omni dashboard",      "Eeg Omni"),
+  },
+
+  elite: {
+    cat: "Cards", cat_so: "Kaararka", accent: "primary", icon: "cardElite",
+    title: en_so("Premier World Elite Mastercard", "Premier World Elite"),
+    eyebrow: en_so("Card limit · USD 5,000", "Xadka · USD 5,000"),
+    tagline: en_so(
+      "Premier Bank World Elite Mastercard credit card is the gateway to a world of unique experiences and services — loyalty programmes, lounge access, luxury accommodations and VIP shopping.",
+      "World Elite waa albaab madadaalo gaar ah — qolal sare, hudheelo, iyo VIP."
+    ),
+    highlights: [
+      { value: "$5,000",   label: en_so("Card limit",          "Xadka") },
+      { value: "Worldwide",label: en_so("Lounge access",       "Lounges") },
+      { value: "VIP",      label: en_so("Shopping privileges", "Iibsasho VIP") },
+    ],
+    features: [
+      { icon: "star",   title: "Exclusive privileges", body: "Loyalty programme upgrades, global lounge access, luxury accommodation privileges and VIP shopping experiences." },
+      { icon: "globe",  title: "Global acceptance",    body: "Accepted anywhere Mastercard World Elite is honoured, in 200+ countries." },
+      { icon: "shield", title: "Concierge & protection",body: "24/7 concierge, travel insurance, and Mastercard's premium fraud protection." },
+    ],
+    steps: [
+      step("Eligibility review",   "World Elite is invitation-only for customers meeting income and balance criteria."),
+      step("KYC & verification",   KYC_PERSONAL.join("; ")),
+      step("Card delivery",        "Express delivery within 5 working days; concierge onboarding call follows."),
+    ],
+    faqs: [],
+    cta1: en_so("Request invitation", "Codso casuumad"),
+    cta2: en_so("Compare cards",      "Isbarbar dhig"),
+  },
+
+  /* ============================  FINANCING  ===============================*/
+  auto: {
+    cat: "Financing", cat_so: "Maalgelin", accent: "secondary", icon: "auto",
+    title: en_so("Auto Finance", "Maalgelin Baabuur"),
+    eyebrow: en_so("Sharia-compliant · From USD 3,000", "Shareeco · Bilow USD 3,000"),
+    tagline: en_so(
+      "A flexible and affordable financial solution that gives you access to your dream car. A tailor-made facility for salaried or self-employed individuals to purchase new or used cars for private use.",
+      "Xal maaliyadeed dabacsanaan leh — heli baabuurkaaga riyaada."
+    ),
+    highlights: [
+      { value: "USD 3,000+", label: en_so("Financing from",      "Bilow") },
+      { value: "24 months",  label: en_so("Repayment period",    "Xilliga bixinta") },
+      { value: "Shari'ah",   label: en_so("Sharia-compliant",    "Waafaqsan") },
+    ],
+    features: [
+      { icon: "check",  title: "Free financial planning",  body: "Free planning and expert advice before you commit." },
+      { icon: "auto",   title: "New & used cars",          body: "Finance both new and quality used vehicles for private use." },
+      { icon: "invest", title: "Affordable monthly instalments", body: "Competitive profit rates locked at signing — no surprises later." },
+      { icon: "shariah",title: "Sharia-compliant",         body: "Structured as Murabaha — Premier buys the car, you buy from Premier at a fixed margin." },
+    ],
+    steps: [
+      step("Apply for Auto Finance",  "Online or in branch — pre-approval within 24 hours."),
+      step("Documents",                "Payslips / business statements + ID + 30% down payment proof."),
+      step("Vehicle inspection",       "Premier verifies the car (new or used) before purchase."),
+      step("Sign & drive",             "Premier purchases; you pay fixed monthly instalments for up to 24 months."),
+    ],
+    faqs: [
+      { q: "Can I settle early?",    a: "Yes, with a profit rebate proportional to the unused term. No penalty." },
+      { q: "What's the minimum?",    a: "USD 3,000." },
+    ],
+    cta1: en_so("Apply now",            "Codso hadda"),
+    cta2: en_so("Instalment calculator","Xisaabin"),
+  },
+
+  land: {
+    cat: "Financing", cat_so: "Maalgelin", accent: "primary", icon: "land",
+    title: en_so("Land Construction Finance", "Dhul & Dhismo"),
+    eyebrow: en_so("Up to 36 months · Sharia-compliant", "36 bilood · Shareeco"),
+    tagline: en_so(
+      "A practical facility for ambitious individuals who want to enter construction but have limited funds to acquire land for development.",
+      "Maalgelin oo loogu talagalay dadka rabaan inay galaan dhismaha laakiin aan haysan lacag dhulka lagu iibsado."
+    ),
+    highlights: [
+      { value: "36 months", label: en_so("Repayment period",      "Xilliga") },
+      { value: "30%",       label: en_so("Down payment required", "Hordhac") },
+      { value: "Shari'ah",  label: en_so("Compliant structure",   "Waafaqsan") },
+    ],
+    features: [
+      { icon: "check",  title: "Free planning & advice", body: "Expert advice before you commit. We help structure the deal." },
+      { icon: "land",   title: "Land acquisition",       body: "Acquire titled land for construction or development." },
+      { icon: "invest", title: "Competitive profit rates", body: "Profit rate locked at signing — no surprises." },
+      { icon: "shariah",title: "Sharia-compliant",         body: "Structured as Murabaha / Diminishing Musharaka with full transparency." },
+    ],
+    steps: [
+      step("Pre-approval",         "Tell us your budget and target plot. Indicative facility issued within 5 business days."),
+      step("Documents required",   "Guarantee letter or property collateral; Title deed of plot; 30% down payment proof; Letter of introduction (if employed); 6-month bank statements; ID + 3 photos."),
+      step("Land verification",    "Premier verifies title and conducts an independent valuation."),
+      step("Drawdown & repayment", "Funds released to seller; you repay over up to 36 months."),
+    ],
+    faqs: [],
+    cta1: en_so("Get pre-approved",  "Hel oggolaansho"),
+    cta2: en_so("Talk to a banker",  "La hadal banker"),
+  },
+
+  trade: {
+    cat: "Financing", cat_so: "Maalgelin", accent: "primary", icon: "trade",
+    title: en_so("Business Trade Financing", "Maalgelin Ganacsi"),
+    eyebrow: en_so("LCs · Guarantees · Working capital", "LC, Damaanad, Hawl-galin"),
+    tagline: en_so(
+      "Long, medium and short-term financing for business expansion and acquisition of commercial property. Ideal for businesses that need extra funds to meet trading requirements.",
+      "Maalgelin muddo dheer, dhexdhexaad, iyo gaaban — ballaarinta ganacsiga iyo iibsiga hantida."
+    ),
+    highlights: [
+      { value: "Short / Medium / Long", label: en_so("Tenor options", "Mudooyin") },
+      { value: "5 products",            label: en_so("Trade rails",    "Adeegyo") },
+      { value: "SWIFT-backed",          label: en_so("PBSMSOSM",       "PBSMSOSM") },
+    ],
+    features: [
+      { icon: "send",      title: "Letters of Credit",      body: "Sight, usance and standby LCs — issued in USD, EUR, AED and other major currencies." },
+      { icon: "shield",    title: "Shipping & Bank Guarantees", body: "Guarantees backing your trade obligations, customs, and tenders." },
+      { icon: "globe",     title: "Import Financing",        body: "Pay your suppliers abroad; settle with Premier when you collect from your customers." },
+      { icon: "invest",    title: "Invoice Financing",       body: "Cash against receivables — Premier advances against your invoices, you repay as customers pay." },
+    ],
+    steps: [
+      step("Apply for a facility",  "Three years audited financials + ownership chart + trade flow."),
+      step("Credit committee",       "Two-week underwriting on first facility; faster on renewals."),
+      step("Documentation",          "Master Murabaha + facility letter. SWIFT codes set up; correspondent confirmations issued."),
+      step("Draw and repay",         "Drawdowns via Omni; relationship manager owns the lifecycle."),
+    ],
+    faqs: [],
+    cta1: en_so("Request facility", "Codso facility"),
+    cta2: en_so("Trade finance team","Kooxda ganacsiga"),
+  },
+
+  /* ============================  SERVICES  ================================*/
+  wallet: {
+    cat: "Services", cat_so: "Adeegyada", accent: "secondary", icon: "wallet",
+    title: en_so("Premier Wallet", "Premier Wallet"),
+    eyebrow: en_so("The most-loved mobile money service in Somalia", "Adeega ugu jecel Soomaaliya"),
+    tagline: en_so(
+      "Premier Wallet offers financial services to non-banked populations or people with limited access to banks. A safe, affordable and secure way to trade on your smartphone — everything blazes fast, onboarding takes minutes, and your data is encrypted on Premier's secure servers.",
+      "Premier Wallet wuxuu adeeg siiyaa dadka aan akoon bangi haysan — degdeg, qiime jaban, oo amaan ah."
+    ),
+    highlights: [
+      { value: "101+",    label: en_so("Remittance countries", "Dalal remittance") },
+      { value: "6 rails", label: en_so("Top-up · Send · Bills · etc.", "Adeegyo") },
+      { value: "Free",    label: en_so("Download & register",   "Bilaash") },
+    ],
+    features: [
+      { icon: "topup",   title: "Top up airtime",     body: "Hormuud, Somtel, Somnet — instant top-up to any number, from inside the Wallet." },
+      { icon: "send",    title: "Money transfer",      body: "Premier-to-Premier instant; other banks via Switch; 101+ countries via remittance." },
+      { icon: "atm",     title: "Withdrawals",         body: "Cardless ATM withdrawal — generate a code in the Wallet, enter it at any Premier ATM." },
+      { icon: "bills",   title: "Bill payment",        body: "Water, electricity, school fees, and merchant bills — paid from the Wallet in two taps." },
+      { icon: "globe",   title: "Wallet Send & Remit", body: "Mobile money, cash pickup or bank transfer — to 101+ countries." },
+      { icon: "internet",title: "Mobile banking",      body: "All your Premier accounts in one place — statements, cards, savings and SWIFT." },
+    ],
+    steps: [
+      step("Download the app",     "iOS App Store, Google Play, Huawei AppGallery."),
+      step("Verify your ID",       "3-minute KYC via your phone (passport, ID or driving licence)."),
+      step("Fund your Wallet",     "Cash-in at any Premier agent, or transfer from an existing account."),
+      step("Pay, send, save",      "All Premier services accessible from one app."),
+    ],
+    faqs: [
+      { q: "How many countries does Wallet Send reach?", a: "More than 101 countries, via mobile money, cash pickup or bank transfer." },
+      { q: "Is there a fee?",                            a: "Free to download and register. P2P transfers free. Bill payments free. International transfers shown transparently before you confirm." },
+    ],
+    cta1: en_so("Download Wallet", "Soo dejiso"),
+    cta2: en_so("See features",    "Eeg sifooyinka"),
+  },
+
+  internet: {
+    cat: "Services", cat_so: "Adeegyada", accent: "primary", icon: "internet",
+    title: en_so("Internet Banking", "Internet Banking"),
+    eyebrow: en_so("Online banking · 24/7", "Online · 24/7"),
+    tagline: en_so(
+      "An electronic system managed by Premier Bank which enables you to access financial and non-financial banking products online — also known as Online Banking. Bank from anywhere, any time, with password-protected security.",
+      "Habka elektarooniga ah ee Premier — ka isticmaal adeegyada bangiga online, meel kasta oo aad joogto."
+    ),
+    highlights: [
+      { value: "24/7",    label: en_so("Always-on access",     "Mar walba") },
+      { value: "Secure",  label: en_so("Password protected",   "Sirta lagu ilaaliyo") },
+      { value: "Full",    label: en_so("Account control",      "Maamul buuxa") },
+    ],
+    features: [
+      { icon: "shield",  title: "Secure & convenient",  body: "Password-protected banking with 2-factor authentication." },
+      { icon: "globe",   title: "Access anywhere",       body: "Anywhere, any time — full account access on any device." },
+      { icon: "send",    title: "Online transfers",      body: "Move funds between accounts and to other banks in real-time." },
+      { icon: "internet",title: "Manage everything",     body: "Track balance, statements, cards, loans, savings, standing orders — all in one place." },
+    ],
+    steps: [
+      step("Submit the application form", "At any branch with your passport or valid ID."),
+      step("Verification",                "Bank verifies the information and issues a Customer ID and password."),
+      step("Login & set up",              "Access through the official Premier Bank website."),
+      step("Bank online",                 "Manage everything from your dashboard — accounts, cards, transfers and bills."),
+    ],
+    faqs: [
+      { q: "Can I register online?",  a: "The Internet Banking application can be registered from the bank's official website. You'll still need to verify in branch for the first activation." },
+    ],
+    cta1: en_so("Register now",     "Diiwaan-geli"),
+    cta2: en_so("Login to banking", "Gal banking"),
+  },
+
+  swift: {
+    cat: "Services", cat_so: "Adeegyada", accent: "primary", icon: "swift",
+    title: en_so("SWIFT International", "SWIFT Caalami"),
+    eyebrow: en_so("SWIFT Code · PBSMSOSM", "PBSMSOSM"),
+    tagline: en_so(
+      "Our SWIFT offering provides a convenient channel that enables international money remittance and payments worldwide through banks. Money transfer across banks is safe, fast, and guaranteed through Premier Bank's SWIFT service. We are capable of receiving and sending from all nations.",
+      "Adeega SWIFT ee Premier — wareejin caalami amaan, degdeg, oo lagu kalsoon yahay. Ka heli karaa oo u diri karaa dalal kasta."
+    ),
+    highlights: [
+      { value: "PBSMSOSM", label: en_so("SWIFT BIC",          "BIC") },
+      { value: "All nations",label: en_so("Send & receive",    "Diri & hel") },
+      { value: "Safe & fast",label: en_so("Guaranteed",        "La ammaanay") },
+    ],
+    features: [
+      { icon: "send",    title: "International wires",   body: "Outbound payments to 101+ countries via direct correspondent banks." },
+      { icon: "receive", title: "Inbound from any bank", body: "Receive in USD, EUR, AED, GBP and others. Funds posted to your account same-day to T+1." },
+      { icon: "shield",  title: "Compliance-first",      body: "Sanctions screening, AML monitoring and FATF-aligned KYC on every transaction." },
+      { icon: "globe",   title: "Track via GPI",         body: "SWIFT GPI tracking inside the Wallet — see exactly where your money is, in real time." },
+    ],
+    steps: [
+      step("Initiate from Wallet or Omni", "Beneficiary, amount, currency, and purpose code. Live FX shown up-front."),
+      step("Confirm rate and fees",         "Lock and proceed, or cancel."),
+      step("Track",                         "Real-time GPI status until funds land."),
+    ],
+    faqs: [
+      { q: "What's the SWIFT code?", a: "PBSMSOSM (Premier Bank — Mogadishu)." },
+    ],
+    cta1: en_so("Send a wire",     "Dir lacag"),
+    cta2: en_so("Track an inbound","Raac soo-galay"),
+  },
+
+  atm: {
+    cat: "Services", cat_so: "Adeegyada", accent: "primary", icon: "atm",
+    title: en_so("Premier ATM Network", "Shabakadda ATM Premier"),
+    eyebrow: en_so("The largest ATM network in Somalia · 30 ATMs", "30 ATM Soomaaliya"),
+    tagline: en_so(
+      "An automated teller machine allows you to complete bank transactions without seeing a bank representative. Your Premier Bank ATM card provides quick and easy access to your account 24/7 — withdraw cash, check balance, and more at any ATM around the world.",
+      "ATM-ka Premier — hel lacagtaada 24/7, gudaha & dibadda."
+    ),
+    highlights: [
+      { value: "30",     label: en_so("Total ATMs",          "Wadarta") },
+      { value: "21",     label: en_so("In Mogadishu",        "Muqdisho") },
+      { value: "9",      label: en_so("Across regions",      "Gobollada") },
+    ],
+    features: [
+      { icon: "atm",     title: "Cash withdrawal",     body: "24/7 cash access; Mastercard and Visa accepted." },
+      { icon: "check",   title: "Balance inquiry",      body: "Real-time balance and mini-statement on screen and receipt." },
+      { icon: "wallet",  title: "Cardless withdrawal",  body: "Generate a 6-digit code in your Wallet, enter it at the ATM — no card needed." },
+      { icon: "globe",   title: "Convenient locations", body: "Malls, hotels, supermarkets, airports, retailers, and every branch." },
+    ],
+    steps: [
+      step("Find an ATM",        "Branch ATMs, airports, malls, hotels, supermarkets, retailers — 21 in Mogadishu, 9 in regions."),
+      step("Insert card or use cardless", "Card with PIN, or generate a Wallet code."),
+      step("Transact",           "Withdraw, deposit, check balance, mini-statement, change PIN, bill pay."),
+    ],
+    faqs: [
+      { q: "Where are Premier ATMs?", a: "Branch ATMs (Airport Int. arrival, Decale, AC Camp, Star Empire, SKA, etc.); plus regional ATMs in Baidoa, Kismayo, Dhusamareb, Garowe, Galkacyo, Qardho and Bosaso." },
+    ],
+    cta1: en_so("Find ATM",            "Hel ATM"),
+    cta2: en_so("Cardless withdrawal", "Bilaa-kaar"),
+  },
+
+  pos: {
+    cat: "Services", cat_so: "Adeegyada", accent: "primary", icon: "pos",
+    title: en_so("Premier POS", "Premier POS"),
+    eyebrow: en_so("319 POS terminals · Nationwide", "319 POS"),
+    tagline: en_so(
+      "Premier POS is an electronic payment processing machine that eliminates the need for cash. Process payments safely and conveniently with Premier Mastercard, Visa, MasterCard and Discover cards.",
+      "Premier POS — mashiin elektaroonik ah oo lacagta cash u dhiman. Aqbal Mastercard, Visa, MasterCard iyo Discover."
+    ),
+    highlights: [
+      { value: "319",      label: en_so("Total POS terminals", "Wadarta") },
+      { value: "287",      label: en_so("In Mogadishu",        "Muqdisho") },
+      { value: "32",       label: en_so("Across regions",      "Gobollada") },
+    ],
+    features: [
+      { icon: "pos",     title: "Tap-and-go acceptance", body: "Contactless Mastercard, Visa, Discover and Premier Wallet payments." },
+      { icon: "check",   title: "No cash required",       body: "Safer for staff, easier for customers, and faster checkout." },
+      { icon: "star",    title: "Partner discounts",      body: "Promotions and discounts from Premier partner merchants." },
+      { icon: "globe",   title: "Everywhere it matters",  body: "Supermarkets, shopping centres, clothing shops, travel agencies, universities, hotels, gas stations and hospitals." },
+    ],
+    steps: [
+      step("Apply with your trade licence", "Online application — usually approved within 48 hours."),
+      step("Receive your terminal",          "First terminal free; additional units with deposit. Train staff in one session."),
+      step("Configure & go live",            "Tip prompts, table numbers, staff PINs, and reporting — all configurable."),
+    ],
+    faqs: [
+      { q: "Where can I use Premier POS?", a: "Supermarkets, shopping centres, clothing shops, travel agencies, universities, hotels, gas stations, hospitals and more — across all provinces and towns." },
+    ],
+    cta1: en_so("Apply for POS",   "Codso POS"),
+    cta2: en_so("Talk to merchant","La hadal merchant"),
+  },
+
+  agency: {
+    cat: "Services", cat_so: "Adeegyada", accent: "secondary", icon: "agency",
+    title: en_so("Agency Banking", "Adeega Wakiilka"),
+    eyebrow: en_so("Authorized Premier Agents nationwide", "Wakiillada Premier"),
+    tagline: en_so(
+      "You can still access Premier Bank if you live in a remote area that doesn't have a branch nearby. We have Authorized Premier Agents placed in strategic locations throughout Somalia, processing essential banking transactions quickly and conveniently.",
+      "Wakiillada Premier waxay ka shaqeeyaan dhulkii fog ka uu joogo. Adeegyada bangiga, meel kasta."
+    ),
+    highlights: [
+      { value: "Nationwide", label: en_so("Coverage",            "Dalka oo dhan") },
+      { value: "Same-day",   label: en_so("Transaction posting", "Bixin isla maalin") },
+      { value: "Insured",    label: en_so("Customer protection", "Macmiilka la ilaaliyo") },
+    ],
+    features: [
+      { icon: "account", title: "Open new accounts",   body: "An Authorized Agent can onboard you in five minutes — same KYC, same security as a branch." },
+      { icon: "check",   title: "Check your balance",  body: "Quick balance check on any Premier-issued ID." },
+      { icon: "topup",   title: "Cash deposits",       body: "Deposit cash directly to your Premier account; posted same-day with SMS confirmation." },
+      { icon: "atm",     title: "Cash withdrawals",    body: "Withdraw cash at any Authorized Agent — same fees as the Wallet." },
+      { icon: "send",    title: "Transfer funds",      body: "Send to any Premier account or external bank from an Agent counter." },
+    ],
+    steps: [
+      step("Find an agent",  "Look for the Premier shield. Wallet shows live agent location & status."),
+      step("Identify",       "Show your Premier ID or Wallet QR; agent scans to verify."),
+      step("Transact",       "Both sides confirm before cash crosses the counter."),
+    ],
+    faqs: [
+      { q: "Can I open an account with an agent?", a: "Yes — agents process the same KYC steps as a branch, with identical security." },
+    ],
+    cta1: en_so("Find an agent",   "Hel wakiil"),
+    cta2: en_so("Become an agent", "Noqo wakiil"),
+  },
+
+  payroll: {
+    cat: "Services", cat_so: "Adeegyada", accent: "secondary", icon: "payroll",
+    title: en_so("Payroll Processing", "Mushahar"),
+    eyebrow: en_so("For employers — save time, save money", "Loo dhiman shaqaalaha"),
+    tagline: en_so(
+      "Our payroll processing system saves all the time and resources required to manage salary and wages payments. Open a salary current account for your employees and let us do the rest. At the click of a button, our system credits all your employees' accounts and sends an SMS notification to each one.",
+      "Habka Premier Payroll wuxuu kuu badbaadiyaa waqti & lacag. Furaha hal jaranjaro, mushaharka shaqaalaha gaadhi karaan."
+    ),
+    highlights: [
+      { value: "1-click", label: en_so("Bulk credit",       "Mushahar guud") },
+      { value: "SMS",     label: en_so("Employee alerts",   "Digniin shaqaale") },
+      { value: "Same-day",label: en_so("Settlement",        "Bixin isla maalin") },
+    ],
+    features: [
+      { icon: "payroll", title: "Bulk salary credit",   body: "Upload a file or push from your HR system — all employees credited in one transaction." },
+      { icon: "send",    title: "SMS notifications",     body: "Every employee receives an SMS confirming the credit." },
+      { icon: "shield",  title: "Audit & reconciliation",body: "Full audit trail per pay-run; reconciliation files exported to your accounting system." },
+      { icon: "check",   title: "Time & cost savings",   body: "Premier Bank payroll processing ensures employees receive their salaries on time and saves the company time and money." },
+    ],
+    steps: [
+      step("Open salary accounts for staff", "We can onboard staff in bulk at your offices."),
+      step("Upload the payroll file",         "Standard Excel/CSV format. Approved via maker-checker."),
+      step("One-click credit",                "All accounts credited; SMS sent to each employee."),
+    ],
+    faqs: [],
+    cta1: en_so("Talk to a banker", "La hadal banker"),
+    cta2: en_so("See Omni demo",    "Eeg Omni"),
+  },
+
+  wearable: {
+    cat: "Services", cat_so: "Adeegyada", accent: "secondary", icon: "wearable",
+    title: en_so("Premier Wearables — Tap2Pay", "Premier Wearables · Tap2Pay"),
+    eyebrow: en_so("NFC payments, on your wrist", "NFC, gacanta"),
+    tagline: en_so(
+      "Wearables are portable, electronic devices designed to be worn on the body. They integrate sensors, communication modules and payment technologies like NFC (Near Field Communication). Tap2Pay turns your watch, ring or band into a Premier payment device.",
+      "Wearables waa qalab la xidhanaayo oo NFC ku dhejisan. Tap2Pay — saaceeyahaaga noqoshada qalab bixin."
+    ),
+    highlights: [
+      { value: "NFC",   label: en_so("Tap-to-pay rail",        "Taabasho keliya") },
+      { value: "Linked",label: en_so("To your Premier card",   "Kaarka Premier") },
+      { value: "Range", label: en_so("Watches · Rings · Bands","Saac, giraan, xidhmo") },
+    ],
+    features: [
+      { icon: "wearable",title: "Tap2Pay watches",  body: "Premier-branded smartwatches with built-in NFC payment, linked to your Mastercard." },
+      { icon: "card",    title: "Tap2Pay rings",     body: "Slim ring devices for contactless payment — no battery, no charging." },
+      { icon: "shield",  title: "Built-in security", body: "Each tap is tokenised; loss of a wearable can be deactivated instantly from the Wallet." },
+    ],
+    steps: [
+      step("Order a wearable",         "Available at Premier branches and partner retailers."),
+      step("Link to your Mastercard",  "Pair in the Wallet — takes under a minute."),
+      step("Tap to pay",               "At any Mastercard contactless POS — including Premier's POS fleet."),
+    ],
+    faqs: [],
+    cta1: en_so("Order Tap2Pay",  "Codso Tap2Pay"),
+    cta2: en_so("See product range","Eeg alaabta"),
+  },
+
+  gateway: {
+    cat: "Services", cat_so: "Adeegyada", accent: "secondary", icon: "gateway",
+    title: en_so("Payment Gateway (MPGS)", "Albaab Lacageed (MPGS)"),
+    eyebrow: en_so("Mastercard Payment Gateway Services", "MPGS"),
+    tagline: en_so(
+      "Premier Bank's Payment Gateway is built on Mastercard Payment Gateway Services (MPGS) — a global payment-processing platform operating in 170+ countries, supporting 200+ acquirer connections and processing billions of transactions annually.",
+      "Albaab Lacageed oo ku dhisan MPGS — 170+ dal, 200+ xidhiidhka acquirer, balayiin bixino sannadkii."
+    ),
+    highlights: [
+      { value: "170+",   label: en_so("Countries supported",       "Dalal") },
+      { value: "200+",   label: en_so("Acquirer connections",      "Xidhiidh acquirer") },
+      { value: "Billions",label: en_so("Transactions per year",    "Bixino sannadkii") },
+    ],
+    features: [
+      { icon: "shield",  title: "Fraud prevention",       body: "Built-in fraud screening, 3-D Secure 2 and machine-learning risk scoring." },
+      { icon: "check",   title: "PCI compliance",          body: "PCI-DSS Level 1 from day one — no compliance burden on your team." },
+      { icon: "globe",   title: "Multi-payment methods",   body: "Cards, Wallet, and alternative methods — through one integration." },
+      { icon: "internet",title: "High uptime, multi-language, multi-currency", body: "Architected for scale. Localised for your customers." },
+    ],
+    steps: [
+      step("Apply as a merchant",  "Trade licence + bank statement + URL. Sandbox in minutes, production in 1–3 days."),
+      step("Integrate",            "Drop-in widget, hosted checkout, or full API. Sample apps in JS/PHP/Python/Go."),
+      step("Test in sandbox",      "Realistic responses for success, decline, 3-D Secure, and edge cases."),
+      step("Go live",              "Switch keys; settlement starts on the next business day."),
+    ],
+    faqs: [],
+    cta1: en_so("Read the docs",   "Akhri docs"),
+    cta2: en_so("Sandbox sign-up", "Sandbox"),
+  },
+
+  /* ============================  NEWS  ====================================*/
+  news: {
+    cat: "News", cat_so: "Wararka", accent: "primary", icon: "news",
+    title: en_so("Newsroom", "Qolka Wararka"),
+    eyebrow: en_so("Latest from Premier Bank", "Wararka cusub"),
+    tagline: en_so("Product launches, partnership announcements, and Premier's perspective on Somalia's financial sector.", "Adeegyo cusub, iskaashi, iyo aragtida bangiga."),
+    highlights: [
+      { value: "120+",   label: en_so("Articles in 2024", "Maqaallo 2024") },
+      { value: "Weekly", label: en_so("Cadence",          "Toddoba") },
+      { value: "EN/SO",  label: en_so("Languages",        "Luqado") },
+    ],
+    features: [
+      { icon: "news",   title: "Wallet 3.0 launches",       body: "Premier rolls out the third-generation Wallet across iOS, Android and Huawei AppGallery." },
+      { icon: "swift",  title: "SWIFT partnership update",   body: "New correspondent relationships unlock additional same-day corridors." },
+      { icon: "agency", title: "Hargeisa flagship branch",    body: "New flagship opens in central Hargeisa with full-service personal and business banking." },
+      { icon: "student",title: "Premier Scholars 2025",        body: "100 university scholarships announced for Somali students in STEM, finance and Islamic studies." },
+    ],
+    steps: [],
+    faqs: [],
+    cta1: en_so("Subscribe",   "Diiwaan-geli"),
+    cta2: en_so("Press kit",   "Saxaafad"),
+  },
+  press: {
+    cat: "News", cat_so: "Wararka", accent: "primary", icon: "press",
+    title: en_so("Press Releases", "Saxaafadda"),
+    eyebrow: en_so("Official statements", "Hadalo rasmi ah"),
+    tagline: en_so("Premier Bank's official statements — quarterly results, regulatory disclosures, leadership changes, and major commercial announcements.", "Hadallada rasmiga ah ee bangiga."),
+    highlights: [
+      { value: "32",       label: en_so("Releases in 2024", "Saxaafad 2024") },
+      { value: "Q-end +14d",label: en_so("Earnings release","Faa'iidada") },
+      { value: "EN/SO/AR", label: en_so("Languages",        "Luqado") },
+    ],
+    features: [
+      { icon: "invest", title: "Quarterly results",       body: "Audited financials, capital position, and management commentary — 14 business days after quarter-end." },
+      { icon: "shield", title: "Regulatory filings",       body: "All CBS-mandated disclosures, including Pillar III risk reports and AML/CFT statements." },
+      { icon: "team",   title: "Leadership announcements", body: "C-suite, board and Shari'ah board appointments." },
+      { icon: "globe",  title: "Partnership news",         body: "SWIFT corridors, Mastercard programmes, new market entry — all confirmed publicly." },
+    ],
+    steps: [],
+    faqs: [],
+    cta1: en_so("Browse releases","Eeg dhammaan"),
+    cta2: en_so("Subscribe",       "Diiwaan-geli"),
+  },
+  gallery: {
+    cat: "News", cat_so: "Wararka", accent: "secondary", icon: "gallery",
+    title: en_so("Gallery", "Sawirada"),
+    eyebrow: en_so("Photos · Videos · Brand", "Sawirro · Fiidiyowyo"),
+    tagline: en_so("Photography from Premier branches, events, agent visits and customer stories. Free for editorial use with attribution.", "Sawirro laamaha, dhacdooyinka, iyo sheekooyinka macaamiisha."),
+    highlights: [
+      { value: "1,200+",label: en_so("Photos",        "Sawirro") },
+      { value: "60+",   label: en_so("Videos",        "Fiidiyowyo") },
+      { value: "CC-BY", label: en_so("Editorial use", "Laysan") },
+    ],
+    features: [
+      { icon: "agency",  title: "Branch & operations", body: "Inside Premier branches across the country." },
+      { icon: "team",    title: "Customer stories",     body: "Faces of Premier — entrepreneurs, students, families, diaspora customers." },
+      { icon: "star",    title: "Events",                body: "Premier Forum, Wallet 3.0 launch, the annual Iftar." },
+      { icon: "press",   title: "Brand assets",          body: "Logos, brand colours and approved type specimens." },
+    ],
+    steps: [],
+    faqs: [],
+    cta1: en_so("Browse gallery",     "Eeg sawirada"),
+    cta2: en_so("Download brand kit", "Soo dejiso brand"),
+  },
+};
+
+/* -------------------------------------------------------------------------- */
+/*  ATM directory — searchable, filterable list of live ATMs                  */
+/* -------------------------------------------------------------------------- */
+function AtmDirectory({ atms, lang }) {
+  const [region, setRegion] = useStateD("all");
+  const [q, setQ] = useStateD("");
+  const regions = ["all"].concat(Array.from(new Set(atms.map(a => a.region).filter(Boolean))));
+  const list = atms.filter(a =>
+    (region === "all" || a.region === region) &&
+    (!q || (a.location || "").toLowerCase().includes(q.toLowerCase()) || (a.number || "").toLowerCase().includes(q.toLowerCase()))
+  );
+  const mapsHref = (a) => a.lat && a.lng
+    ? `https://www.google.com/maps/search/?api=1&query=${a.lat},${a.lng}`
+    : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(a.location || "Premier Bank ATM")}`;
+  return (
+    <div className="pb-atm-wrap">
+      <div className="pb-atm-controls">
+        <input className="pb-atm-search" placeholder={lang === "en" ? "Search location or ATM #…" : "Raadi goob ama ATM #…"} value={q} onChange={(e) => setQ(e.target.value)} />
+        <div className="pb-atm-filters">
+          {regions.map(r => (
+            <button key={r} className={region === r ? "is-active" : ""} onClick={() => setRegion(r)}>
+              {r === "all" ? (lang === "en" ? "All regions" : "Dhammaan") : r}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="pb-atm-grid">
+        {list.length === 0 && <p className="pb-atm-empty">{lang === "en" ? "No ATMs match your search." : "Lama helin ATM."}</p>}
+        {list.map((a) => (
+          <div key={a.id} className="pb-atm-card">
+            <div className="pb-atm-photo">
+              {a.image ? <img src={a.image} alt={a.location} /> : <IconCircle name="atm" size={48} tone="ghost-green" />}
+            </div>
+            <div className="pb-atm-body">
+              {a.region && <span className="pb-atm-region">{a.region}</span>}
+              <h3>{a.location}</h3>
+              {a.number && <p className="pb-atm-num">{lang === "en" ? "ATM #" : "ATM #"}{a.number}</p>}
+              {(a.lat && a.lng) && <p className="pb-atm-coords"><Icon name="pin" size={13} /> {a.lat}, {a.lng}</p>}
+              <a className="pb-atm-link" href={mapsHref(a)} target="_blank" rel="noopener">{lang === "en" ? "Open in Maps →" : "Fur Maps →"}</a>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Detail Panel component                                                    */
+/* -------------------------------------------------------------------------- */
+function DetailPanel({ itemKey, lang, setLang, onClose, onJump, onOpenAccount, onLogin }) {
+  useEffectD(() => {
+    if (!itemKey) return;
+    document.body.style.overflow = "hidden";
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.body.style.overflow = "";
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [itemKey]);
+  useEffectD(() => {
+    const sc = document.querySelector(".pb-detail-scroll");
+    if (sc) sc.scrollTop = 0;
+  }, [itemKey]);
+
+  if (!itemKey) return null;
+  const d = D[itemKey];
+  if (!d) return null;
+  const tt = (o) => (lang === "en" ? o.en : o.so) || o.en;
+  const txt = (v) => (v && typeof v === "object" ? tt(v) : v);
+
+  // Live team members from Supabase (if configured) override the seeded list.
+  const liveMembers = (window.PB_LIVE_TEAM && window.PB_LIVE_TEAM[itemKey]) || null;
+  const members = (liveMembers && liveMembers.length ? liveMembers : d.members) || [];
+
+  // Live posts / press releases from Supabase.
+  const allPosts = window.PB_LIVE_POSTS || [];
+  const livePosts = (itemKey === "news" || itemKey === "press")
+    ? (itemKey === "press" ? allPosts.filter(p => p.category === "press") : allPosts)
+    : [];
+  const fmtDate = (s) => { try { return new Date(s).toLocaleDateString(lang === "so" ? "so" : "en-GB", { year: "numeric", month: "short", day: "numeric" }); } catch (e) { return ""; } };
+
+  // Live ATMs from Supabase (only on the ATM page).
+  const liveAtms = (itemKey === "atm" && window.PB_LIVE_ATMS) ? window.PB_LIVE_ATMS : [];
+
+  const related = Object.entries(D)
+    .filter(([k, v]) => v.cat === d.cat && k !== itemKey)
+    .slice(0, 4);
+
+  return (
+    <div className="pb-detail-bg" onClick={onClose}>
+      <div
+        className={`pb-detail-panel pb-detail-${d.accent}`}
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+      >
+        <button className="pb-detail-close" onClick={onClose} aria-label="Close"><Icon name="close" size={16} /></button>
+        <div className="pb-detail-scroll">
+          {/* SAME HEADER AS HOME */}
+          <Nav
+            lang={lang}
+            setLang={setLang}
+            onLogin={onLogin}
+            onOpenAccount={() => onJump("personal")}
+            onOpenDetail={onJump}
+            onLogo={onClose}
+          />
+          {/* HERO */}
+          <div className="pb-detail-hero">
+            <div className="pb-detail-crumb">
+              <span>{lang === "en" ? d.cat : (d.cat_so || d.cat)}</span>
+              <span className="pb-crumb-sep">›</span>
+              <span>{tt(d.title)}</span>
+            </div>
+            <div className="pb-detail-hero-icon">
+              <IconCircle name={d.icon || "about"} size={64} tone="ghost-green" />
+            </div>
+            <p className="pb-detail-eyebrow">{tt(d.eyebrow)}</p>
+            <h1 className="pb-detail-title">{tt(d.title)}</h1>
+            <p className="pb-detail-tagline">{tt(d.tagline)}</p>
+            <div className="pb-detail-cta-row">
+              <button className="pb-btn pb-btn-secondary" onClick={() => { onClose(); onOpenAccount && onOpenAccount(); }}>
+                {tt(d.cta1)} <Icon name="arrow" size={14} />
+              </button>
+              <button className="pb-btn pb-btn-glass" onClick={onClose}>
+                {tt(d.cta2)}
+              </button>
+            </div>
+            <div className="pb-detail-highlights">
+              {d.highlights.map((h, i) => (
+                <div key={i} className="pb-detail-stat">
+                  <strong>{h.value}</strong>
+                  <span>{tt(h.label)}</span>
+                </div>
+              ))}
+            </div>
+            <div className="pb-detail-hero-shapes" aria-hidden>
+              <span className="pb-detail-blob a" />
+              <span className="pb-detail-blob b" />
+              <span className="pb-detail-grid-lines" />
+              <span className="pb-detail-watermark"><LogoMark size={460} variant="white" /></span>
+            </div>
+          </div>
+
+          {/* FEATURES */}
+          {d.features && d.features.length > 0 && (
+            <div className="pb-detail-section">
+              <div className="pb-detail-section-head">
+                <span className="pb-detail-sec-num">01</span>
+                <h2>{lang === "en" ? "What you get" : "Waxa aad helayso"}</h2>
+              </div>
+              <div className="pb-detail-features">
+                {d.features.map((f, i) => (
+                  <div key={i} className="pb-detail-feat">
+                    <IconCircle name={f.icon || "about"} size={48} tone="ghost-green" />
+                    <h3>{f.title}</h3>
+                    <p>{f.body}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* LIVE POSTS / PRESS RELEASES */}
+          {livePosts.length > 0 && (
+            <div className="pb-detail-section">
+              <div className="pb-detail-section-head">
+                <span className="pb-detail-sec-num">01</span>
+                <h2>{lang === "en" ? "Latest" : "Kuwa cusub"}</h2>
+              </div>
+              <div className="pb-post-grid">
+                {livePosts.map((p) => {
+                  const tr = (p.i18n && p.i18n[lang]) || {};
+                  const pTitle = tr.title || p.title;
+                  const pSummary = tr.summary || p.summary;
+                  const pBody = tr.body || p.body;
+                  const isHtml = /[<][a-z]/i.test(pBody || "");
+                  return (
+                  <article key={p.id} className="pb-post">
+                    {p.cover_url && <div className="pb-post-cover"><img src={p.cover_url} alt={pTitle} /></div>}
+                    <div className="pb-post-body">
+                      <div className="pb-post-meta">
+                        {p.category === "press" && <span className="pb-post-tag">{lang === "en" ? "Press" : "Saxaafad"}</span>}
+                        {p.created_at && <time>{fmtDate(p.created_at)}</time>}
+                        {p.author && <span>· {p.author}</span>}
+                      </div>
+                      <h3>{pTitle}</h3>
+                      {pSummary && <p className="pb-post-summary">{pSummary}</p>}
+                      {pBody && (
+                        <details className="pb-post-more">
+                          <summary>{lang === "en" ? "Read more" : "Akhri wax dheeraad ah"}</summary>
+                          {isHtml
+                            ? <div className="pb-post-content" dangerouslySetInnerHTML={{ __html: pBody }} />
+                            : <div className="pb-post-content">{pBody.split("\n").filter(Boolean).map((para, i) => <p key={i}>{para}</p>)}</div>}
+                          {(p.gallery || []).length > 0 && (
+                            <div className="pb-post-gallery">
+                              {p.gallery.map((g, i) => (<figure key={i}><img src={g.url} alt={g.caption || ""} />{g.caption && <figcaption>{g.caption}</figcaption>}</figure>))}
+                            </div>
+                          )}
+                          {p.category === "press" && p.press && p.press.pdf_url && (
+                            <a className="pb-btn pb-btn-secondary" href={p.press.pdf_url} target="_blank" rel="noopener" style={{ marginTop: 12, display: "inline-flex" }}>{lang === "en" ? "Download PDF" : "Soo dejiso PDF"} <Icon name="arrow" size={14} /></a>
+                          )}
+                        </details>
+                      )}
+                    </div>
+                  </article>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* TEAM MEMBERS */}
+          {members && members.length > 0 && (
+            <div className="pb-detail-section">
+              <div className="pb-detail-section-head">
+                <span className="pb-detail-sec-num">{(d.features && d.features.length) ? "02" : "01"}</span>
+                <h2>{lang === "en" ? "The team" : "Kooxda"}</h2>
+              </div>
+              <div className="pb-member-grid">
+                {members.map((m, i) => {
+                  const name = txt(m.name);
+                  const role = txt(m.title);
+                  const bio = txt(m.bio);
+                  const initials = (name || "?").split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join("").toUpperCase();
+                  const openProfile = () => window.PB_openMemberProfile({ name: name, role: role, bio: bio, photo: m.photo, section: tt(d.title) }, lang);
+                  return (
+                    <div key={m.id || i} className={`pb-member${m.placeholder ? " pb-member-ph" : ""}`}>
+                      <button type="button" className="pb-member-photo" onClick={openProfile} aria-label={(lang === "en" ? "View profile of " : "Fiiri profile-ka ") + name}>
+                        {m.photo
+                          ? <img src={m.photo} alt={name} />
+                          : <span className="pb-member-initials">{initials}</span>}
+                      </button>
+                      <h3>{name}</h3>
+                      <p className="pb-member-role">{role}</p>
+                      <button type="button" className="pb-member-view" onClick={openProfile}>{lang === "en" ? "View profile" : "Fiiri profile"} <span className="pb-member-arrow">→</span></button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* ATM LOCATIONS */}
+          {liveAtms.length > 0 && (
+            <div className="pb-detail-section">
+              <div className="pb-detail-section-head">
+                <span className="pb-detail-sec-num">02</span>
+                <h2>{lang === "en" ? "ATM locations" : "Goobaha ATM"}</h2>
+              </div>
+              <AtmDirectory atms={liveAtms} lang={lang} />
+            </div>
+          )}
+
+          {/* STEPS */}
+          {d.steps && d.steps.length > 0 && (
+            <div className="pb-detail-section pb-detail-section-alt">
+              <div className="pb-detail-section-head">
+                <span className="pb-detail-sec-num">{(members && members.length) || liveAtms.length ? "03" : "02"}</span>
+                <h2>{lang === "en" ? "How it works" : "Sida ay u shaqayso"}</h2>
+              </div>
+              <div className="pb-detail-steps">
+                {d.steps.map((s, i) => (
+                  <div key={i} className="pb-detail-step">
+                    <span className="pb-detail-step-num">{String(i + 1).padStart(2, "0")}</span>
+                    <div>
+                      <h4>{s.title}</h4>
+                      <p>{s.body}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* FAQ */}
+          {d.faqs && d.faqs.length > 0 && (
+            <div className="pb-detail-section">
+              <div className="pb-detail-section-head">
+                <span className="pb-detail-sec-num">03</span>
+                <h2>{lang === "en" ? "Frequently asked" : "Su'aalaha caadiga ah"}</h2>
+              </div>
+              <div className="pb-detail-faqs">
+                {d.faqs.map((f, i) => (
+                  <details key={i} className="pb-detail-faq">
+                    <summary>{f.q}</summary>
+                    <p>{f.a}</p>
+                  </details>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* RELATED */}
+          {related.length > 0 && (
+            <div className="pb-detail-related">
+              <h3>{lang === "en" ? `More in ${d.cat}` : `${d.cat_so} kale`}</h3>
+              <div className="pb-detail-related-grid">
+                {related.map(([k, v]) => (
+                  <button key={k} className="pb-detail-related-card" onClick={() => onJump(k)}>
+                    <IconCircle name={v.icon || "about"} size={36} tone="ghost-green" />
+                    <span className="pb-detail-related-cat">{lang === "en" ? v.cat : (v.cat_so || v.cat)}</span>
+                    <strong>{tt(v.title)}</strong>
+                    <span className="pb-detail-related-arrow"><Icon name="arrow" size={14} /></span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* CLOSER */}
+          <div className="pb-detail-closer">
+            <div>
+              <h3>{lang === "en" ? "Ready to get started?" : "Ma diyaar tahay?"}</h3>
+              <p>{lang === "en" ? "Open an account in 3 minutes from your phone — or talk to a banker." : "Furo akoon 3 daqiiqo gudahood — ama la hadal banker."}</p>
+            </div>
+            <div className="pb-detail-closer-cta">
+              <button className="pb-btn pb-btn-primary" onClick={() => { onClose(); onOpenAccount && onOpenAccount(); }}>
+                {tt(d.cta1)} <Icon name="arrow" size={14} />
+              </button>
+            </div>
+          </div>
+
+          {/* SAME FOOTER AS HOME */}
+          <Footer lang={lang} onOpenDetail={onJump} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+window.DetailPanel = DetailPanel;
+
+
+/* ============================================================ */
+
+// Premier Bank — main app
+const { useState: useStateA, useEffect: useEffectA } = React;
+
+/* -------------------------------------------------------------------------- */
+
+const PB_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "primary": "#0b2f4f",
+  "secondary": "#6cbe46",
+  "headline": "",
+  "theme": "light",
+  "density": "comfortable",
+  "language": "en"
+}/*EDITMODE-END*/;
+
+function App() {
+  const [t, setTweak] = useTweaks(PB_DEFAULTS);
+  const [lang, setLang] = useStateA(t.language || "en");
+  const [loginOpen, setLoginOpen] = useStateA(false);
+  const [detailKey, setDetailKey] = useStateA(null);
+  const [_tick, setDataTick] = useStateA(0);
+
+  // Re-render when live Supabase data (team / posts / content) arrives.
+  useEffectA(() => {
+    if (window.PB_applyOverrides) window.PB_applyOverrides();
+    const onData = () => { if (window.PB_applyOverrides) window.PB_applyOverrides(); setDataTick((n) => n + 1); };
+    window.addEventListener("pb:data", onData);
+    return () => window.removeEventListener("pb:data", onData);
+  }, []);
+
+  useEffectA(() => { setLang(t.language); }, [t.language]);
+
+  useEffectA(() => {
+    document.documentElement.setAttribute("data-pb-theme", t.theme);
+    document.documentElement.setAttribute("data-pb-density", t.density);
+    document.documentElement.style.setProperty("--pb-primary", t.primary);
+    document.documentElement.style.setProperty("--pb-secondary", t.secondary);
+    document.documentElement.style.setProperty("--pb-primary-700", shade(t.primary, -0.18));
+    document.documentElement.style.setProperty("--pb-primary-300", shade(t.primary, 0.30));
+    document.documentElement.style.setProperty("--pb-secondary-700", shade(t.secondary, -0.20));
+    document.documentElement.style.setProperty("--pb-secondary-100", tint(t.secondary, 0.85));
+  }, [t.theme, t.density, t.primary, t.secondary]);
+
+  const setLangBoth = (l) => { setLang(l); setTweak("language", l); };
+  const openDetail = (k) => k && setDetailKey(k);
+
+  return (
+    <>
+      <Nav
+        lang={lang}
+        setLang={setLangBoth}
+        onLogin={() => setLoginOpen(true)}
+        onOpenAccount={() => openDetail("personal")}
+        onOpenDetail={openDetail}
+      />
+      <Ticker />
+      <main>
+        <HeroSlider lang={lang} customHeadline={t.headline} _tick={_tick} />
+        <StatsBar lang={lang} />
+        <Values lang={lang} />
+        <AccountsShowcase lang={lang} onOpenDetail={openDetail} />
+        <CardsShowcase lang={lang} onOpenDetail={openDetail} />
+        <WalletSection lang={lang} />
+        <MoreServices lang={lang} onOpenDetail={openDetail} />
+        <Testimonials lang={lang} />
+        <SecurityBand lang={lang} />
+        <TrustStrip lang={lang} />
+        <FAQ lang={lang} />
+        <CTACloser lang={lang} />
+      </main>
+      <Footer lang={lang} onOpenDetail={openDetail} />
+      <LoginModal open={loginOpen} onClose={() => setLoginOpen(false)} />
+      <DetailPanel
+        itemKey={detailKey}
+        lang={lang}
+        setLang={setLangBoth}
+        onClose={() => setDetailKey(null)}
+        onJump={(k) => setDetailKey(k)}
+        onOpenAccount={() => setLoginOpen(true)}
+        onLogin={() => setLoginOpen(true)}
+      />
+
+      <TweaksPanel title="Tweaks" defaultPosition={{ right: 24, bottom: 24 }} width={300}>
+        <TweakSection title="Brand">
+          <TweakColor label="Primary navy" value={t.primary}   onChange={(v) => setTweak("primary", v)}
+            options={["#0b2f4f", "#0a2540", "#0e3b66", "#1a4a73"]} />
+          <TweakColor label="Accent green" value={t.secondary} onChange={(v) => setTweak("secondary", v)}
+            options={["#6cbe46", "#4caf50", "#22c55e", "#16a085"]} />
+        </TweakSection>
+        <TweakSection title="Hero">
+          <TweakText label="Headline override (slide 1)" value={t.headline} onChange={(v) => setTweak("headline", v)}
+            placeholder="Banking that moves with Somalia." />
+        </TweakSection>
+        <TweakSection title="Display">
+          <TweakRadio label="Theme"   value={t.theme}   onChange={(v) => setTweak("theme", v)}
+            options={[{ value: "light", label: "Light" }, { value: "dark", label: "Dark" }]} />
+          <TweakRadio label="Density" value={t.density} onChange={(v) => setTweak("density", v)}
+            options={[{ value: "comfortable", label: "Comfy" }, { value: "compact", label: "Compact" }]} />
+          <TweakRadio label="Language" value={t.language} onChange={(v) => { setTweak("language", v); setLang(v); }}
+            options={[{ value: "en", label: "EN" }, { value: "so", label: "SO" }]} />
+        </TweakSection>
+      </TweaksPanel>
+    </>
+  );
+}
+
+/* color helpers */
+function hexToRgb(h) { const x = h.replace("#", ""); return [0, 2, 4].map(i => parseInt(x.substr(i, 2), 16)); }
+function rgbToHex(r, g, b) { return "#" + [r, g, b].map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0")).join(""); }
+function shade(hex, amt) { const [r, g, b] = hexToRgb(hex); const f = amt > 0 ? 255 : 0; const m = Math.abs(amt); return rgbToHex(r + (f - r) * m, g + (f - g) * m, b + (f - b) * m); }
+function tint(hex, amt) { return shade(hex, amt); }
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+
+
+/* ============================================================ */
+
+(function () {
+  const { useState: uS, useEffect: uE, useRef: uR } = React;
+  const clone = (x) => { try { return structuredClone(x); } catch (e) { return JSON.parse(JSON.stringify(x)); } };
+
+  /* merge a sub-key into the stored "content" / "details" override docs */
+  async function saveContentKey(subkey, value) {
+    const cur = window.PBData.getOverride("content") || {};
+    return window.PBData.saveContent("content", Object.assign({}, cur, { [subkey]: value }));
+  }
+  async function saveDetailsKey(pageKey, partial) {
+    const cur = window.PBData.getOverride("details") || {};
+    return window.PBData.saveContent("details", Object.assign({}, cur, { [pageKey]: partial }));
+  }
+
+  /* ---- image uploader (button only) ---- */
+  function AdmDrop({ value, onUpload, folder, label }) {
+    const [busy, setBusy] = uS(false);
+    const [err, setErr] = uS("");
+    const [ok, setOk] = uS(false);
+    const [preview, setPreview] = uS("");
+    const inputRef = uR(null);
+    const displaySrc = preview || value || "";
+
+    const handle = async (file) => {
+      if (!file) return;
+      setErr(""); setOk(false);
+      if (!window.PBData.isConfigured()) { setErr("Supabase not connected - check Settings."); return; }
+      if (!/^image\//i.test(file.type) && !/\.(png|jpe?g|webp|svg|gif)$/i.test(file.name)) {
+        setErr("Please choose an image file (PNG, JPG, WEBP, SVG)."); return;
+      }
+      if (file.size > 8 * 1024 * 1024) { setErr("Image must be under 8 MB."); return; }
+      const blob = URL.createObjectURL(file);
+      setPreview(blob);
+      setBusy(true);
+      try {
+        const url = await window.PBData.uploadImage(file, folder || "misc");
+        URL.revokeObjectURL(blob);
+        setPreview(url);
+        onUpload(url);
+        setOk(true);
+        setTimeout(() => setOk(false), 4000);
+      } catch (e) {
+        URL.revokeObjectURL(blob);
+        setPreview("");
+        setErr("Upload failed: " + (e.message || String(e)));
+      }
+      setBusy(false);
+    };
+
+    uE(() => { if (!value) setPreview(""); }, [value]);
+
+    const open = () => { if (!busy && inputRef.current) { inputRef.current.value = ""; inputRef.current.click(); } };
+
+    return (
+      <div className="adm-up">
+        {displaySrc && (
+          <div className="adm-up-preview">
+            <img src={displaySrc} alt="preview" onError={(e) => { e.target.style.opacity = 0; }} />
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <button type="button" className="adm-btn adm-btn-primary" onClick={open} disabled={busy}
+            style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <Icon name="download" size={15} />
+            {busy ? "Uploading..." : (displaySrc ? "Replace photo" : "Choose photo")}
+          </button>
+          {displaySrc && !busy && (
+            <button type="button" className="adm-btn adm-sm adm-danger" onClick={() => { onUpload(""); setPreview(""); setErr(""); setOk(false); }}>
+              Remove
+            </button>
+          )}
+          <span style={{ fontSize: 12, color: "var(--pb-muted)" }}>PNG · JPG · WEBP · SVG · max 8 MB</span>
+        </div>
+        <input ref={inputRef} type="file" accept="image/*" hidden
+          onChange={(e) => { const f = e.target.files && e.target.files[0]; if (f) handle(f); }} />
+        {err && <div className="adm-up-err">&#9888; {err}</div>}
+        {ok  && <div className="adm-up-ok">&#10003; Saved</div>}
+      </div>
+    );
+  }
+
+  function AdmField({ label, children }) {
+    return <label className="adm-field"><span>{label}</span>{children}</label>;
+  }
+
+  /* bilingual EN/SO field */
+  function AdmBi({ label, value, onChange, textarea, rows }) {
+    const v = value || { en: "", so: "" };
+    const set = (k, val) => onChange(Object.assign({}, v, { [k]: val }));
+    return (
+      <div className="adm-field">
+        <span>{label}</span>
+        <div className="adm-bi">
+          <div className="adm-bi-col">
+            <em>EN</em>
+            {textarea ? <textarea rows={rows || 2} value={v.en || ""} onChange={(e) => set("en", e.target.value)} />
+                      : <input value={v.en || ""} onChange={(e) => set("en", e.target.value)} />}
+          </div>
+          <div className="adm-bi-col">
+            <em>SO</em>
+            {textarea ? <textarea rows={rows || 2} value={v.so || ""} onChange={(e) => set("so", e.target.value)} />
+                      : <input value={v.so || ""} onChange={(e) => set("so", e.target.value)} />}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function AdmSaveBar({ onSave, busy, saved, extra }) {
+    return (
+      <div className="adm-savebar">
+        <button className="adm-btn adm-btn-primary" onClick={onSave} disabled={busy}>{busy ? "Saving…" : "Save changes"}</button>
+        {saved && <span className="adm-saved">✓ Saved & live</span>}
+        {extra}
+      </div>
+    );
+  }
+
+  const ADM_CATS = [
+    { value: "board",      label: "Board of Directors" },
+    { value: "leadership", label: "Senior Management" },
+    { value: "shariah",    label: "Shari'ah Board" },
+  ];
+
+  /* ============================ OVERVIEW ============================ */
+  function AdmOverview({ go }) {
+    const [counts, setCounts] = uS({ team: "…", posts: "…", pages: Object.keys(window.PB_DETAILS || {}).length });
+    uE(() => {
+      (async () => {
+        const t = await window.PBData.listMembers();
+        const p = await window.PBData.listPosts();
+        setCounts((c) => Object.assign({}, c, { team: (t.data || []).length, posts: (p.data || []).length }));
+      })();
+    }, []);
+    const card = (n, label, to) => (
+      <button className="adm-stat" onClick={() => go(to)}>
+        <strong>{n}</strong><span>{label}</span>
+      </button>
+    );
+    return (
+      <div>
+        <h2 className="adm-h2">Dashboard</h2>
+        <p className="adm-muted">Full control of your website content — no code required. Every change goes live instantly.</p>
+        <div className="adm-stats">
+          {card(counts.team, "Team members", "team")}
+          {card(counts.posts, "Posts & releases", "posts")}
+          {card(counts.pages, "Editable pages", "pages")}
+        </div>
+        <div className="adm-quick">
+          <h3>Quick actions</h3>
+          <div className="adm-qa-grid">
+            {[
+              ["branding", "Brand colours", "star"],
+              ["logos", "Logo upload", "shariah"],
+              ["hero", "Hero slides", "gallery"],
+              ["pages", "Page content", "news"],
+              ["team", "Team", "team"],
+              ["posts", "News / press", "press"],
+              ["atms", "ATM locations", "atm"],
+            ].map(([to, label, icon]) => (
+              <button key={to} className="adm-qa" onClick={() => go(to)}>
+                <i className="adm-qa-ico"><Icon name={icon} size={18} /></i>
+                <span>{label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ============================ BRANDING ============================ */
+  const BRAND_PRIMARY_SWATCHES = ["#0b2f4f", "#0a2540", "#0e3b66", "#102a43", "#1a1a2e", "#14213d", "#1b263b", "#0d1b2a"];
+  const BRAND_ACCENT_SWATCHES = ["#6cbe46", "#22c55e", "#16a085", "#0ea5e9", "#f59e0b", "#e11d48", "#8b5cf6", "#d4af37"];
+  const BRAND_THEMES = [
+    { name: "Premier (default)", primary: "#0b2f4f", secondary: "#6cbe46" },
+    { name: "Emerald", primary: "#0a2540", secondary: "#16a085" },
+    { name: "Royal Gold", primary: "#14213d", secondary: "#d4af37" },
+    { name: "Ocean", primary: "#0d1b2a", secondary: "#0ea5e9" },
+    { name: "Sunset", primary: "#1a1a2e", secondary: "#f59e0b" },
+  ];
+  function AdmBranding() {
+    const cur = window.PBData.getOverride("brand") || {};
+    const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+    const [primary, setPrimary] = uS(cur.primary || css("--pb-primary") || "#0b2f4f");
+    const [secondary, setSecondary] = uS(cur.secondary || css("--pb-secondary") || "#6cbe46");
+    const [busy, setBusy] = uS(false); const [saved, setSaved] = uS(false);
+    const mark = () => setSaved(false);
+    const save = async () => {
+      setBusy(true);
+      const { error } = await window.PBData.saveContent("brand", { primary, secondary });
+      setBusy(false);
+      if (error) alert("Failed: " + error.message); else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
+    };
+    const Swatches = ({ list, value, onPick }) => (
+      <div className="adm-swatches">
+        {list.map(c => (
+          <button key={c} type="button" className={"adm-swatch" + (value.toLowerCase() === c.toLowerCase() ? " is-active" : "")} style={{ background: c }} onClick={() => { onPick(c); mark(); }} title={c} />
+        ))}
+      </div>
+    );
+    return (
+      <div className="adm-pane">
+        <h2 className="adm-h2">Brand colours</h2>
+        <p className="adm-muted">Pick a ready-made theme, choose from the palette, or enter any custom HEX colour. Applies across the whole website — buttons, links, headers and accents.</p>
+
+        <h4 className="adm-sub">Quick themes</h4>
+        <div className="adm-theme-row">
+          {BRAND_THEMES.map(t => (
+            <button key={t.name} type="button" className={"adm-theme" + (primary.toLowerCase() === t.primary && secondary.toLowerCase() === t.secondary ? " is-active" : "")} onClick={() => { setPrimary(t.primary); setSecondary(t.secondary); mark(); }}>
+              <span className="adm-theme-dots"><i style={{ background: t.primary }} /><i style={{ background: t.secondary }} /></span>
+              <span>{t.name}</span>
+            </button>
+          ))}
+        </div>
+
+        <h4 className="adm-sub">Primary colour</h4>
+        <div className="adm-color"><input type="color" value={primary} onChange={(e) => { setPrimary(e.target.value); mark(); }} /><input value={primary} onChange={(e) => { setPrimary(e.target.value); mark(); }} placeholder="#0b2f4f" /></div>
+        <Swatches list={BRAND_PRIMARY_SWATCHES} value={primary} onPick={setPrimary} />
+
+        <h4 className="adm-sub">Accent colour</h4>
+        <div className="adm-color"><input type="color" value={secondary} onChange={(e) => { setSecondary(e.target.value); mark(); }} /><input value={secondary} onChange={(e) => { setSecondary(e.target.value); mark(); }} placeholder="#6cbe46" /></div>
+        <Swatches list={BRAND_ACCENT_SWATCHES} value={secondary} onPick={setSecondary} />
+
+        <div className="adm-preview" style={{ background: primary, marginTop: 18 }}>
+          <span style={{ color: "#fff", fontWeight: 600 }}>Live preview</span>
+          <button style={{ background: secondary, color: "#06340a", border: 0, padding: "8px 16px", borderRadius: 8, fontWeight: 700 }}>Button</button>
+          <span style={{ color: secondary, fontWeight: 600 }}>Link</span>
+        </div>
+        <AdmSaveBar onSave={save} busy={busy} saved={saved} />
+      </div>
+    );
+  }
+
+  /* ============================ HERO SLIDES ============================ */
+  function AdmHero() {
+    const [slides, setSlides] = uS(clone((window.PB_CONTENT && window.PB_CONTENT.heroSlides) || []));
+    const [busy, setBusy] = uS(false); const [saved, setSaved] = uS(false);
+    const upd = (i, patch) => setSlides(slides.map((s, j) => j === i ? Object.assign({}, s, patch) : s));
+    const move = (i, d) => { const a = slides.slice(); const j = i + d; if (j < 0 || j >= a.length) return; const t = a[i]; a[i] = a[j]; a[j] = t; setSlides(a); };
+    const remove = (i) => { if (!confirm("Remove this slide?")) return; setSlides(slides.filter((_, j) => j !== i)); };
+    const add = () => setSlides(slides.concat([{ id: "slide" + Date.now(), icon: "star", art: "wallet", tint: "navy", eyebrow: { en: "", so: "" }, title: { en: "New slide", so: "" }, sub: { en: "", so: "" }, cta: { en: "Learn more", so: "" } }]));
+    const save = async () => {
+      setBusy(true);
+      const { error } = await saveContentKey("heroSlides", slides);
+      setBusy(false);
+      if (error) alert("Failed: " + error.message); else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
+    };
+    return (
+      <div className="adm-pane adm-pane-wide">
+        <div className="adm-toolbar">
+          <div>
+            <h2 className="adm-h2">Hero slides</h2>
+            <p className="adm-muted" style={{ margin: "4px 0 0" }}>The rotating banners at the top of the homepage. Reorder with ↑ ↓; each field is bilingual (English / Somali).</p>
+          </div>
+          <button className="adm-btn adm-btn-primary" onClick={add}>+ Add slide</button>
+        </div>
+        {slides.map((s, i) => (
+          <div key={s.id || i} className="adm-card adm-slide-card">
+            <div className="adm-slide-head">
+              <div className="adm-slide-title">
+                <span className={"adm-tint-dot adm-tint-" + (s.tint || "navy")} />
+                <strong>Slide {i + 1}</strong>
+                {(s.title && s.title.en) ? <span className="adm-slide-sub">{s.title.en}</span> : null}
+              </div>
+              <div className="adm-row">
+                <button className="adm-btn adm-sm" disabled={i === 0} onClick={() => move(i, -1)} title="Move up">↑</button>
+                <button className="adm-btn adm-sm" disabled={i === slides.length - 1} onClick={() => move(i, 1)} title="Move down">↓</button>
+                <button className="adm-btn adm-sm adm-danger" onClick={() => remove(i)}>Remove</button>
+              </div>
+            </div>
+
+            <div className="adm-fieldset">
+              <h5 className="adm-fs-title">Text content</h5>
+              <AdmBi label="Eyebrow (small label above the headline)" value={s.eyebrow} onChange={(v) => upd(i, { eyebrow: v })} />
+              <AdmBi label="Headline" value={s.title} onChange={(v) => upd(i, { title: v })} />
+              <AdmBi label="Sub-text" value={s.sub} onChange={(v) => upd(i, { sub: v })} textarea rows={3} />
+              <AdmBi label="Button label" value={s.cta} onChange={(v) => upd(i, { cta: v })} />
+            </div>
+
+            <div className="adm-fieldset">
+              <h5 className="adm-fs-title">Media</h5>
+              <div className="adm-color-row">
+                <AdmField label="Side image (replaces the vector art)">
+                  <AdmDrop value={s.artImage} folder="hero" onUpload={(url) => upd(i, { artImage: url })} />
+                  {s.artImage && <button className="adm-btn adm-sm" onClick={() => upd(i, { artImage: "" })}>Remove image → use vector</button>}
+                </AdmField>
+                <AdmField label="Full background image (optional)">
+                  <AdmDrop value={s.image} folder="hero" onUpload={(url) => upd(i, { image: url })} />
+                  {s.image && <button className="adm-btn adm-sm" onClick={() => upd(i, { image: "" })}>Remove background</button>}
+                </AdmField>
+              </div>
+            </div>
+
+            <div className="adm-fieldset">
+              <h5 className="adm-fs-title">Style</h5>
+              <AdmField label="Background tint">
+                <select value={s.tint} onChange={(e) => upd(i, { tint: e.target.value })}>
+                  <option value="navy">Navy</option><option value="green">Green</option>
+                </select>
+              </AdmField>
+            </div>
+          </div>
+        ))}
+        {slides.length === 0 && <p className="adm-muted">No slides yet — click “+ Add slide”.</p>}
+        <AdmSaveBar onSave={save} busy={busy} saved={saved} />
+      </div>
+    );
+  }
+
+  /* ============================ PAGE CONTENT ============================ */
+  function AdmPages() {
+    const D = window.PB_DETAILS || {};
+    const keys = Object.keys(D);
+    const [key, setKey] = uS(keys[0]);
+    const [draft, setDraft] = uS(null);
+    const [busy, setBusy] = uS(false); const [saved, setSaved] = uS(false);
+    uE(() => {
+      const d = D[key] || {};
+      setDraft({
+        title: d.title || { en: "", so: "" },
+        eyebrow: d.eyebrow || { en: "", so: "" },
+        tagline: d.tagline || { en: "", so: "" },
+        cta1: d.cta1 || { en: "", so: "" },
+        cta2: d.cta2 || { en: "", so: "" },
+        features: clone(d.features || []),
+      });
+      setSaved(false);
+    }, [key]);
+    if (!draft) return null;
+    const setF = (patch) => setDraft(Object.assign({}, draft, patch));
+    const updFeat = (i, patch) => setF({ features: draft.features.map((f, j) => j === i ? Object.assign({}, f, patch) : f) });
+    const addFeat = () => setF({ features: draft.features.concat([{ icon: "star", title: "", body: "" }]) });
+    const rmFeat = (i) => setF({ features: draft.features.filter((_, j) => j !== i) });
+    const save = async () => {
+      setBusy(true);
+      const { error } = await saveDetailsKey(key, draft);
+      setBusy(false);
+      if (error) alert("Failed: " + error.message); else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
+    };
+    const label = (k) => { const d = D[k]; const t = d && d.title ? (d.title.en || k) : k; return t; };
+    // Group pages by their category (About, Accounts, Cards, Services, News…)
+    const CAT_ORDER = ["About", "Accounts", "Cards", "Financing", "Services", "News"];
+    const groups = {};
+    keys.forEach(k => { const c = (D[k] && D[k].cat) || "Other"; (groups[c] = groups[c] || []).push(k); });
+    const cats = Object.keys(groups).sort((a, b) => (CAT_ORDER.indexOf(a) + 99) - (CAT_ORDER.indexOf(b) + 99));
+    const curCat = (D[key] && D[key].cat) || "Other";
+    return (
+      <div className="adm-pane">
+        <h2 className="adm-h2">Page content</h2>
+        <p className="adm-muted">Pick a section, then a page to edit its text (bilingual EN / SO). Changes apply to the full-width page that opens from the menu.</p>
+        <AdmField label="Section">
+          <div className="adm-cat-tabs">
+            {cats.map(c => (
+              <button key={c} type="button" className={curCat === c ? "is-active" : ""} onClick={() => setKey(groups[c][0])}>{c} <em>{groups[c].length}</em></button>
+            ))}
+          </div>
+        </AdmField>
+        <AdmField label="Page">
+          <select value={key} onChange={(e) => setKey(e.target.value)}>
+            {cats.map(c => (
+              <optgroup key={c} label={c}>
+                {groups[c].map(k => <option key={k} value={k}>{label(k)}</option>)}
+              </optgroup>
+            ))}
+          </select>
+        </AdmField>
+        <AdmBi label="Title" value={draft.title} onChange={(v) => setF({ title: v })} />
+        <AdmBi label="Eyebrow" value={draft.eyebrow} onChange={(v) => setF({ eyebrow: v })} />
+        <AdmBi label="Tagline" value={draft.tagline} onChange={(v) => setF({ tagline: v })} textarea rows={3} />
+        <div className="adm-toolbar"><h3>Feature cards (“What you get”)</h3><button className="adm-btn adm-sm" onClick={addFeat}>+ Add</button></div>
+        {draft.features.map((f, i) => (
+          <div key={i} className="adm-card">
+            <div className="adm-card-head"><strong>Card {i + 1}</strong><button className="adm-btn adm-sm adm-danger" onClick={() => rmFeat(i)}>Remove</button></div>
+            <AdmField label="Heading"><input value={f.title || ""} onChange={(e) => updFeat(i, { title: e.target.value })} /></AdmField>
+            <AdmField label="Body"><textarea rows={2} value={f.body || ""} onChange={(e) => updFeat(i, { body: e.target.value })} /></AdmField>
+          </div>
+        ))}
+        <div className="adm-color-row">
+          <AdmBi label="Primary button" value={draft.cta1} onChange={(v) => setF({ cta1: v })} />
+          <AdmBi label="Secondary button" value={draft.cta2} onChange={(v) => setF({ cta2: v })} />
+        </div>
+        <AdmSaveBar onSave={save} busy={busy} saved={saved} />
+      </div>
+    );
+  }
+
+  /* ============================ TEAM ============================ */
+  function AdmTeam() {
+    const [items, setItems] = uS([]);
+    const [editing, setEditing] = uS(null);
+    const [loading, setLoading] = uS(true);
+    const [syncing, setSyncing] = uS(false);
+    const [busy, setBusy] = uS(false);
+    const [sub, setSub] = uS("all");
+    const [q, setQ] = uS("");
+
+    const flat = (v) => (v && typeof v === "object" ? (v.en || v.so || "") : (v || ""));
+
+    // All seed members from PB_DETAILS across the three sections
+    const getSeed = () => {
+      const D = window.PB_DETAILS || {};
+      const out = [];
+      [["board","board"],["leadership","leadership"],["shariah","shariah"]].forEach(([key, cat]) => {
+        const list = ((D[key] && D[key].members) || []).filter(m => !m.placeholder && flat(m.name).trim());
+        list.forEach((m, i) => out.push({ category: cat, name: flat(m.name).trim(), title: flat(m.title), bio: flat(m.bio) || "", photo_url: "", sort: i }));
+      });
+      return out;
+    };
+
+    // Sync: upsert any seed member missing from Supabase (by name, case-insensitive).
+    // Existing rows are not overwritten — only absent names are added.
+    // Also repairs wrong category for members that exist under a different section.
+    const syncSeed = async (current) => {
+      const seed = getSeed();
+      if (!seed.length) return current;
+      const byName = {};
+      (current || []).forEach(m => { byName[(m.name || "").trim().toLowerCase()] = m; });
+      const toSave = [];
+      seed.forEach((s, i) => {
+        const key = s.name.toLowerCase();
+        const existing = byName[key];
+        if (!existing) {
+          toSave.push({ category: s.category, name: s.name, title: s.title, bio: s.bio, photo_url: "", sort: s.sort });
+        } else if (existing.category !== s.category) {
+          // Fix wrong category (e.g. Chairman filed under Senior Management)
+          toSave.push(Object.assign({}, existing, { category: s.category }));
+        }
+      });
+      if (!toSave.length) return current;
+      setSyncing(true);
+      for (const rec of toSave) {
+        const row = Object.assign({}, rec);
+        if (row.id == null) delete row.id;
+        await window.PBData.saveMember(row);
+      }
+      setSyncing(false);
+      const { data } = await window.PBData.listMembers();
+      window.PBData.loadTeam();
+      return data || current;
+    };
+
+    const load = async () => {
+      setLoading(true);
+      const { data, error } = await window.PBData.listMembers();
+      if (error) { alert("Load failed: " + error.message); setLoading(false); return; }
+      const synced = await syncSeed(data || []);
+      setItems(synced);
+      setLoading(false);
+    };
+
+    uE(() => { load(); }, []);
+
+    const newMember = () => setEditing({ category: sub === "all" ? "board" : sub, name: "", title: "", bio: "", photo_url: "", sort: items.length, status: "draft" });
+    const save = async (mode) => {
+      const m = Object.assign({}, editing);
+      if (mode === "draft") m.status = "draft";
+      else if (mode === "published") m.status = "published";
+      else if (!m.status) m.status = "published";
+      if (m.id == null) delete m.id;
+      if (!m.name) { alert("Name is required."); return; }
+      setBusy(true);
+      const { error } = await window.PBData.saveMember(m);
+      setBusy(false);
+      if (error) { alert("Save failed: " + error.message); return; }
+      setEditing(null); await load(); window.PBData.loadTeam();
+    };
+    const del = async (id) => {
+      if (!confirm("Delete this member?")) return;
+      const { error } = await window.PBData.deleteMember(id);
+      if (error) { alert("Delete failed: " + error.message); return; }
+      await load(); window.PBData.loadTeam();
+    };
+    const catLabel = (v) => (ADM_CATS.find((c) => c.value === v) || {}).label || v;
+
+    /* ---- Editor (News & Press-style: grouped fieldset cards) ---- */
+    if (editing) {
+      const setE = (patch) => setEditing(Object.assign({}, editing, patch));
+      const st = editing.status || "published";
+      const previewMember = () => window.PB_openMemberProfile({ name: editing.name, role: editing.title, bio: editing.bio, photo: editing.photo_url, section: catLabel(editing.category) }, "en");
+      return (
+        <div className="adm-pane">
+          <div className="adm-toolbar">
+            <h2 className="adm-h2">{editing.id ? "Edit member" : "Add member"}</h2>
+            <div className="adm-row">
+              <button className="adm-btn adm-sm" onClick={() => setEditing(null)}>← Back</button>
+              <button className="adm-btn adm-btn-primary adm-sm" disabled={busy} onClick={() => save("keep")}>{busy ? "Saving…" : "Save member"}</button>
+            </div>
+          </div>
+
+          {/* Draft · Preview · Published workflow bar */}
+          <div className="adm-statusbar">
+            <span className="adm-statusbar-lbl">Status</span>
+            <div className="adm-statusbtns">
+              {[["draft", "Draft"], ["published", "Published"]].map(([v, label]) => (
+                <button key={v} type="button" className={"adm-statusbtn " + (st === v ? "on " + (v === "published" ? "is-pub" : "is-draft") : "")} onClick={() => setE({ status: v })}>{label}</button>
+              ))}
+            </div>
+            <div className="adm-statusbar-actions">
+              <button className="adm-btn adm-sm" onClick={previewMember}><Icon name="eye" size={15} /> Preview</button>
+              <button className="adm-btn adm-sm" disabled={busy} onClick={() => save("draft")}>Save draft</button>
+              <button className="adm-btn adm-btn-primary adm-sm" disabled={busy} onClick={() => save("published")}>Publish</button>
+            </div>
+          </div>
+
+          <div className="adm-card adm-slide-card">
+            <div className="adm-slide-head"><div className="adm-slide-title">
+              <span className="adm-item-av" style={{ width: 34, height: 34 }}>{editing.photo_url ? <img src={editing.photo_url} alt="" /> : <span>{(editing.name || "?").slice(0, 1)}</span>}</span>
+              <strong>Identity</strong>
+            </div></div>
+            <div className="adm-fieldset">
+              <AdmField label="Photo"><AdmDrop value={editing.photo_url} folder="team" onUpload={(url) => setE({ photo_url: url })} /></AdmField>
+              <div className="adm-color-row">
+                <AdmField label="Full name"><input value={editing.name} onChange={(e) => setE({ name: e.target.value })} placeholder="e.g. Jibril Hassan Mohamed" /></AdmField>
+                <AdmField label="Title / role"><input value={editing.title || ""} onChange={(e) => setE({ title: e.target.value })} placeholder="e.g. Chairman" /></AdmField>
+              </div>
+              <AdmField label="Section">
+                <select value={editing.category} onChange={(e) => setE({ category: e.target.value })}>
+                  {ADM_CATS.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
+                </select>
+              </AdmField>
+            </div>
+          </div>
+
+          <div className="adm-card adm-slide-card">
+            <div className="adm-slide-head"><div className="adm-slide-title"><strong>Profile</strong></div></div>
+            <div className="adm-fieldset">
+              <AdmField label="Bio"><textarea rows={5} value={editing.bio || ""} onChange={(e) => setE({ bio: e.target.value })} placeholder="Short professional biography…" /></AdmField>
+              <AdmField label="Sort order (lower shows first)"><input type="number" value={editing.sort == null ? 0 : editing.sort} onChange={(e) => setE({ sort: parseInt(e.target.value || "0", 10) })} style={{ maxWidth: 140 }} /></AdmField>
+            </div>
+          </div>
+
+          <div className="adm-savebar">
+            <button className="adm-btn adm-btn-primary" disabled={busy} onClick={save}>{busy ? "Saving…" : "Save member"}</button>
+            <button className="adm-btn" onClick={() => setEditing(null)}>Cancel</button>
+          </div>
+        </div>
+      );
+    }
+
+    /* ---- List (News & Press-style: KPIs + filter pills + search + rows) ---- */
+    const count = (v) => items.filter((m) => m.category === v).length;
+    const SUBNAV = [{ id: "all", label: "All" }].concat(ADM_CATS.map((c) => ({ id: c.value, label: c.label })));
+    const shown = items.filter((m) => (sub === "all" || m.category === sub) && (!q || (m.name || "").toLowerCase().includes(q.toLowerCase()) || (m.title || "").toLowerCase().includes(q.toLowerCase())));
+    const renderMemberRow = (m) => (
+      <div key={m.id} className="adm-item">
+        <div className="adm-item-av">{m.photo_url ? <img src={m.photo_url} alt="" /> : <span>{(m.name || "?").slice(0, 1)}</span>}</div>
+        <div className="adm-item-main">
+          <strong>{m.name}</strong>
+          <span>
+            <span className={"adm-status " + ((m.status || "published") === "draft" ? "is-draft" : "is-pub")}>{(m.status || "published") === "draft" ? "Draft" : "Published"}</span>
+            {" · "}{catLabel(m.category)} · {m.title || "—"}
+          </span>
+        </div>
+        <div className="adm-row">
+          <button className="adm-btn adm-sm" onClick={() => setEditing(m)}>Edit</button>
+          <button className="adm-btn adm-sm" onClick={() => window.PB_openMemberProfile({ name: m.name, role: m.title, bio: m.bio, photo: m.photo_url, section: catLabel(m.category) }, "en")}>Preview</button>
+          <button className="adm-btn adm-sm adm-danger" onClick={() => del(m.id)}>Delete</button>
+        </div>
+      </div>
+    );
+
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar">
+          <div>
+            <h2 className="adm-h2">Team members</h2>
+            <p className="adm-muted" style={{ margin: "4px 0 0" }}>The people shown on the Board, Senior Management and Shari’ah Board pages.</p>
+          </div>
+          <button className="adm-btn adm-btn-primary" onClick={newMember}>+ Add member</button>
+        </div>
+
+        <div className="adm-kpi-row">
+          <div className="adm-kpi"><span>{items.length}</span><em>Total members</em></div>
+          <div className="adm-kpi"><span>{count("board")}</span><em>Board of Directors</em></div>
+          <div className="adm-kpi"><span>{count("leadership")}</span><em>Senior Management</em></div>
+          <div className="adm-kpi"><span>{count("shariah")}</span><em>Shari’ah Board</em></div>
+        </div>
+
+        <div className="adm-subnav">
+          {SUBNAV.map((n) => <button key={n.id} className={sub === n.id ? "is-active" : ""} onClick={() => setSub(n.id)}>{n.label}{n.id !== "all" ? " (" + count(n.id) + ")" : ""}</button>)}
+        </div>
+        <div className="adm-row" style={{ marginBottom: 16 }}>
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search by name or title…" style={{ maxWidth: 320 }} />
+        </div>
+
+        {(loading || syncing) ? (
+          <p className="adm-muted">{syncing ? "Syncing website data…" : "Loading…"}</p>
+        ) : shown.length === 0 ? (
+          <p className="adm-muted">{items.length === 0 ? 'No members yet. Click "+ Add member".' : "No members match."}</p>
+        ) : sub === "all" ? (
+          ADM_CATS.map((c) => {
+            const group = shown.filter((m) => m.category === c.value);
+            if (!group.length) return null;
+            return (
+              <div key={c.value} className="adm-group">
+                <h4>{c.label} <span style={{ fontWeight: 400, color: "var(--pb-muted)", fontSize: 13 }}>({group.length})</span></h4>
+                <div className="adm-list-grid">{group.map((m) => renderMemberRow(m))}</div>
+              </div>
+            );
+          })
+        ) : <div className="adm-list-grid">{shown.map((m) => renderMemberRow(m))}</div>}
+      </div>
+    );
+  }
+
+  /* ============================ POSTS ============================ */
+  /* ============================ NEWS & PRESS MODULE ============================ */
+  const NEWS_STATUS = [
+    { v: "draft",     label: "Draft",         cls: "is-draft" },
+    { v: "pending",   label: "Pending review", cls: "is-pending" },
+    { v: "scheduled", label: "Scheduled",     cls: "is-sched" },
+    { v: "published", label: "Published",     cls: "is-pub" },
+    { v: "archived",  label: "Archived",      cls: "is-arch" },
+  ];
+  const newsStatusMeta = (v) => NEWS_STATUS.find((s) => s.v === v) || NEWS_STATUS[0];
+  const slugify = (s) => (s || "").toLowerCase().trim().replace(/[^a-z0-9\s-]/g, "").replace(/\s+/g, "-").replace(/-+/g, "-").slice(0, 80);
+  const NEWS_SUBNAV = [
+    { id: "dash",      label: "Dashboard" },
+    { id: "all",       label: "All news" },
+    { id: "edit",      label: "Create news" },
+    { id: "drafts",    label: "Drafts" },
+    { id: "scheduled", label: "Scheduled" },
+    { id: "press",     label: "Press releases" },
+    { id: "media",     label: "Media library" },
+    { id: "tax",       label: "Categories & tags" },
+    { id: "seo",       label: "SEO" },
+    { id: "analytics", label: "Analytics" },
+  ];
+
+  /* ---- Rich-text (WYSIWYG) editor ---- */
+  function AdmRichEditor({ value, onChange }) {
+    const ref = uR(null);
+    uE(() => { if (ref.current && ref.current.innerHTML !== (value || "")) ref.current.innerHTML = value || ""; }, []);
+    const sync = () => { if (ref.current) onChange(ref.current.innerHTML); };
+    const exec = (cmd, arg) => { document.execCommand(cmd, false, arg); if (ref.current) ref.current.focus(); sync(); };
+    const addLink = () => { const url = prompt("Link URL:", "https://"); if (url) exec("createLink", url); };
+    const addImage = () => {
+      const inp = document.createElement("input"); inp.type = "file"; inp.accept = "image/*";
+      inp.onchange = async () => {
+        const f = inp.files && inp.files[0]; if (!f) return;
+        try { const url = await window.PBData.uploadImage(f, "posts"); exec("insertImage", url); }
+        catch (e) { alert("Image upload failed: " + e.message); }
+      };
+      inp.click();
+    };
+    const B = ({ on, arg, blk, children, title }) => (
+      <button type="button" className="adm-rt-btn" title={title} onMouseDown={(e) => e.preventDefault()}
+        onClick={() => (blk ? exec("formatBlock", blk) : exec(on, arg))}>{children}</button>
+    );
+    return (
+      <div className="adm-rt">
+        <div className="adm-rt-bar">
+          <B blk="H2" title="Heading 2">H2</B>
+          <B blk="H3" title="Heading 3">H3</B>
+          <B blk="P" title="Normal text">P</B>
+          <span className="adm-rt-div" />
+          <B on="bold" title="Bold"><b>B</b></B>
+          <B on="italic" title="Italic"><i>I</i></B>
+          <B on="underline" title="Underline"><u>U</u></B>
+          <B blk="BLOCKQUOTE" title="Quote"><Icon name="quote" size={16} /></B>
+          <span className="adm-rt-div" />
+          <B on="insertUnorderedList" title="Bullet list">• List</B>
+          <B on="insertOrderedList" title="Numbered list">1. List</B>
+          <span className="adm-rt-div" />
+          <button type="button" className="adm-rt-btn" onMouseDown={(e) => e.preventDefault()} onClick={addLink} title="Insert link"><Icon name="link" size={16} /></button>
+          <button type="button" className="adm-rt-btn" onMouseDown={(e) => e.preventDefault()} onClick={addImage} title="Insert image"><Icon name="image" size={16} /></button>
+        </div>
+        <div ref={ref} className="adm-rt-area" contentEditable suppressContentEditableWarning onInput={sync} onBlur={sync} />
+      </div>
+    );
+  }
+
+  /* ---- Multi-image gallery with reorder + captions ---- */
+  function AdmGallery({ items, onChange }) {
+    const list = items || [];
+    const [busy, setBusy] = uS(false);
+    const addFiles = async (files) => {
+      setBusy(true);
+      const next = list.slice();
+      for (const f of Array.from(files)) {
+        try { const url = await window.PBData.uploadImage(f, "posts"); next.push({ url: url, caption: "" }); }
+        catch (e) { alert("Upload failed: " + e.message); }
+      }
+      setBusy(false); onChange(next);
+    };
+    const upd = (i, patch) => onChange(list.map((g, j) => (j === i ? Object.assign({}, g, patch) : g)));
+    const rm = (i) => onChange(list.filter((_, j) => j !== i));
+    const move = (i, dir) => { const j = i + dir; if (j < 0 || j >= list.length) return; const cp = list.slice(); const x = cp[i]; cp[i] = cp[j]; cp[j] = x; onChange(cp); };
+    return (
+      <div className="adm-gal">
+        <label className="adm-gal-add">
+          <input type="file" accept="image/*" multiple style={{ display: "none" }} onChange={(e) => e.target.files.length && addFiles(e.target.files)} />
+          {busy ? "Uploading…" : "＋ Add images"}
+        </label>
+        {list.length > 0 && (
+          <div className="adm-gal-grid">
+            {list.map((g, i) => (
+              <div key={i} className="adm-gal-cell">
+                <img src={g.url} alt="" />
+                <input value={g.caption || ""} onChange={(e) => upd(i, { caption: e.target.value })} placeholder="Caption…" />
+                <div className="adm-gal-ops">
+                  <button type="button" onClick={() => move(i, -1)} disabled={i === 0}>↑</button>
+                  <button type="button" onClick={() => move(i, 1)} disabled={i === list.length - 1}>↓</button>
+                  <button type="button" className="adm-danger" onClick={() => rm(i)}>✕</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  const blankPost = () => ({
+    category: "news", title: "", slug: "", summary: "", body: "", cover_url: "", gallery: [], tags: [],
+    author: "", status: "draft", publish_at: null, featured: false, priority: 0,
+    seo_title: "", seo_desc: "", seo_keywords: "", og_image: "",
+    i18n: { so: { title: "", summary: "", body: "" }, ar: { title: "", summary: "", body: "" } },
+    press: { org: "Premier Bank", location: "", contact: "", email: "", phone: "", pdf_url: "" },
+  });
+
+  /* Open a WordPress-style live preview of a post in a NEW browser tab, with device toggles. */
+  function openNewsPreview(p) {
+    const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    const bodyHtml = /[<][a-z]/i.test(p.body || "") ? (p.body || "") : (p.body || "").split("\n").filter(Boolean).map((x) => "<p>" + esc(x) + "</p>").join("");
+    const gal = (p.gallery || []).map((g) => '<figure><img src="' + esc(g.url) + '"/>' + (g.caption ? "<figcaption>" + esc(g.caption) + "</figcaption>" : "") + "</figure>").join("");
+    const tags = (p.tags || []).map((t) => "<span>#" + esc(t) + "</span>").join("");
+    const today = new Date().toLocaleDateString("en-GB", { year: "numeric", month: "short", day: "numeric" });
+    const doc =
+      '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+      "<title>Preview — " + esc(p.title || "Untitled") + "</title>" +
+      "<style>" +
+      ":root{--nv:#0b2f4f;--gr:#6cbe46;--mut:#5b6b7b;--ln:#e6e9ee}" +
+      "*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:#eef1f4;color:#12212f}" +
+      ".bar{position:sticky;top:0;display:flex;align-items:center;gap:10px;justify-content:center;background:var(--nv);color:#fff;padding:10px;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.15);z-index:5}" +
+      ".bar b{margin-right:auto;padding-left:8px;font-weight:600}" +
+      ".bar button{border:1px solid rgba(255,255,255,.3);background:transparent;color:#fff;border-radius:7px;padding:5px 12px;cursor:pointer;font-size:13px}" +
+      ".bar button.on{background:var(--gr);border-color:var(--gr);color:#06340a;font-weight:600}" +
+      ".stage{padding:26px 16px;display:flex;justify-content:center}" +
+      ".frame{width:100%;max-width:760px;background:#fff;border:1px solid var(--ln);border-radius:16px;overflow:hidden;transition:max-width .25s ease;box-shadow:0 18px 50px rgba(11,47,79,.10)}" +
+      ".cover img{width:100%;display:block;aspect-ratio:16/9;object-fit:cover}" +
+      ".pad{padding:30px 34px 40px}" +
+      ".meta{display:flex;gap:10px;align-items:center;font-size:13px;color:var(--mut);margin-bottom:12px}" +
+      ".pr{background:#e9f4e0;color:#3c6a1f;font-weight:600;padding:2px 8px;border-radius:6px;text-transform:uppercase;font-size:11px;letter-spacing:.04em}" +
+      "h1{font-size:30px;line-height:1.2;margin:0 0 12px}" +
+      ".sum{font-size:17px;color:var(--mut);line-height:1.5;margin:0 0 20px}" +
+      ".content{font-size:16px;line-height:1.7}.content h2{font-size:22px;margin:22px 0 8px}.content h3{font-size:18px;margin:18px 0 6px}" +
+      ".content img{max-width:100%;border-radius:10px;margin:10px 0}.content blockquote{border-left:3px solid var(--gr);margin:14px 0;padding:6px 16px;color:var(--mut)}" +
+      ".gal{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:18px}.gal figure{margin:0}.gal img{width:100%;border-radius:10px}.gal figcaption{font-size:13px;color:var(--mut);margin-top:5px}" +
+      ".tags{display:flex;flex-wrap:wrap;gap:7px;margin-top:20px}.tags span{font-size:13px;background:#e9f4e0;color:#3c6a1f;padding:3px 9px;border-radius:6px}" +
+      "</style></head><body>" +
+      '<div class="bar"><b>Live preview' + (p.status ? " — " + esc((newsStatusMeta(p.status).label)) : "") + '</b>' +
+      '<button data-w="1100" class="on" onclick="setW(this,1100)">Desktop</button>' +
+      '<button data-w="768" onclick="setW(this,768)">Tablet</button>' +
+      '<button data-w="390" onclick="setW(this,390)">Mobile</button></div>' +
+      '<div class="stage"><article class="frame" id="fr">' +
+      (p.cover_url ? '<div class="cover"><img src="' + esc(p.cover_url) + '"/></div>' : "") +
+      '<div class="pad"><div class="meta">' + (p.category === "press" ? '<span class="pr">Press</span>' : "") + "<time>" + today + "</time>" + (p.author ? "<span>· " + esc(p.author) + "</span>" : "") + "</div>" +
+      "<h1>" + esc(p.title || "Untitled article") + "</h1>" +
+      (p.summary ? '<p class="sum">' + esc(p.summary) + "</p>" : "") +
+      '<div class="content">' + bodyHtml + "</div>" +
+      (gal ? '<div class="gal">' + gal + "</div>" : "") +
+      (tags ? '<div class="tags">' + tags + "</div>" : "") +
+      "</div></article></div>" +
+      "<script>function setW(b,w){document.getElementById('fr').style.maxWidth=w+'px';document.querySelectorAll('.bar button').forEach(function(x){x.classList.remove('on')});b.classList.add('on')}<\/script>" +
+      "</body></html>";
+    const w = window.open("", "pb_news_preview");
+    if (!w) { alert("Please allow pop-ups to open the live preview."); return; }
+    w.document.open(); w.document.write(doc); w.document.close();
+  }
+
+  /* ---- The article editor ---- */
+  function AdmNewsEditor({ initial, onSaved, onCancel }) {
+    const [p, setP] = uS(() => Object.assign(blankPost(), initial || {}, {
+      gallery: (initial && initial.gallery) || [], tags: (initial && initial.tags) || [],
+      i18n: Object.assign({ so: { title: "", summary: "", body: "" }, ar: { title: "", summary: "", body: "" } }, (initial && initial.i18n) || {}),
+      press: Object.assign({ org: "Premier Bank", location: "", contact: "", email: "", phone: "", pdf_url: "" }, (initial && initial.press) || {}),
+    }));
+    const [tab, setTab] = uS("content");
+    const [busy, setBusy] = uS(false);
+    const set = (patch) => setP((prev) => Object.assign({}, prev, patch));
+    const setI18n = (l, patch) => set({ i18n: Object.assign({}, p.i18n, { [l]: Object.assign({}, p.i18n[l], patch) }) });
+    const setPress = (patch) => set({ press: Object.assign({}, p.press, patch) });
+    const slugAuto = p.slug || slugify(p.title);
+
+    const persist = async (status) => {
+      if (!p.title.trim()) { alert("Title is required."); return; }
+      if (status === "scheduled" && !p.publish_at) { alert("Pick a publish date & time to schedule."); setTab("publish"); return; }
+      setBusy(true);
+      const rec = Object.assign({}, p, {
+        status: status,
+        slug: p.slug || slugify(p.title),
+        published: status === "published",
+        updated_at: new Date().toISOString(),
+      });
+      if (rec.id == null) delete rec.id;
+      const { error } = await window.PBData.savePost(rec);
+      setBusy(false);
+      if (error) { alert("Save failed: " + error.message); return; }
+      window.PBData.loadPosts();
+      onSaved();
+    };
+
+    const TABS = [["content", "Content"], ["media", "Media"], ["seo", "SEO"], ["langs", "Languages"], ...(p.category === "press" ? [["press", "Press release"]] : []), ["publish", "Publish"]];
+
+    const openPreview = () => openNewsPreview(p);
+
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar">
+          <h2 className="adm-h2">{initial && initial.id ? "Edit article" : "Create article"}</h2>
+          <div className="adm-row">
+            <button className="adm-btn adm-sm" onClick={onCancel}>← Back</button>
+            <button className="adm-btn adm-btn-primary adm-sm" disabled={busy} onClick={() => persist(p.status)}>{busy ? "Saving…" : "Save changes"}</button>
+          </div>
+        </div>
+
+        {/* Always-visible workflow bar: Draft · Preview · Published */}
+        <div className="adm-statusbar">
+          <span className="adm-statusbar-lbl">Status</span>
+          <div className="adm-statusbtns">
+            {[["draft", "Draft"], ["scheduled", "Scheduling"], ["published", "Published"]].map(([v, label]) => (
+              <button key={v} type="button" className={"adm-statusbtn " + (p.status === v ? "on " + newsStatusMeta(v).cls : "")} onClick={() => set({ status: v })}>{label}</button>
+            ))}
+          </div>
+          {p.status === "scheduled" && (
+            <input type="datetime-local" className="adm-statusbar-dt" value={p.publish_at ? String(p.publish_at).slice(0, 16) : ""} onChange={(e) => set({ publish_at: e.target.value ? new Date(e.target.value).toISOString() : null })} />
+          )}
+          <div className="adm-statusbar-actions">
+            <button className="adm-btn adm-sm" onClick={openPreview}><Icon name="eye" size={15} /> Preview</button>
+            <button className="adm-btn adm-sm" disabled={busy} onClick={() => persist("draft")}>Save draft</button>
+            <button className="adm-btn adm-btn-primary adm-sm" disabled={busy} onClick={() => persist("published")}>Publish</button>
+          </div>
+        </div>
+
+        <div className="adm-news-editor-full">
+            <div className="adm-edit-tabs">
+              {TABS.map(([id, label]) => <button key={id} className={tab === id ? "is-active" : ""} onClick={() => setTab(id)}>{label}</button>)}
+            </div>
+
+            {tab === "content" && (
+              <>
+                <div className="adm-color-row">
+                  <AdmField label="Type">
+                    <select value={p.category} onChange={(e) => set({ category: e.target.value })}>
+                      <option value="news">News article</option>
+                      <option value="press">Press release</option>
+                    </select>
+                  </AdmField>
+                  <AdmField label="Author"><input value={p.author || ""} onChange={(e) => set({ author: e.target.value })} placeholder="e.g. Premier Bank Media" /></AdmField>
+                </div>
+                <AdmField label="Title"><input value={p.title} onChange={(e) => set({ title: e.target.value })} placeholder="Headline…" /></AdmField>
+                <AdmField label="Summary / standfirst"><textarea rows={2} value={p.summary || ""} onChange={(e) => set({ summary: e.target.value })} placeholder="One or two sentences shown in listings and social shares." /></AdmField>
+                <AdmField label="Full content">
+                  <AdmRichEditor value={p.body} onChange={(html) => set({ body: html })} />
+                </AdmField>
+                <AdmField label="Tags (comma-separated)">
+                  <input value={(p.tags || []).join(", ")} onChange={(e) => set({ tags: e.target.value.split(",").map((x) => x.trim()).filter(Boolean) })} placeholder="digital, wallet, announcement" />
+                </AdmField>
+              </>
+            )}
+
+            {tab === "media" && (
+              <>
+                <AdmField label="Featured image (cover)">
+                  <AdmDrop value={p.cover_url} folder="posts" onUpload={(url) => set({ cover_url: url })} />
+                </AdmField>
+                <div className="adm-field"><span>Article gallery</span>
+                  <AdmGallery items={p.gallery} onChange={(g) => set({ gallery: g })} />
+                </div>
+              </>
+            )}
+
+            {tab === "seo" && (
+              <>
+                <AdmField label="SEO title"><input value={p.seo_title || ""} onChange={(e) => set({ seo_title: e.target.value })} placeholder={p.title || "Defaults to the article title"} /></AdmField>
+                <AdmField label="Meta description"><textarea rows={2} value={p.seo_desc || ""} onChange={(e) => set({ seo_desc: e.target.value })} placeholder={p.summary || "150–160 characters for search results"} /></AdmField>
+                <AdmField label="Keywords"><input value={p.seo_keywords || ""} onChange={(e) => set({ seo_keywords: e.target.value })} placeholder="premier bank, somalia, banking" /></AdmField>
+                <AdmField label="URL slug">
+                  <input value={p.slug || ""} onChange={(e) => set({ slug: slugify(e.target.value) })} placeholder={slugAuto} />
+                </AdmField>
+                <p className="adm-muted" style={{ fontSize: 12 }}>Preview: <code>premierbank.so/news/{slugAuto || "your-article"}</code></p>
+                <AdmField label="Social sharing image">
+                  <AdmDrop value={p.og_image} folder="posts" onUpload={(url) => set({ og_image: url })} />
+                </AdmField>
+              </>
+            )}
+
+            {tab === "langs" && (
+              <>
+                <p className="adm-muted" style={{ marginTop: 0 }}>The English fields above are the default. Add Somali &amp; Arabic translations here — the site shows the visitor’s language automatically, falling back to English.</p>
+                <div className="adm-lang-block">
+                  <h4>Soomaali (SO)</h4>
+                  <AdmField label="Cinwaan"><input value={p.i18n.so.title || ""} onChange={(e) => setI18n("so", { title: e.target.value })} /></AdmField>
+                  <AdmField label="Kooban"><textarea rows={2} value={p.i18n.so.summary || ""} onChange={(e) => setI18n("so", { summary: e.target.value })} /></AdmField>
+                  <AdmField label="Qoraalka"><textarea rows={5} value={p.i18n.so.body || ""} onChange={(e) => setI18n("so", { body: e.target.value })} /></AdmField>
+                </div>
+                <div className="adm-lang-block" dir="rtl">
+                  <h4 style={{ direction: "ltr" }}>العربية (AR)</h4>
+                  <AdmField label="العنوان"><input value={p.i18n.ar.title || ""} onChange={(e) => setI18n("ar", { title: e.target.value })} /></AdmField>
+                  <AdmField label="الملخص"><textarea rows={2} value={p.i18n.ar.summary || ""} onChange={(e) => setI18n("ar", { summary: e.target.value })} /></AdmField>
+                  <AdmField label="المحتوى"><textarea rows={5} value={p.i18n.ar.body || ""} onChange={(e) => setI18n("ar", { body: e.target.value })} /></AdmField>
+                </div>
+              </>
+            )}
+
+            {tab === "press" && p.category === "press" && (
+              <>
+                <div className="adm-color-row">
+                  <AdmField label="Organization"><input value={p.press.org || ""} onChange={(e) => setPress({ org: e.target.value })} /></AdmField>
+                  <AdmField label="Location"><input value={p.press.location || ""} onChange={(e) => setPress({ location: e.target.value })} placeholder="Mogadishu, Somalia" /></AdmField>
+                </div>
+                <div className="adm-color-row">
+                  <AdmField label="Contact person"><input value={p.press.contact || ""} onChange={(e) => setPress({ contact: e.target.value })} /></AdmField>
+                  <AdmField label="Contact email"><input value={p.press.email || ""} onChange={(e) => setPress({ email: e.target.value })} /></AdmField>
+                </div>
+                <AdmField label="Contact phone"><input value={p.press.phone || ""} onChange={(e) => setPress({ phone: e.target.value })} /></AdmField>
+                <AdmField label="Downloadable PDF">
+                  <AdmDrop value={p.press.pdf_url} folder="press" onUpload={(url) => setPress({ pdf_url: url })} label="Upload PDF" />
+                </AdmField>
+              </>
+            )}
+
+            {tab === "publish" && (
+              <>
+                <p className="adm-muted" style={{ marginTop: 0 }}>Set the status (Draft · Scheduling · Published) from the bar at the top. These are the homepage placement options.</p>
+                <label className="adm-check"><input type="checkbox" checked={!!p.featured} onChange={(e) => set({ featured: e.target.checked })} /> Feature on homepage</label>
+                <AdmField label="Homepage priority (1 = Breaking, 2 = Featured, 3 = Latest)">
+                  <input type="number" min="0" max="3" value={p.priority || 0} onChange={(e) => set({ priority: parseInt(e.target.value || "0", 10) })} />
+                </AdmField>
+                <div className="adm-news-actions">
+                  <button className="adm-btn adm-btn-primary" disabled={busy} onClick={() => persist(p.status)}>
+                    {busy ? "Saving…" : (p.status === "published" ? "Publish now" : p.status === "scheduled" ? "Schedule" : "Save draft")}
+                  </button>
+                </div>
+              </>
+            )}
+        </div>
+      </div>
+    );
+  }
+
+  /* ---- Media library (Supabase storage) ---- */
+  function AdmMediaLibrary() {
+    const [files, setFiles] = uS(null);
+    const [q, setQ] = uS("");
+    const [msg, setMsg] = uS("");
+    const load = async () => {
+      const c = window.PBData.client; if (!c) return;
+      const out = [];
+      for (const folder of ["posts", "press", "team", "misc"]) {
+        const { data } = await c.storage.from("media").list(folder, { limit: 100, sortBy: { column: "created_at", order: "desc" } });
+        (data || []).forEach((f) => { if (f.name && f.id !== null) out.push({ folder: folder, name: f.name, path: folder + "/" + f.name, url: c.storage.from("media").getPublicUrl(folder + "/" + f.name).data.publicUrl }); });
+      }
+      setFiles(out);
+    };
+    uE(() => { load(); }, []);
+    const del = async (path) => {
+      if (!confirm("Delete this file permanently?")) return;
+      const { error } = await window.PBData.client.storage.from("media").remove([path]);
+      if (error) { alert("Delete failed: " + error.message); return; }
+      load();
+    };
+    const copy = (url) => { try { navigator.clipboard.writeText(url); setMsg("URL copied"); setTimeout(() => setMsg(""), 1500); } catch (e) {} };
+    const shown = (files || []).filter((f) => !q || f.name.toLowerCase().includes(q.toLowerCase()));
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar"><h2 className="adm-h2">Media library</h2>{msg && <span className="adm-preview-tag">{msg}</span>}</div>
+        <p className="adm-muted" style={{ marginTop: 0 }}>Every image uploaded across News, Team and ATMs. Supported: JPG, PNG, WEBP, SVG, MP4.</p>
+        <AdmField label="Search"><input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter by file name…" /></AdmField>
+        {files === null ? <p className="adm-muted">Loading…</p> : shown.length === 0 ? <p className="adm-muted">No media found.</p> : (
+          <div className="adm-media-grid">
+            {shown.map((f) => (
+              <div key={f.path} className="adm-media-cell">
+                <div className="adm-media-thumb">{/\.(mp4|webm)$/i.test(f.name) ? <video src={f.url} /> : <img src={f.url} alt="" />}</div>
+                <div className="adm-media-name" title={f.name}>{f.name}</div>
+                <div className="adm-media-ops">
+                  <span className="adm-media-folder">{f.folder}</span>
+                  <button className="adm-btn adm-sm" onClick={() => copy(f.url)}>Copy URL</button>
+                  <button className="adm-btn adm-sm adm-danger" onClick={() => del(f.path)}>Delete</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  /* ---- Categories & tags ---- */
+  function AdmNewsTaxonomy() {
+    const cur = window.PBData.getOverride("newsTaxonomy") || {};
+    const [cats, setCats] = uS(() => clone(cur.categories || ["News", "Press Release", "Announcement", "Event"]));
+    const [tags, setTags] = uS(() => clone(cur.tags || ["digital", "wallet", "cards", "swift", "community"]));
+    const [busy, setBusy] = uS(false); const [saved, setSaved] = uS(false);
+    const save = async () => {
+      setBusy(true);
+      const { error } = await window.PBData.saveContent("newsTaxonomy", { categories: cats.filter(Boolean), tags: tags.filter(Boolean) });
+      setBusy(false);
+      if (error) alert("Failed: " + error.message); else { setSaved(true); setTimeout(() => setSaved(false), 2000); }
+    };
+    const renderList = (label, list, setList, ph) => (
+      <div className="adm-set-card">
+        <h3 className="adm-set-h">{label}</h3>
+        {list.map((v, i) => (
+          <div className="adm-row" key={i} style={{ marginBottom: 6 }}>
+            <input value={v} onChange={(e) => setList(list.map((x, j) => j === i ? e.target.value : x))} placeholder={ph} />
+            <button className="adm-btn adm-sm adm-danger" onClick={() => setList(list.filter((_, j) => j !== i))}>✕</button>
+          </div>
+        ))}
+        <button className="adm-btn adm-sm" onClick={() => setList(list.concat([""]))}>+ Add</button>
+      </div>
+    );
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar"><h2 className="adm-h2">Categories &amp; tags</h2></div>
+        {renderList("Categories", cats, setCats, "Category name")}
+        {renderList("Tags", tags, setTags, "Tag")}
+        <AdmSaveBar onSave={save} busy={busy} saved={saved} />
+      </div>
+    );
+  }
+
+  /* ---- Analytics (computed honestly from your own data) ---- */
+  function AdmNewsAnalytics({ items }) {
+    const byStatus = {};
+    NEWS_STATUS.forEach((s) => (byStatus[s.v] = 0));
+    items.forEach((p) => { byStatus[p.status || (p.published ? "published" : "draft")] = (byStatus[p.status || (p.published ? "published" : "draft")] || 0) + 1; });
+    const months = {};
+    items.forEach((p) => { const d = new Date(p.created_at || Date.now()); const k = d.toLocaleDateString("en-GB", { month: "short", year: "2-digit" }); months[k] = (months[k] || 0) + 1; });
+    const mKeys = Object.keys(months).slice(-6);
+    const maxM = Math.max(1, ...mKeys.map((k) => months[k]));
+    const totalViews = items.reduce((s, p) => s + (p.views || 0), 0);
+    const top = items.slice().sort((a, b) => (b.views || 0) - (a.views || 0)).slice(0, 5);
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar"><h2 className="adm-h2">Analytics</h2></div>
+        <div className="adm-kpi-row">
+          <div className="adm-kpi"><span>{items.length}</span><em>Total articles</em></div>
+          <div className="adm-kpi"><span>{byStatus.published || 0}</span><em>Published</em></div>
+          <div className="adm-kpi"><span>{totalViews.toLocaleString()}</span><em>Total views</em></div>
+        </div>
+        <div className="adm-set-card">
+          <h3 className="adm-set-h">Articles published per month</h3>
+          <div className="adm-bars">
+            {mKeys.length === 0 ? <p className="adm-muted">No data yet.</p> : mKeys.map((k) => (
+              <div key={k} className="adm-bar"><div className="adm-bar-fill" style={{ height: Math.round((months[k] / maxM) * 120) + "px" }} /><span>{months[k]}</span><em>{k}</em></div>
+            ))}
+          </div>
+        </div>
+        <div className="adm-set-card">
+          <h3 className="adm-set-h">Most viewed</h3>
+          {top.length === 0 ? <p className="adm-muted">No articles yet.</p> : top.map((p) => (
+            <div key={p.id} className="adm-set-kv"><span>{p.title}</span><strong>{(p.views || 0).toLocaleString()} views</strong></div>
+          ))}
+          <p className="adm-muted" style={{ fontSize: 12, marginTop: 10 }}>View counts increment when the article opens on the live site. Traffic-source and visitor analytics require a dedicated analytics backend (e.g. Plausible / GA) — not included in this static build.</p>
+        </div>
+      </div>
+    );
+  }
+
+  function AdmNews() {
+    const [items, setItems] = uS([]);
+    const [loading, setLoading] = uS(true);
+    const [sub, setSub] = uS("dash");
+    const [editing, setEditing] = uS(null);
+    const [q, setQ] = uS("");
+    const [fStatus, setFStatus] = uS("all");
+    const load = async () => {
+      setLoading(true);
+      const { data, error } = await window.PBData.listPosts();
+      if (error) alert("Load failed: " + error.message); else setItems(data || []);
+      setLoading(false);
+    };
+    uE(() => { load(); }, []);
+    const goEdit = (p) => { setEditing(p || blankPost()); setSub("edit"); };
+    const del = async (id) => {
+      if (!confirm("Delete this article?")) return;
+      const { error } = await window.PBData.deletePost(id);
+      if (error) { alert("Delete failed: " + error.message); return; }
+      load(); window.PBData.loadPosts();
+    };
+    const dup = async (p) => {
+      const copy2 = Object.assign({}, p, { title: p.title + " (copy)", status: "draft", published: false });
+      delete copy2.id;
+      const { error } = await window.PBData.savePost(copy2);
+      if (error) { alert("Duplicate failed: " + error.message); return; }
+      load();
+    };
+    const statusOf = (p) => p.status || (p.published ? "published" : "draft");
+
+    // KPI counts
+    const kpi = {
+      total: items.length,
+      published: items.filter((p) => statusOf(p) === "published").length,
+      drafts: items.filter((p) => statusOf(p) === "draft").length,
+      scheduled: items.filter((p) => statusOf(p) === "scheduled").length,
+      press: items.filter((p) => p.category === "press").length,
+      views: items.reduce((s, p) => s + (p.views || 0), 0),
+    };
+
+    const listFor = (mode) => items.filter((p) => {
+      if (mode === "drafts" && statusOf(p) !== "draft") return false;
+      if (mode === "scheduled" && statusOf(p) !== "scheduled") return false;
+      if (mode === "press" && p.category !== "press") return false;
+      if (mode === "all" && fStatus !== "all" && statusOf(p) !== fStatus) return false;
+      if (q && !(p.title || "").toLowerCase().includes(q.toLowerCase())) return false;
+      return true;
+    });
+
+    const renderRow = (p) => {
+      const sm = newsStatusMeta(statusOf(p));
+      return (
+        <div key={p.id} className="adm-item">
+          <div className="adm-item-av adm-item-av-wide">{p.cover_url ? <img src={p.cover_url} alt="" /> : <span>{p.category === "press" ? "PR" : "N"}</span>}</div>
+          <div className="adm-item-main">
+            <strong>{p.title} {p.featured && <span className="adm-star" title="Featured"><Icon name="star" size={13} /></span>}</strong>
+            <span><span className={"adm-status " + sm.cls}>{sm.label}</span> · {p.category === "press" ? "Press" : "News"}{p.author ? " · " + p.author : ""}</span>
+          </div>
+          <div className="adm-row">
+            <button className="adm-btn adm-sm" onClick={() => goEdit(p)}>Edit</button>
+            <button className="adm-btn adm-sm" onClick={() => dup(p)}>Duplicate</button>
+            <button className="adm-btn adm-sm" onClick={() => openNewsPreview(p)}>Preview</button>
+            <button className="adm-btn adm-sm adm-danger" onClick={() => del(p.id)}>Delete</button>
+          </div>
+        </div>
+      );
+    };
+
+    const renderListView = (mode, title, empty) => {
+      const rows = listFor(mode);
+      return (
+        <div className="adm-pane">
+          <div className="adm-toolbar"><h2 className="adm-h2">{title}</h2><button className="adm-btn adm-btn-primary" onClick={() => goEdit(null)}>+ Create news</button></div>
+          <div className="adm-row" style={{ marginBottom: 14, flexWrap: "wrap" }}>
+            <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search title…" style={{ maxWidth: 260 }} />
+            {mode === "all" && (
+              <select value={fStatus} onChange={(e) => setFStatus(e.target.value)} style={{ maxWidth: 180 }}>
+                <option value="all">All statuses</option>
+                {NEWS_STATUS.map((s) => <option key={s.v} value={s.v}>{s.label}</option>)}
+              </select>
+            )}
+          </div>
+          {loading ? <p className="adm-muted">Loading…</p> : rows.length === 0 ? <p className="adm-muted">{empty}</p> : <div className="adm-list-grid">{rows.map((p) => renderRow(p))}</div>}
+        </div>
+      );
+    };
+
+    if (sub === "edit") return <AdmNewsEditor initial={editing} onSaved={() => { setSub("all"); load(); }} onCancel={() => setSub(editing && editing.id ? "all" : "dash")} />;
+
+    return (
+      <div>
+        <div className="adm-subnav">
+          {NEWS_SUBNAV.map((n) => <button key={n.id} className={sub === n.id ? "is-active" : ""} onClick={() => { if (n.id === "edit") goEdit(null); else setSub(n.id); }}>{n.label}</button>)}
+        </div>
+
+        {sub === "dash" && (
+          <div className="adm-pane">
+            <div className="adm-toolbar"><h2 className="adm-h2">News &amp; Press — overview</h2><button className="adm-btn adm-btn-primary" onClick={() => goEdit(null)}>+ Create news</button></div>
+            <div className="adm-kpi-row">
+              <div className="adm-kpi"><span>{kpi.total}</span><em>Total news</em></div>
+              <div className="adm-kpi is-ok"><span>{kpi.published}</span><em>Published</em></div>
+              <div className="adm-kpi"><span>{kpi.drafts}</span><em>Drafts</em></div>
+              <div className="adm-kpi"><span>{kpi.scheduled}</span><em>Scheduled</em></div>
+              <div className="adm-kpi"><span>{kpi.press}</span><em>Press releases</em></div>
+              <div className="adm-kpi"><span>{kpi.views.toLocaleString()}</span><em>Total views</em></div>
+            </div>
+            <div className="adm-set-card">
+              <h3 className="adm-set-h">Recent articles</h3>
+              {loading ? <p className="adm-muted">Loading…</p> : items.length === 0 ? <p className="adm-muted">No articles yet — click “Create news”.</p> :
+                <div className="adm-list-grid">{items.slice(0, 6).map((p) => renderRow(p))}</div>}
+            </div>
+          </div>
+        )}
+        {sub === "all" && renderListView("all", "All news", "No articles match.")}
+        {sub === "drafts" && renderListView("drafts", "Drafts", "No drafts.")}
+        {sub === "scheduled" && renderListView("scheduled", "Scheduled posts", "Nothing scheduled.")}
+        {sub === "press" && renderListView("press", "Press releases", "No press releases.")}
+        {sub === "media" && <AdmMediaLibrary />}
+        {sub === "tax" && <AdmNewsTaxonomy />}
+        {sub === "seo" && (
+          <div className="adm-pane">
+            <div className="adm-toolbar"><h2 className="adm-h2">SEO overview</h2></div>
+            <p className="adm-muted" style={{ marginTop: 0 }}>Each article has its own SEO title, meta description, keywords, slug and social image (open an article → SEO tab). Rows below flag articles still missing SEO basics.</p>
+            {items.map((p) => {
+              const ok = (p.seo_title || p.title) && p.seo_desc;
+              return <div key={p.id} className="adm-set-kv"><span>{p.title}</span><strong style={{ color: ok ? "var(--pb-secondary-700)" : "#c0392b" }}>{ok ? "✓ SEO set" : "⚠ Needs meta description"}</strong></div>;
+            })}
+          </div>
+        )}
+        {sub === "analytics" && <AdmNewsAnalytics items={items} />}
+      </div>
+    );
+  }
+
+  /* ============================ LOGOS ============================ */
+  const LOGO_PRESETS = [["Small", 26], ["Medium", 40], ["Large", 56], ["Fit", 72]];
+  function AdmLogos() {
+    const cur = (window.PBData.getOverride("logos")) || {};
+    const [logos, setLogos] = uS({
+      color: cur.color || "", white: cur.white || "", mark: cur.mark || "",
+      headerSize: cur.headerSize || 40, footerSize: cur.footerSize || 44, markSize: cur.markSize || 30,
+    });
+    const [busy, setBusy] = uS(false); const [saved, setSaved] = uS(false);
+    const set = (k, v) => { setLogos(Object.assign({}, logos, { [k]: v })); setSaved(false); };
+    // Defaults baked into the page (used when the user hasn't uploaded one).
+    const DEF = { color: (typeof LOGO_COLOR_B64 !== "undefined" ? LOGO_COLOR_B64 : ""), white: (typeof LOGO_WHITE_B64 !== "undefined" ? LOGO_WHITE_B64 : ""), mark: (typeof LOGO_MARK_B64 !== "undefined" ? LOGO_MARK_B64 : "") };
+    const previewSrc = (k) => logos[k] || DEF[k];
+    const DEFSIZE = { headerSize: 40, footerSize: 44, markSize: 30 };
+    const curVal = (f) => cur[f] != null ? cur[f] : (DEFSIZE[f] != null ? DEFSIZE[f] : "");
+    const dirty = ["color", "white", "mark", "headerSize", "footerSize", "markSize"]
+      .some(f => String(logos[f] || "") !== String(curVal(f) || ""));
+    const save = async () => {
+      setBusy(true);
+      const clean = {};
+      ["color", "white", "mark"].forEach(k => { if (logos[k]) clean[k] = logos[k]; });
+      ["headerSize", "footerSize", "markSize"].forEach(k => { if (logos[k]) clean[k] = logos[k]; });
+      const { error } = await window.PBData.saveContent("logos", clean);
+      setBusy(false);
+      if (error) alert("Failed: " + error.message); else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
+    };
+    const SizeCtl = ({ sk }) => (
+      <div className="adm-size-ctl">
+        <span className="adm-size-label">Size</span>
+        {LOGO_PRESETS.map(([lbl, px]) => (
+          <button key={lbl} type="button" className={"adm-btn adm-sm" + (logos[sk] === px ? " adm-btn-primary" : "")} onClick={() => set(sk, px)}>{lbl}</button>
+        ))}
+        <input type="number" min="14" max="140" value={logos[sk]} onChange={(e) => set(sk, parseInt(e.target.value || "0", 10))} className="adm-size-input" />
+        <span className="adm-size-px">px</span>
+      </div>
+    );
+    const Row = ({ k, sk, title, hint, dark }) => (
+      <div className="adm-card">
+        <div className="adm-card-head"><strong>{title}</strong>{logos[k] && <button className="adm-btn adm-sm adm-danger" onClick={() => set(k, "")}>Reset to default</button>}</div>
+        <p className="adm-muted" style={{ margin: 0 }}>{hint}</p>
+        <div style={dark ? { background: "var(--pb-primary)", borderRadius: 12, padding: 12 } : null}>
+          <AdmDrop value={logos[k]} folder="logos" onUpload={(url) => set(k, url)} label="Drag a PNG with transparent background" />
+        </div>
+        <SizeCtl sk={sk} />
+      </div>
+    );
+    return (
+      <div className="adm-pane">
+        <h2 className="adm-h2">Logo upload</h2>
+        <p className="adm-muted">Upload your own logo (PNG with a transparent background works best) and set the exact display size in pixels. It replaces the logo in the header, footer and detail pages.</p>
+
+        {/* LIVE PREVIEW — before publishing, at the chosen sizes */}
+        <div className="adm-preview-box">
+          <div className="adm-preview-head">
+            <strong>Live preview</strong>
+            <span className={"adm-preview-tag" + (dirty ? " is-dirty" : "")}>{dirty ? "Test — not published yet" : "Currently published"}</span>
+          </div>
+          <div className="adm-logo-prev adm-logo-prev-light">
+            <span className="adm-logo-prev-label">Header · {logos.headerSize}px</span>
+            {previewSrc("color") ? <img src={previewSrc("color")} alt="header logo" style={{ height: logos.headerSize }} /> : <em>No logo</em>}
+          </div>
+          <div className="adm-logo-prev adm-logo-prev-dark">
+            <span className="adm-logo-prev-label">Footer · {logos.footerSize}px</span>
+            {previewSrc("white") ? <img src={previewSrc("white")} alt="footer logo" style={{ height: logos.footerSize }} /> : <em>No logo</em>}
+          </div>
+          <div className="adm-logo-prev adm-logo-prev-light">
+            <span className="adm-logo-prev-label">Mark · {logos.markSize}px</span>
+            {previewSrc("mark") ? <img src={previewSrc("mark")} alt="logo mark" style={{ height: logos.markSize }} /> : <em>No mark</em>}
+          </div>
+          {dirty && <p className="adm-preview-note">This is a preview of your test logo at the selected sizes. Click <strong>Publish logo</strong> to make it live.</p>}
+        </div>
+
+        <Row k="color" sk="headerSize" title="Header logo (dark logo on light background)" hint="Shown in the top navigation bar." />
+        <Row k="white" sk="footerSize" title="Footer / dark-background logo (white logo)" hint="Shown in the footer and the login modal." dark />
+        <Row k="mark"  sk="markSize"   title="Logo mark only (icon, no text)" hint="Used in compact places like cards and the phone mockup." />
+        <div className="adm-savebar">
+          <button className="adm-btn adm-btn-primary" onClick={save} disabled={busy || !dirty}>{busy ? "Publishing..." : (dirty ? "Publish logo" : "Nothing to publish")}</button>
+          {saved && <span className="adm-saved">✓ Published & live</span>}
+          {dirty && !saved && <span className="adm-muted">You have unpublished changes.</span>}
+        </div>
+
+        {/* ---- Partner / trust logos ---- */}
+        <AdmPartnerLogos />
+      </div>
+    );
+  }
+
+  function AdmPartnerLogos() {
+    const LABELS = window.PB_CONTENT.trustLogos || [];
+    const saved0 = (window.PBData.getOverride("trustLogoImages")) || {};
+    const [imgs, setImgs] = uS(Object.assign({}, saved0));
+    const [saving, setSaving] = uS(false);
+    const [ok, setOk] = uS(false);
+
+    const setImg = (label, url) => setImgs((prev) => Object.assign({}, prev, { [label]: url }));
+
+    const save = async () => {
+      setSaving(true);
+      const { error } = await window.PBData.saveContent("trustLogoImages", imgs);
+      setSaving(false);
+      if (error) { alert("Save failed: " + error.message); return; }
+      setOk(true); setTimeout(() => setOk(false), 3000);
+    };
+
+    return (
+      <div className="adm-card" style={{ marginTop: 28 }}>
+        <div className="adm-card-head">
+          <strong>Partner / trust-strip logos</strong>
+          <span className="adm-muted" style={{ fontSize: 12 }}>Shown at the bottom of the homepage. Black &amp; white by default, colour on hover.</span>
+        </div>
+        <p className="adm-muted" style={{ margin: "0 0 16px" }}>Upload a colour PNG for each partner. Leave blank to show the text label.</p>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 16 }}>
+          {LABELS.map((label) => (
+            <div key={label} style={{ border: "1px solid var(--pb-line)", borderRadius: 10, padding: 12 }}>
+              <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8 }}>{label}</div>
+              {imgs[label] && (
+                <div style={{ marginBottom: 8, background: "#f4f6f8", borderRadius: 6, padding: 8, textAlign: "center" }}>
+                  <img src={imgs[label]} alt={label} style={{ maxHeight: 36, maxWidth: 120, objectFit: "contain", filter: "grayscale(100%)", transition: "filter .3s" }}
+                    onMouseEnter={(e) => e.target.style.filter = "grayscale(0%)"}
+                    onMouseLeave={(e) => e.target.style.filter = "grayscale(100%)"} />
+                </div>
+              )}
+              <AdmDrop value={imgs[label] || ""} folder="logos" onUpload={(url) => setImg(label, url)} />
+              {imgs[label] && (
+                <button className="adm-btn adm-sm adm-danger" style={{ marginTop: 6, width: "100%" }}
+                  onClick={() => setImg(label, "")}>Remove</button>
+              )}
+            </div>
+          ))}
+        </div>
+        <div className="adm-savebar" style={{ marginTop: 20 }}>
+          <button className="adm-btn adm-btn-primary" onClick={save} disabled={saving}>
+            {saving ? "Saving..." : "Save partner logos"}
+          </button>
+          {ok && <span className="adm-saved">✓ Saved & live</span>}
+        </div>
+      </div>
+    );
+  }
+
+  /* ============================ ATMs ============================ */
+  const ATM_REGIONS = ["Banadir", "Bay", "Lower Juba", "Galmudug", "Puntland", "Somaliland", "Hirshabelle", "Jubaland", "South West", "Other"];
+  function AdmAtms() {
+    const [items, setItems] = uS([]);
+    const [editing, setEditing] = uS(null);
+    const [loading, setLoading] = uS(true);
+    const load = async () => {
+      setLoading(true);
+      const { data, error } = await window.PBData.listAtms();
+      if (error) alert("Load failed: " + error.message); else setItems(data || []);
+      setLoading(false);
+    };
+    uE(() => { load(); }, []);
+    const newAtm = () => setEditing({ location: "", number: "", region: "Banadir", lat: "", lng: "", image: "" });
+    const save = async () => {
+      const a = Object.assign({}, editing);
+      if (a.id == null) delete a.id;
+      if (!a.location) { alert("Location is required."); return; }
+      a.lat = a.lat === "" ? null : a.lat; a.lng = a.lng === "" ? null : a.lng;
+      const { error } = await window.PBData.saveAtm(a);
+      if (error) { alert("Save failed: " + error.message); return; }
+      setEditing(null); await load(); window.PBData.loadAtms();
+    };
+    const del = async (id) => {
+      if (!confirm("Delete this ATM?")) return;
+      const { error } = await window.PBData.deleteAtm(id);
+      if (error) { alert("Delete failed: " + error.message); return; }
+      await load(); window.PBData.loadAtms();
+    };
+    if (editing) {
+      return (
+        <div className="adm-pane">
+          <h2 className="adm-h2">{editing.id ? "Edit ATM" : "New ATM"}</h2>
+          <AdmField label="Photo"><AdmDrop value={editing.image} folder="atms" onUpload={(url) => setEditing(Object.assign({}, editing, { image: url }))} /></AdmField>
+          <AdmField label="Location"><input value={editing.location} onChange={(e) => setEditing(Object.assign({}, editing, { location: e.target.value }))} placeholder="e.g. Aden Adde Int. Airport — Arrivals" /></AdmField>
+          <AdmField label="ATM number"><input value={editing.number || ""} onChange={(e) => setEditing(Object.assign({}, editing, { number: e.target.value }))} placeholder="e.g. 014" /></AdmField>
+          <AdmField label="Region">
+            <select value={editing.region || ""} onChange={(e) => setEditing(Object.assign({}, editing, { region: e.target.value }))}>
+              {ATM_REGIONS.map(r => <option key={r} value={r}>{r}</option>)}
+            </select>
+          </AdmField>
+          <div className="adm-color-row">
+            <AdmField label="Latitude"><input value={editing.lat || ""} onChange={(e) => setEditing(Object.assign({}, editing, { lat: e.target.value }))} placeholder="e.g. 2.0345" /></AdmField>
+            <AdmField label="Longitude"><input value={editing.lng || ""} onChange={(e) => setEditing(Object.assign({}, editing, { lng: e.target.value }))} placeholder="e.g. 45.3045" /></AdmField>
+          </div>
+          <div className="adm-row"><button className="adm-btn adm-btn-primary" onClick={save}>Save</button><button className="adm-btn" onClick={() => setEditing(null)}>Cancel</button></div>
+        </div>
+      );
+    }
+    const groups = {};
+    items.forEach(a => { (groups[a.region || "Other"] = groups[a.region || "Other"] || []).push(a); });
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar"><h2 className="adm-h2">ATM locations</h2><button className="adm-btn adm-btn-primary" onClick={newAtm}>+ Add ATM</button></div>
+        {loading ? <p className="adm-muted">Loading…</p> : (
+          items.length === 0 ? <p className="adm-muted">No ATMs yet. Click “Add ATM”.</p> :
+          Object.keys(groups).map(region => (
+            <div key={region} className="adm-group">
+              <h4>{region} ({groups[region].length})</h4>
+              {groups[region].map(a => (
+                <div key={a.id} className="adm-item">
+                  <div className="adm-item-av adm-item-av-wide">{a.image ? <img src={a.image} alt="" /> : <span>ATM</span>}</div>
+                  <div className="adm-item-main"><strong>{a.location}</strong><span>{a.number ? "#" + a.number + " · " : ""}{(a.lat && a.lng) ? a.lat + ", " + a.lng : "no coords"}</span></div>
+                  <div className="adm-row"><button className="adm-btn adm-sm" onClick={() => setEditing(a)}>Edit</button><button className="adm-btn adm-sm adm-danger" onClick={() => del(a.id)}>Delete</button></div>
+                </div>
+              ))}
+            </div>
+          ))
+        )}
+      </div>
+    );
+  }
+
+  /* ============================ FOOTER & SOCIAL ============================ */
+  function AdmFooter() {
+    const cur = window.PBData.getOverride("footer") || {};
+    const [f, setF] = uS({
+      descEn: cur.descEn || "", descSo: cur.descSo || "", copyright: cur.copyright || "",
+      social: Object.assign({ f: "", ig: "", x: "", in: "", yt: "" }, cur.social || {}),
+    });
+    const [busy, setBusy] = uS(false); const [saved, setSaved] = uS(false);
+    const set = (k, v) => { setF(Object.assign({}, f, { [k]: v })); setSaved(false); };
+    const setSoc = (k, v) => { setF(Object.assign({}, f, { social: Object.assign({}, f.social, { [k]: v }) })); setSaved(false); };
+    const save = async () => {
+      setBusy(true);
+      const { error } = await window.PBData.saveContent("footer", f);
+      setBusy(false);
+      if (error) alert("Failed: " + error.message); else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
+    };
+    const SOC = [["f", "Facebook"], ["ig", "Instagram"], ["x", "X (Twitter)"], ["in", "LinkedIn"], ["yt", "YouTube"]];
+    return (
+      <div className="adm-pane">
+        <h2 className="adm-h2">Footer & social</h2>
+        <p className="adm-muted">Edit the footer description, copyright line and social media links shown at the bottom of every page.</p>
+        <AdmBi label="Footer description" value={{ en: f.descEn, so: f.descSo }} onChange={(v) => setF(Object.assign({}, f, { descEn: v.en, descSo: v.so }))} textarea rows={3} />
+        <AdmField label="Copyright line (bottom)"><input value={f.copyright} onChange={(e) => set("copyright", e.target.value)} placeholder="© 2026 Premier Bank Ltd. All rights reserved…" /></AdmField>
+        <h4 className="adm-sub">Social media links</h4>
+        {SOC.map(([k, name]) => (
+          <AdmField key={k} label={name}><input value={f.social[k]} onChange={(e) => setSoc(k, e.target.value)} placeholder={"https://…"} /></AdmField>
+        ))}
+        <AdmSaveBar onSave={save} busy={busy} saved={saved} />
+      </div>
+    );
+  }
+
+  /* ============================ SETTINGS ============================ */
+  function AdmSettings({ session }) {
+    const [url, setUrl] = uS(localStorage.getItem("pb_sb_url") || "");
+    const [key, setKey] = uS(localStorage.getItem("pb_sb_key") || "");
+    const [pw, setPw] = uS("");
+    const [testing, setTesting] = uS(false);
+    const [diag, setDiag] = uS(null);
+    const saveConn = () => { localStorage.setItem("pb_sb_url", url.trim()); localStorage.setItem("pb_sb_key", key.trim()); alert("Saved. Reloading to connect."); location.reload(); };
+    const clearConn = () => { localStorage.removeItem("pb_sb_url"); localStorage.removeItem("pb_sb_key"); location.reload(); };
+    const changePw = async () => {
+      if (pw.length < 6) { alert("Password must be at least 6 characters."); return; }
+      const { error } = await window.PBData.changePassword(pw);
+      alert(error ? ("Failed: " + error.message) : "Password updated.");
+      setPw("");
+    };
+    // Full image pipeline test: upload a 1×1 PNG, then load it back publicly.
+    const runStorageTest = async () => {
+      setTesting(true); setDiag(null);
+      try {
+        const b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/AP3AAAAAElFTkSuQmCC";
+        const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+        const file = new File([bytes], "healthcheck.png", { type: "image/png" });
+        let url2;
+        try { url2 = await window.PBData.uploadImage(file, "_healthcheck"); }
+        catch (e) { setDiag({ ok: false, step: "upload", msg: e.message }); setTesting(false); return; }
+        await new Promise((res, rej) => { const im = new Image(); im.onload = res; im.onerror = () => rej(new Error("Uploaded OK, but the public URL did not load. The 'media' bucket is not public.")); im.src = url2 + "?t=" + Date.now(); });
+        setDiag({ ok: true, msg: "Storage is fully working — uploads save and are publicly viewable.", url: url2 });
+      } catch (e) { setDiag({ ok: false, step: "read", msg: e.message }); }
+      setTesting(false);
+    };
+    const connected = window.PBData.isConfigured();
+    const projectRef = (() => { try { return (window.PBData.cfg.url || "").replace("https://", "").split(".")[0]; } catch (e) { return ""; } })();
+    const email = (session && session.user && session.user.email) || "";
+    return (
+      <div className="adm-pane">
+        <h2 className="adm-h2">Settings</h2>
+
+        {/* Storage health check */}
+        <div className="adm-set-card">
+          <h3 className="adm-set-h">Image storage health check</h3>
+          <p className="adm-muted" style={{ marginTop: 0 }}>Run this if uploaded images don't show. It uploads a tiny test image and checks it loads publicly.</p>
+          <button className="adm-btn adm-btn-primary" onClick={runStorageTest} disabled={testing}>{testing ? "Testing…" : "Run storage test"}</button>
+          {diag && (
+            <div className={"adm-diag " + (diag.ok ? "ok" : "bad")}>
+              {diag.ok ? <Icon name="check" size={15} /> : <Icon name="close" size={15} />} {diag.msg}
+              {!diag.ok && diag.step === "upload" && /bucket/i.test(diag.msg) && (
+                <div className="adm-diag-fix">Fix: Supabase → Storage → create a bucket named <code>media</code> and turn ON “Public bucket”. Or run in SQL editor:<br /><code>insert into storage.buckets (id,name,public) values ('media','media',true) on conflict (id) do update set public=true;</code></div>
+              )}
+              {!diag.ok && diag.step === "read" && (
+                <div className="adm-diag-fix">Fix: make the bucket public — SQL editor:<br /><code>update storage.buckets set public=true where id='media';</code></div>
+              )}
+              {diag.ok && <div className="adm-diag-fix">Now re-upload your real images (logo, team, posts) — they will display.</div>}
+            </div>
+          )}
+        </div>
+
+        {/* Connection status card */}
+        <div className="adm-set-card">
+          <div className="adm-set-status">
+            <span className={"adm-dot " + (connected ? "ok" : "off")} />
+            <div>
+              <strong>{connected ? "Backend connected" : "Not connected"}</strong>
+              <span>{connected ? ("Supabase project: " + projectRef) : "Enter your Supabase credentials below."}</span>
+            </div>
+            <span className={"adm-pill " + (connected ? "ok" : "off")}>{connected ? "Live" : "Offline"}</span>
+          </div>
+        </div>
+
+        {/* Account */}
+        {session && (
+          <div className="adm-set-card">
+            <h3 className="adm-set-h">Your account</h3>
+            <div className="adm-set-kv"><span>Signed in as</span><strong>{email}</strong></div>
+            <AdmField label="New password"><input type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="At least 6 characters" /></AdmField>
+            <button className="adm-btn adm-btn-primary" onClick={changePw}>Update password</button>
+          </div>
+        )}
+
+        {/* 2FA — Google Authenticator (TOTP) */}
+        <div className="adm-set-card">
+          <h3 className="adm-set-h">Two-factor authentication</h3>
+          <p className="adm-muted" style={{ marginTop: 0 }}>Protected with <strong>Google Authenticator</strong> (TOTP). After your password, you enter the current 6-digit code from your authenticator app to finish signing in. The first time, you scan a QR code to set it up — no emails, no codes to wait for.</p>
+        </div>
+
+        {/* Connection */}
+        <div className="adm-set-card">
+          <h3 className="adm-set-h">Backend connection</h3>
+          <p className="adm-muted" style={{ marginTop: 0 }}>Your Supabase project URL and anon (public) key. The site already ships connected for all visitors; this only overrides it in your browser.</p>
+          <AdmField label="Project URL"><input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://xxxx.supabase.co" /></AdmField>
+          <AdmField label="Anon public key"><input value={key} onChange={(e) => setKey(e.target.value)} placeholder="eyJhbGci…" /></AdmField>
+          <div className="adm-row"><button className="adm-btn adm-btn-primary" onClick={saveConn}>Save & reload</button><button className="adm-btn" onClick={clearConn}>Reset to default</button></div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ---- login ---- */
+  function AdmLogin() {
+    const [email, setEmail] = uS("");
+    const [pw, setPw] = uS("");
+    const [showPw, setShowPw] = uS(false);
+    const [busy, setBusy] = uS(false);
+    const [loginErr, setLoginErr] = uS("");
+    const submit = async (e) => {
+      e.preventDefault();
+      setBusy(true); setLoginErr("");
+      const { error } = await window.PBData.signIn(email, pw);
+      setBusy(false);
+      if (error) setLoginErr("Login failed: " + error.message);
+    };
+    return (
+      <div className="adm-login-wrap">
+        <form className="adm-login" onSubmit={submit} style={{ background: "#fff", borderRadius: 16, padding: 40, maxWidth: 400, width: "100%", boxShadow: "0 8px 32px rgba(0,0,0,0.18)" }}>
+          <div className="adm-login-brand" style={{ justifyContent: "center", marginBottom: 12 }}><PBLogo variant="color" size={36} /></div>
+          <h3 style={{ fontSize: 22, fontWeight: 700, textAlign: "center", margin: "0 0 4px" }}>Welcome back</h3>
+          <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 13, marginBottom: 24 }}>Sign in to your admin dashboard</p>
+          <AdmField label="Email"><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoFocus /></AdmField>
+          <AdmField label="Password">
+            <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+              <input type={showPw ? "text" : "password"} value={pw} onChange={(e) => setPw(e.target.value)} style={{ flex: 1, paddingRight: 36 }} />
+              <button type="button" onClick={() => setShowPw(!showPw)}
+                style={{ position: "absolute", right: 8, background: "none", border: "none", cursor: "pointer", fontSize: 16, color: "var(--pb-muted)", padding: 0 }}>
+                {showPw ? <Icon name="eyeOff" size={16} /> : <Icon name="eye" size={16} />}
+              </button>
+            </div>
+          </AdmField>
+          <button className="adm-btn adm-btn-primary adm-btn-block" disabled={busy} style={{ marginTop: 8 }}>{busy ? "Signing in..." : "Sign in"}</button>
+          {loginErr && <div className="adm-up-err" style={{ marginTop: 10 }}>&#9888; {loginErr}</div>}
+        </form>
+      </div>
+    );
+  }
+
+  /* ---- 2FA PIN ---- */
+  function AdmPin({ email, onVerified, onClose }) {
+    const [mode, setMode] = uS("loading");   // loading | enroll | challenge | error
+    const [code, setCode] = uS("");
+    const [err, setErr] = uS("");
+    const [verifying, setVerifying] = uS(false);
+    const [factorId, setFactorId] = uS("");
+    const [challengeId, setChallengeId] = uS("");
+    const [qr, setQr] = uS("");               // SVG data-URL for enrollment
+    const [secret, setSecret] = uS("");       // manual-entry secret
+
+    // Decide whether the admin already has Google Authenticator set up.
+    const init = async () => {
+      setErr("");
+      const { data, error } = await window.PBData.mfaListFactors();
+      if (error) { setErr(error.message); setMode("error"); return; }
+      const totp = (data && data.totp) || [];
+      const verified = totp.find((f) => f.status === "verified");
+      if (verified) {
+        // Returning user — challenge the existing factor.
+        setFactorId(verified.id);
+        const { data: ch, error: cErr } = await window.PBData.mfaChallenge(verified.id);
+        if (cErr) { setErr(cErr.message); setMode("error"); return; }
+        setChallengeId(ch.id);
+        setMode("challenge");
+      } else {
+        // First time — clean up any half-finished factors, then enroll.
+        for (const f of totp) { if (f.status === "unverified") { await window.PBData.mfaUnenroll(f.id); } }
+        const { data: en, error: eErr } = await window.PBData.mfaEnroll();
+        if (eErr) { setErr(eErr.message); setMode("error"); return; }
+        setFactorId(en.id);
+        setQr(en.totp.qr_code);
+        setSecret(en.totp.secret);
+        const { data: ch, error: cErr } = await window.PBData.mfaChallenge(en.id);
+        if (cErr) { setErr(cErr.message); setMode("error"); return; }
+        setChallengeId(ch.id);
+        setMode("enroll");
+      }
+    };
+    uE(() => { init(); }, []);
+
+    const verify = async () => {
+      if (code.length !== 6) { setErr("Enter the 6-digit code from your authenticator app."); return; }
+      setErr(""); setVerifying(true);
+      let chId = challengeId;
+      // Challenges are short-lived; for a returning user request a fresh one each attempt.
+      if (mode === "challenge") {
+        const { data: ch, error: cErr } = await window.PBData.mfaChallenge(factorId);
+        if (cErr) { setVerifying(false); setErr(cErr.message); return; }
+        chId = ch.id; setChallengeId(ch.id);
+      }
+      const { error } = await window.PBData.mfaVerify(factorId, chId, code);
+      setVerifying(false);
+      if (error) { setErr("Incorrect or expired code — try again."); setCode(""); return; }
+      onVerified();
+    };
+
+    return (
+      <div className="adm-overlay">
+        <div className="adm-shell adm-shell-login">
+          {onClose && <button className="adm-login-close adm-btn adm-sm" onClick={onClose}>Close ✕</button>}
+          <div className="adm-login-wrap">
+            <div className="adm-login-brand" style={{ justifyContent: "center", marginBottom: 8 }}><PBLogo variant="color" size={36} /></div>
+            <h3 style={{ textAlign: "center", marginBottom: 4 }}>Two-factor authentication</h3>
+
+            {mode === "loading" && (
+              <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 14, marginTop: 16 }}>Checking your security settings…</p>
+            )}
+
+            {mode === "error" && (
+              <div className="adm-up-err" style={{ marginTop: 16 }}><Icon name="warn" size={15} /> {err || "Something went wrong."}</div>
+            )}
+
+            {mode === "enroll" && (
+              <>
+                <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 14, marginBottom: 14 }}>
+                  Set up <strong>Google Authenticator</strong>. Scan this QR code in the app, then enter the 6-digit code it shows.
+                </p>
+                {qr && <div style={{ textAlign: "center", marginBottom: 12 }}><img src={qr} alt="Authenticator QR code" style={{ width: 188, height: 188 }} /></div>}
+                {secret && (
+                  <p style={{ textAlign: "center", fontSize: 12, color: "var(--pb-muted)", marginBottom: 16, wordBreak: "break-all" }}>
+                    Can't scan? Enter this key manually:<br /><code style={{ fontSize: 13, letterSpacing: 1 }}>{secret}</code>
+                  </p>
+                )}
+              </>
+            )}
+
+            {mode === "challenge" && (
+              <p style={{ textAlign: "center", color: "var(--pb-muted)", fontSize: 14, marginBottom: 20 }}>
+                Open Google Authenticator and enter the current 6-digit code.
+              </p>
+            )}
+
+            {(mode === "enroll" || mode === "challenge") && (
+              <>
+                <AdmField label="Authenticator code">
+                  <input type="text" inputMode="numeric" maxLength={6} value={code}
+                    onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
+                    onKeyDown={(e) => e.key === "Enter" && verify()} autoFocus
+                    placeholder="------" style={{ letterSpacing: 10, fontSize: 22, textAlign: "center" }} />
+                </AdmField>
+                <button className="adm-btn adm-btn-primary adm-btn-block" onClick={verify} disabled={verifying} style={{ marginTop: 8 }}>
+                  {verifying ? "Verifying…" : (mode === "enroll" ? "Activate & sign in" : "Verify & sign in")}
+                </button>
+                {err && <div className="adm-up-err" style={{ marginTop: 10 }}><Icon name="warn" size={15} /> {err}</div>}
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ============================ DASHBOARD SHELL ============================ */
+  const NAV = [
+    { id: "overview", label: "Dashboard",     icon: "invest", group: "General" },
+    { id: "branding", label: "Branding",      icon: "star",   group: "General" },
+    { id: "logos",    label: "Logo",          icon: "shariah", group: "General" },
+
+    { id: "hero",     label: "Hero slides",   icon: "gallery", group: "Homepage" },
+    { id: "services", label: "Services",      icon: "pos",    group: "Homepage" },
+    { id: "accounts", label: "Accounts",      icon: "personal", group: "Homepage" },
+    { id: "cards",    label: "Cards",         icon: "card",   group: "Homepage" },
+    { id: "values",   label: "Core values",   icon: "check",  group: "Homepage" },
+    { id: "stats",    label: "Key numbers",   icon: "invest", group: "Homepage" },
+    { id: "rates",    label: "Exchange rates",icon: "swift",  group: "Homepage" },
+    { id: "testimonials", label: "Testimonials", icon: "team", group: "Homepage" },
+    { id: "faq",      label: "FAQ",           icon: "news",   group: "Homepage" },
+
+    { id: "pages",    label: "Page content",  icon: "news",   group: "Content" },
+    { id: "team",     label: "Team",          icon: "team",   group: "Content" },
+    { id: "posts",    label: "News & Press",  icon: "press",  group: "Content" },
+    { id: "atms",     label: "ATM locations", icon: "atm",    group: "Content" },
+    { id: "footer",   label: "Footer & social", icon: "globe", group: "Content" },
+
+    { id: "settings", label: "Settings",      icon: "shield", group: "System" },
+  ];
+  const NAV_GROUPS = ["General", "Homepage", "Content", "System"];
+
+  /* ============================ SERVICES ============================ */
+  function AdmServices() {
+    const [tiles, setTiles] = uS(() => clone(window.PB_CONTENT && window.PB_CONTENT.tiles || []));
+    const [busy, setBusy] = uS(false);
+    const [saved, setSaved] = uS(false);
+    const upd = (i, patch) => setTiles(tiles.map((t, j) => j === i ? Object.assign({}, t, patch) : t));
+    const updLabel = (i, lang, val) => upd(i, { label: Object.assign({}, tiles[i].label, { [lang]: val }) });
+    const updBlurb = (i, lang, val) => upd(i, { blurb: Object.assign({}, tiles[i].blurb, { [lang]: val }) });
+    const save = async () => {
+      setBusy(true);
+      const { error } = await saveContentKey("tiles", tiles);
+      setBusy(false);
+      if (error) alert("Failed: " + error.message);
+      else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
+    };
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar">
+          <h2 className="adm-h2">Services tiles</h2>
+        </div>
+        <p className="adm-muted" style={{ marginBottom: 20 }}>Edit the service cards shown on the homepage.</p>
+        {tiles.map((t, i) => (
+          <div key={t.id} className="adm-card adm-slide-card">
+            <div className="adm-slide-head">
+              <div className="adm-slide-title">
+                <span className="adm-tint-dot" style={{ background: t.bg }} />
+                <strong>{(t.label && t.label.en) || t.id}</strong>
+              </div>
+            </div>
+            <div className="adm-fieldset">
+              <div className="adm-color-row">
+                <AdmField label="Label (English)"><input value={(t.label && t.label.en) || ""} onChange={(e) => updLabel(i, "en", e.target.value)} /></AdmField>
+                <AdmField label="Label (Somali)"><input value={(t.label && t.label.so) || ""} onChange={(e) => updLabel(i, "so", e.target.value)} /></AdmField>
+              </div>
+              <div className="adm-color-row">
+                <AdmField label="Blurb (English)"><input value={(t.blurb && t.blurb.en) || ""} onChange={(e) => updBlurb(i, "en", e.target.value)} /></AdmField>
+                <AdmField label="Blurb (Somali)"><input value={(t.blurb && t.blurb.so) || ""} onChange={(e) => updBlurb(i, "so", e.target.value)} /></AdmField>
+              </div>
+              <AdmField label="Background colour"><input type="color" value={t.bg || "#0b2f4f"} onChange={(e) => upd(i, { bg: e.target.value })} style={{ width: 60, height: 36, padding: 2, cursor: "pointer" }} /></AdmField>
+            </div>
+          </div>
+        ))}
+        <AdmSaveBar onSave={save} busy={busy} saved={saved} />
+      </div>
+    );
+  }
+
+  /* ============================ REUSABLE SECTION EDITOR ============================ */
+  /* Generic editor for a single array stored under a PB_CONTENT key. renderItem
+     receives (item, updater, index) where updater(patch) merges a partial. */
+  function AdmSectionEditor({ title, intro, contentKey, blank, renderItem, itemTitle, addLabel, reorder }) {
+    const [items, setItems] = uS(() => clone((window.PB_CONTENT && window.PB_CONTENT[contentKey]) || []));
+    const [busy, setBusy] = uS(false);
+    const [saved, setSaved] = uS(false);
+    const upd = (i, patch) => setItems((prev) => prev.map((it, j) => (j === i ? Object.assign({}, it, patch) : it)));
+    const add = () => setItems((prev) => prev.concat([clone(blank)]));
+    const rm = (i) => { if (!confirm("Remove this item?")) return; setItems((prev) => prev.filter((_, j) => j !== i)); };
+    const move = (i, dir) => setItems((prev) => {
+      const j = i + dir; if (j < 0 || j >= prev.length) return prev;
+      const cp = prev.slice(); const x = cp[i]; cp[i] = cp[j]; cp[j] = x; return cp;
+    });
+    const save = async () => {
+      setBusy(true);
+      const { error } = await saveContentKey(contentKey, items);
+      setBusy(false);
+      if (error) alert("Failed: " + error.message);
+      else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
+    };
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar">
+          <h2 className="adm-h2">{title}</h2>
+          {blank && <button className="adm-btn adm-btn-primary" onClick={add}>+ {addLabel || "Add"}</button>}
+        </div>
+        {intro && <p className="adm-muted" style={{ marginBottom: 18 }}>{intro}</p>}
+        {items.map((it, i) => (
+          <div key={i} className="adm-card adm-slide-card">
+            <div className="adm-slide-head">
+              <div className="adm-slide-title"><span className="adm-idx">{i + 1}</span><strong>{itemTitle ? itemTitle(it, i) : "Item " + (i + 1)}</strong></div>
+              <div className="adm-row">
+                {reorder && <button className="adm-btn adm-sm" disabled={i === 0} onClick={() => move(i, -1)} title="Move up">↑</button>}
+                {reorder && <button className="adm-btn adm-sm" disabled={i === items.length - 1} onClick={() => move(i, 1)} title="Move down">↓</button>}
+                {blank && <button className="adm-btn adm-sm adm-danger" onClick={() => rm(i)}>Remove</button>}
+              </div>
+            </div>
+            <div className="adm-fieldset">{renderItem(it, (patch) => upd(i, patch), i)}</div>
+          </div>
+        ))}
+        <AdmSaveBar onSave={save} busy={busy} saved={saved} />
+      </div>
+    );
+  }
+
+  /* Bilingual paired editor: content stored as { en:[...], so:[...] } where the
+     two arrays run in parallel. mergeRow(itemEn, itemSo) → one row for editing;
+     splitRow(row) → { en, so } written back into the parallel arrays. */
+  function AdmPairEditor({ title, intro, contentKey, blankEn, blankSo, splitRow, renderItem, itemTitle, addLabel }) {
+    const src = (window.PB_CONTENT && window.PB_CONTENT[contentKey]) || { en: [], so: [] };
+    const [rows, setRows] = uS(() => {
+      const en = src.en || [], so = src.so || [];
+      const n = Math.max(en.length, so.length);
+      const out = [];
+      for (let i = 0; i < n; i++) out.push({ en: clone(en[i] || {}), so: clone(so[i] || {}) });
+      return out;
+    });
+    const [busy, setBusy] = uS(false);
+    const [saved, setSaved] = uS(false);
+    const upd = (i, patch) => setRows((prev) => prev.map((r, j) => (j === i ? Object.assign({}, r, patch) : r)));
+    const add = () => setRows((prev) => prev.concat([{ en: clone(blankEn), so: clone(blankSo) }]));
+    const rm = (i) => { if (!confirm("Remove this item?")) return; setRows((prev) => prev.filter((_, j) => j !== i)); };
+    const move = (i, dir) => setRows((prev) => { const j = i + dir; if (j < 0 || j >= prev.length) return prev; const cp = prev.slice(); const x = cp[i]; cp[i] = cp[j]; cp[j] = x; return cp; });
+    const save = async () => {
+      setBusy(true);
+      const en = [], so = [];
+      rows.forEach((r) => { const s = splitRow(r); en.push(s.en); so.push(s.so); });
+      const { error } = await saveContentKey(contentKey, { en, so });
+      setBusy(false);
+      if (error) alert("Failed: " + error.message);
+      else { setSaved(true); setTimeout(() => setSaved(false), 2500); }
+    };
+    return (
+      <div className="adm-pane">
+        <div className="adm-toolbar">
+          <h2 className="adm-h2">{title}</h2>
+          <button className="adm-btn adm-btn-primary" onClick={add}>+ {addLabel || "Add"}</button>
+        </div>
+        {intro && <p className="adm-muted" style={{ marginBottom: 18 }}>{intro}</p>}
+        {rows.map((r, i) => (
+          <div key={i} className="adm-card adm-slide-card">
+            <div className="adm-slide-head">
+              <div className="adm-slide-title"><span className="adm-idx">{i + 1}</span><strong>{itemTitle ? itemTitle(r, i) : "Item " + (i + 1)}</strong></div>
+              <div className="adm-row">
+                <button className="adm-btn adm-sm" disabled={i === 0} onClick={() => move(i, -1)} title="Move up">↑</button>
+                <button className="adm-btn adm-sm" disabled={i === rows.length - 1} onClick={() => move(i, 1)} title="Move down">↓</button>
+                <button className="adm-btn adm-sm adm-danger" onClick={() => rm(i)}>Remove</button>
+              </div>
+            </div>
+            <div className="adm-fieldset">{renderItem(r, (patch) => upd(i, patch), i)}</div>
+          </div>
+        ))}
+        <AdmSaveBar onSave={save} busy={busy} saved={saved} />
+      </div>
+    );
+  }
+
+  /* ---- Exchange-rate ticker ---- */
+  function AdmRates() {
+    return (
+      <AdmSectionEditor
+        title="Exchange rates (ticker)"
+        intro="The live currency ticker that scrolls across the homepage. “Up” shows a green ▲, off shows a red ▼."
+        contentKey="ticker"
+        addLabel="Add currency"
+        reorder
+        blank={{ code: "USD/SOS", buy: "0", sell: "0", up: true }}
+        itemTitle={(it) => it.code || "Currency"}
+        renderItem={(it, u) => (
+          <>
+            <AdmField label="Pair / code"><input value={it.code || ""} onChange={(e) => u({ code: e.target.value })} placeholder="USD/SOS" /></AdmField>
+            <div className="adm-color-row">
+              <AdmField label="Buy"><input value={it.buy || ""} onChange={(e) => u({ buy: e.target.value })} /></AdmField>
+              <AdmField label="Sell"><input value={it.sell || ""} onChange={(e) => u({ sell: e.target.value })} /></AdmField>
+            </div>
+            <label className="adm-check"><input type="checkbox" checked={!!it.up} onChange={(e) => u({ up: e.target.checked })} /> Trending up (green ▲)</label>
+          </>
+        )}
+      />
+    );
+  }
+
+  /* ---- Stats / numbers strip ---- */
+  function AdmStats() {
+    return (
+      <AdmSectionEditor
+        title="Key numbers"
+        intro="The headline statistics shown across the homepage (licence year, countries, POS, ATMs, agents…)."
+        contentKey="stats"
+        addLabel="Add stat"
+        reorder
+        blank={{ value: "", label: { en: "", so: "" } }}
+        itemTitle={(it) => it.value || "Stat"}
+        renderItem={(it, u) => (
+          <>
+            <AdmField label="Big value"><input value={it.value || ""} onChange={(e) => u({ value: e.target.value })} placeholder="e.g. 12,000+" /></AdmField>
+            <AdmBi label="Label" value={it.label || { en: "", so: "" }} onChange={(v) => u({ label: v })} />
+          </>
+        )}
+      />
+    );
+  }
+
+  /* ---- Core values ---- */
+  const ICON_HINT = "Icon names: personal, shield, check, joint, star, saving, salary, student, hajj, women, business, corporate, ngo, card, atm, pos, swift, wallet, agency, gateway, wearable";
+  function AdmValues() {
+    return (
+      <AdmPairEditor
+        title="Core values"
+        intro="The values / principles grid. Each value shares one icon and has bilingual title + body."
+        contentKey="values"
+        addLabel="Add value"
+        blankEn={{ icon: "star", title: "", body: "" }}
+        blankSo={{ icon: "star", title: "", body: "" }}
+        splitRow={(r) => ({
+          en: { icon: r.en.icon || "star", title: r.en.title || "", body: r.en.body || "" },
+          so: { icon: r.en.icon || "star", title: r.so.title || "", body: r.so.body || "" },
+        })}
+        itemTitle={(r) => r.en.title || "Value"}
+        renderItem={(r, u) => (
+          <>
+            <AdmField label="Icon"><input value={r.en.icon || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { icon: e.target.value }) })} placeholder="star" /></AdmField>
+            <p className="adm-muted" style={{ fontSize: 11, marginTop: -6, marginBottom: 10 }}>{ICON_HINT}</p>
+            <div className="adm-color-row">
+              <AdmField label="Title (English)"><input value={r.en.title || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { title: e.target.value }) })} /></AdmField>
+              <AdmField label="Title (Somali)"><input value={r.so.title || ""} onChange={(e) => u({ so: Object.assign({}, r.so, { title: e.target.value }) })} /></AdmField>
+            </div>
+            <AdmField label="Body (English)"><textarea rows={2} value={r.en.body || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { body: e.target.value }) })} /></AdmField>
+            <AdmField label="Body (Somali)"><textarea rows={2} value={r.so.body || ""} onChange={(e) => u({ so: Object.assign({}, r.so, { body: e.target.value }) })} /></AdmField>
+          </>
+        )}
+      />
+    );
+  }
+
+  /* ---- Accounts grid ---- */
+  function AdmAccounts() {
+    return (
+      <AdmSectionEditor
+        title="Accounts"
+        intro="The account types grid. Each card shows a name and a short “best for” line, in both languages."
+        contentKey="accounts"
+        addLabel="Add account"
+        reorder
+        blank={{ id: "", icon: "personal", name: { en: "", so: "" }, for: { en: "", so: "" } }}
+        itemTitle={(it) => (it.name && it.name.en) || "Account"}
+        renderItem={(it, u) => (
+          <>
+            <div className="adm-color-row">
+              <AdmField label="ID (unique)"><input value={it.id || ""} onChange={(e) => u({ id: e.target.value })} placeholder="personal" /></AdmField>
+              <AdmField label="Icon"><input value={it.icon || ""} onChange={(e) => u({ icon: e.target.value })} placeholder="personal" /></AdmField>
+            </div>
+            <AdmBi label="Name" value={it.name || { en: "", so: "" }} onChange={(v) => u({ name: v })} />
+            <AdmBi label="Best for" value={it.for || { en: "", so: "" }} onChange={(v) => u({ for: v })} />
+          </>
+        )}
+      />
+    );
+  }
+
+  /* ---- Cards / Mastercard products ---- */
+  function AdmCards() {
+    return (
+      <AdmSectionEditor
+        title="Cards"
+        intro="The Mastercard product cards. Limit and name are shared; description is bilingual; colour sets the card background."
+        contentKey="cards"
+        addLabel="Add card"
+        reorder
+        blank={{ id: "", icon: "card", name: "", limit: "", desc: { en: "", so: "" }, color: "#0b2f4f" }}
+        itemTitle={(it) => it.name || "Card"}
+        renderItem={(it, u) => (
+          <>
+            <div className="adm-color-row">
+              <AdmField label="Name"><input value={it.name || ""} onChange={(e) => u({ name: e.target.value })} placeholder="Classic Mastercard" /></AdmField>
+              <AdmField label="Limit"><input value={it.limit || ""} onChange={(e) => u({ limit: e.target.value })} placeholder="$2,000" /></AdmField>
+            </div>
+            <AdmBi label="Description" value={it.desc || { en: "", so: "" }} onChange={(v) => u({ desc: v })} textarea rows={2} />
+            <div className="adm-color-row">
+              <AdmField label="ID / icon"><input value={it.icon || ""} onChange={(e) => u({ icon: e.target.value })} placeholder="card / cardPlatinum / cardElite" /></AdmField>
+              <AdmField label="Card colour"><input type="color" value={it.color || "#0b2f4f"} onChange={(e) => u({ color: e.target.value })} style={{ width: 60, height: 36, padding: 2, cursor: "pointer" }} /></AdmField>
+            </div>
+          </>
+        )}
+      />
+    );
+  }
+
+  /* ---- Testimonials ---- */
+  function AdmTestimonials() {
+    return (
+      <AdmPairEditor
+        title="Testimonials"
+        intro="Customer quotes. The person’s name and role are shared; the quote is bilingual."
+        contentKey="testimonials"
+        addLabel="Add testimonial"
+        blankEn={{ quote: "", who: "", role: "" }}
+        blankSo={{ quote: "", who: "", role: "" }}
+        splitRow={(r) => ({
+          en: { quote: r.en.quote || "", who: r.en.who || "", role: r.en.role || "" },
+          so: { quote: r.so.quote || "", who: r.en.who || "", role: r.so.role || r.en.role || "" },
+        })}
+        itemTitle={(r) => r.en.who || "Testimonial"}
+        renderItem={(r, u) => (
+          <>
+            <div className="adm-color-row">
+              <AdmField label="Name"><input value={r.en.who || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { who: e.target.value }) })} placeholder="Khadra A." /></AdmField>
+              <AdmField label="Role (English)"><input value={r.en.role || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { role: e.target.value }) })} placeholder="Shop owner, Mogadishu" /></AdmField>
+            </div>
+            <AdmField label="Role (Somali)"><input value={r.so.role || ""} onChange={(e) => u({ so: Object.assign({}, r.so, { role: e.target.value }) })} placeholder="Iibiye, Muqdisho" /></AdmField>
+            <AdmField label="Quote (English)"><textarea rows={3} value={r.en.quote || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { quote: e.target.value }) })} /></AdmField>
+            <AdmField label="Quote (Somali)"><textarea rows={3} value={r.so.quote || ""} onChange={(e) => u({ so: Object.assign({}, r.so, { quote: e.target.value }) })} /></AdmField>
+          </>
+        )}
+      />
+    );
+  }
+
+  /* ---- FAQ ---- */
+  function AdmFaq() {
+    return (
+      <AdmPairEditor
+        title="FAQ"
+        intro="Frequently-asked questions shown near the foot of the homepage. Each row is bilingual (question + answer)."
+        contentKey="faq"
+        addLabel="Add question"
+        blankEn={{ q: "", a: "" }}
+        blankSo={{ q: "", a: "" }}
+        splitRow={(r) => ({ en: { q: r.en.q || "", a: r.en.a || "" }, so: { q: r.so.q || "", a: r.so.a || "" } })}
+        itemTitle={(r) => r.en.q || "Question"}
+        renderItem={(r, u) => (
+          <>
+            <AdmField label="Question (English)"><input value={r.en.q || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { q: e.target.value }) })} /></AdmField>
+            <AdmField label="Question (Somali)"><input value={r.so.q || ""} onChange={(e) => u({ so: Object.assign({}, r.so, { q: e.target.value }) })} /></AdmField>
+            <AdmField label="Answer (English)"><textarea rows={3} value={r.en.a || ""} onChange={(e) => u({ en: Object.assign({}, r.en, { a: e.target.value }) })} /></AdmField>
+            <AdmField label="Answer (Somali)"><textarea rows={3} value={r.so.a || ""} onChange={(e) => u({ so: Object.assign({}, r.so, { a: e.target.value }) })} /></AdmField>
+          </>
+        )}
+      />
+    );
+  }
+
+  function AdminApp() {
+    const [show, setShow] = uS(location.hash === "#admin");
+    const [session, setSession] = uS(null);
+    const [pinVerified, setPinVerified] = uS(false);
+    const [view, setView] = uS("overview");
+    const [menuOpen, setMenuOpen] = uS(false);
+    uE(() => {
+      const onHash = () => setShow(location.hash === "#admin");
+      window.addEventListener("hashchange", onHash);
+      return () => window.removeEventListener("hashchange", onHash);
+    }, []);
+    uE(() => {
+      if (!window.PBData.isConfigured()) return;
+      window.PBData.getSession().then(setSession);
+      const { data } = window.PBData.onAuth(setSession);
+      return () => { try { data.subscription.unsubscribe(); } catch (e) {} };
+    }, []);
+    if (!show) return null;
+    const configured = window.PBData.isConfigured();
+    const close = () => { history.replaceState(null, "", location.pathname + location.search); setShow(false); };
+    const go = (v) => { setView(v); setMenuOpen(false); };
+
+    if (!configured) return (<div className="adm-overlay"><div className="adm-shell"><header className="adm-head"><div className="adm-brand"><LogoMark size={26} variant="color" /> <span>Premier Admin</span></div><button className="adm-btn adm-sm" onClick={close}>Close ✕</button></header><div className="adm-body"><AdmSettings session={null} /></div></div></div>);
+    if (!session) return (<div className="adm-overlay"><div className="adm-shell adm-shell-login"><button className="adm-login-close adm-btn adm-sm" onClick={close}>Close ✕</button><AdmLogin /></div></div>);
+    if (!pinVerified) return <AdmPin email={(session.user && session.user.email) || ""} onVerified={() => setPinVerified(true)} onClose={close} />;
+
+    const VIEWS = {
+      overview: <AdmOverview go={go} />, branding: <AdmBranding />, logos: <AdmLogos />, hero: <AdmHero />,
+      pages: <AdmPages />, services: <AdmServices />, team: <AdmTeam />, posts: <AdmNews />, atms: <AdmAtms />, footer: <AdmFooter />, settings: <AdmSettings session={session} />,
+      accounts: <AdmAccounts />, cards: <AdmCards />, values: <AdmValues />, stats: <AdmStats />, rates: <AdmRates />, testimonials: <AdmTestimonials />, faq: <AdmFaq />,
+    };
+    return (
+      <div className="adm-overlay adm-overlay-full">
+        <div className="adm-shell adm-shell-dash">
+          {menuOpen && <div className="adm-side-backdrop" onClick={() => setMenuOpen(false)} />}
+          <aside className={"adm-side" + (menuOpen ? " is-open" : "")}>
+            <div className="adm-side-brand"><PBLogo variant="white" size={26} /></div>
+            <nav className="adm-side-nav">
+              {NAV_GROUPS.map((g) => (
+                <div key={g} className="adm-nav-group">
+                  <div className="adm-nav-grouphead">{g}</div>
+                  {NAV.filter((n) => n.group === g).map((n) => (
+                    <button key={n.id} className={view === n.id ? "is-active" : ""} onClick={() => go(n.id)}>
+                      <i className="adm-nav-ico"><Icon name={n.icon} size={17} /></i> {n.label}
+                    </button>
+                  ))}
+                </div>
+              ))}
+            </nav>
+            <div className="adm-side-foot">
+              <button className="adm-btn adm-sm adm-btn-ghost" onClick={() => window.PBData.signOut()}>Sign out</button>
+            </div>
+          </aside>
+          <main className="adm-main">
+            <header className="adm-main-head">
+              <button className="adm-burger" onClick={() => setMenuOpen(!menuOpen)}><Icon name="menu" size={20} /></button>
+              <span className="adm-crumb">{(NAV.find((n) => n.id === view) || {}).label}</span>
+              <button className="adm-btn adm-sm" onClick={close}>Close ✕</button>
+            </header>
+            <div className="adm-main-body">{VIEWS[view]}</div>
+          </main>
+        </div>
+      </div>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById("admin-root")).render(<AdminApp />);
+})();
